@@ -150,21 +150,29 @@ export class TelegramChannel implements Channel {
     if (!content) return;
 
     // --- Group mention gating ---
-    // In groups, only process messages that @mention the bot (unless requiresTrigger is false)
+    // In groups, only process messages that @mention the bot (unless requiresTrigger is false).
+    // Normalize @botUsername → @AssistantName so index.ts trigger check passes.
+    let normalizedContent = content;
     if (isGroup) {
       const group = groups[jid];
       const requireMention = group.requiresTrigger !== false;
 
       if (requireMention) {
         const botUsername = this.bot.botInfo?.username;
-        const mentionPattern = new RegExp(`@${botUsername}\\b`, 'i');
+        const mentionPattern = botUsername ? new RegExp(`@${botUsername}\\b`, 'gi') : null;
         const triggerPattern = new RegExp(`^@${ASSISTANT_NAME}\\b`, 'i');
 
-        const hasMention = botUsername && mentionPattern.test(content);
+        const hasMention = mentionPattern && mentionPattern.test(content);
         const hasTrigger = triggerPattern.test(content);
 
         if (!hasMention && !hasTrigger) {
           return; // Skip — not addressed to the bot
+        }
+
+        // Normalize: replace @botUsername with @AssistantName so the
+        // router's TRIGGER_PATTERN (^@AssistantName\b) matches correctly
+        if (hasMention && !hasTrigger && mentionPattern) {
+          normalizedContent = content.replace(mentionPattern, `@${ASSISTANT_NAME}`);
         }
       }
     }
@@ -184,7 +192,7 @@ export class TelegramChannel implements Channel {
       chat_jid: jid,
       sender,
       sender_name: senderName,
-      content,
+      content: normalizedContent,
       timestamp,
       is_from_me: fromMe,
       is_bot_message: isBotMessage,
