@@ -9,12 +9,27 @@ import { readEnvFile } from './env.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'TELEGRAM_BOT_TOKEN',
+  'TELEGRAM_DM_POLICY',
+  'TELEGRAM_ALLOWED_USERS',
 ]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+export const TELEGRAM_BOT_TOKEN =
+  process.env.TELEGRAM_BOT_TOKEN || envConfig.TELEGRAM_BOT_TOKEN || '';
+// DM access policy: 'open' (anyone), 'allowlist' (only allowed users), 'disabled' (no DMs)
+export const TELEGRAM_DM_POLICY =
+  (process.env.TELEGRAM_DM_POLICY || envConfig.TELEGRAM_DM_POLICY || 'open') as 'open' | 'allowlist' | 'disabled';
+// Comma-separated numeric Telegram user IDs allowed to DM (when dmPolicy=allowlist)
+export const TELEGRAM_ALLOWED_USERS = new Set(
+  (process.env.TELEGRAM_ALLOWED_USERS || envConfig.TELEGRAM_ALLOWED_USERS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
