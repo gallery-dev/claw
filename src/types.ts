@@ -41,6 +41,16 @@ export interface RegisteredGroup {
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
 }
 
+export interface MediaAttachment {
+  type: 'photo' | 'document' | 'audio' | 'video' | 'voice' | 'sticker';
+  fileId: string;
+  fileName?: string;
+  mimeType?: string;
+  fileSize?: number;
+  /** URL to download the file (populated after getFile call) */
+  fileUrl?: string;
+}
+
 export interface NewMessage {
   id: string;
   chat_jid: string;
@@ -50,6 +60,10 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  /** Platform-specific message ID for reply threading */
+  platform_message_id?: number;
+  /** Media attachments (photos, docs, audio, etc.) */
+  media?: MediaAttachment[];
 }
 
 export interface ScheduledTask {
@@ -81,12 +95,17 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(jid: string, text: string, replyToMessageId?: number): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: streaming message edits (send first chunk, then edit subsequent)
+  sendStreamingChunk?(jid: string, text: string, messageId?: number, replyToMessageId?: number): Promise<number>;
+  finalizeStream?(jid: string, messageId: number, text: string): Promise<void>;
+  // Optional: reactions
+  sendReaction?(jid: string, messageId: number, emoji: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

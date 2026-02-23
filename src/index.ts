@@ -184,6 +184,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
+  // Streaming state — accumulate agent output into one message edited progressively
+  let streamMessageId: number | undefined;
+  let accumulatedText = '';
+  const supportsStreaming = !!(channel.sendStreamingChunk && channel.finalizeStream);
+
+  // Reply threading — use the last user message's platform ID
+  const lastUserMsg = missedMessages[missedMessages.length - 1];
+  const replyToId = lastUserMsg?.platform_message_id;
+
+  // React 👀 to acknowledge we're processing the user's message
+  if (replyToId && channel.sendReaction) {
+    channel.sendReaction(chatJid, replyToId, '👀').catch(() => {});
+  }
+
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
@@ -192,7 +206,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        if (supportsStreaming) {
+          // Accumulate into one message, edit progressively
+          accumulatedText = accumulatedText ? `${accumulatedText}\n\n${text}` : text;
+          streamMessageId = await channel.sendStreamingChunk!(chatJid, accumulatedText, streamMessageId, replyToId);
+        } else {
+          await channel.sendMessage(chatJid, text, replyToId);
+        }
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -200,10 +220,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     if (result.status === 'success') {
+      // Finalize streaming message with proper formatting
+      if (supportsStreaming && streamMessageId != null && accumulatedText) {
+        await channel.finalizeStream!(chatJid, streamMessageId, accumulatedText);
+      }
       queue.notifyIdle(chatJid);
     }
 
     if (result.status === 'error') {
+      // Finalize with whatever we have so far
+      if (supportsStreaming && streamMessageId != null && accumulatedText) {
+        await channel.finalizeStream!(chatJid, streamMessageId, accumulatedText);
+      }
       hadError = true;
     }
   });

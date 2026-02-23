@@ -1,4 +1,5 @@
-import { Bot, Context } from 'grammy';
+import { Bot, Context, GrammyError, HttpError } from 'grammy';
+import { apiThrottler } from '@grammyjs/transformer-throttler';
 
 import {
   ASSISTANT_NAME,
@@ -7,10 +8,26 @@ import {
 } from '../config.js';
 import { updateChatName } from '../db.js';
 import { logger } from '../logger.js';
-import { Channel, OnInboundMessage, OnChatMetadata, RegisteredGroup } from '../types.js';
+import { Channel, MediaAttachment, OnInboundMessage, OnChatMetadata, RegisteredGroup } from '../types.js';
+import { markdownToTelegramHtml, formatAndChunk, escapeHtml } from './telegram-format.js';
 
 /** Telegram Bot API message text limit */
 const MAX_MESSAGE_LENGTH = 4096;
+
+/** Throttle streaming edits to avoid Telegram rate limits */
+const STREAM_THROTTLE_MS = 1200;
+
+/** Max retries for API calls */
+const MAX_RETRIES = 3;
+
+/** Fragment reassembly: max gap between consecutive messages (ms) */
+const FRAGMENT_MAX_GAP_MS = 1500;
+/** Fragment reassembly: max sequential message ID gap */
+const FRAGMENT_MAX_ID_GAP = 1;
+/** Fragment reassembly: max parts to reassemble */
+const FRAGMENT_MAX_PARTS = 12;
+/** Fragment reassembly: max total chars */
+const FRAGMENT_MAX_CHARS = 50_000;
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -19,10 +36,8 @@ export interface TelegramChannelOpts {
   botToken: string;
 }
 
-/**
- * Telegram JID format: `tg:<chat_id>`
- * e.g. `tg:-1001234567890` for groups, `tg:123456789` for DMs
- */
+// ── JID helpers ────────────────────────────────────────────────────
+
 function toJid(chatId: number): string {
   return `tg:${chatId}`;
 }
@@ -31,11 +46,76 @@ function fromJid(jid: string): number {
   return parseInt(jid.replace('tg:', ''), 10);
 }
 
-/**
- * Split long text into chunks that fit within Telegram's 4096 char limit.
- * Prefers splitting on paragraph boundaries (double newlines), then
- * single newlines, then hard-cuts at the limit.
- */
+// ── Retry logic ────────────────────────────────────────────────────
+
+/** Error codes that are safe to retry */
+const RECOVERABLE_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT',
+  'ENETUNREACH', 'EHOSTUNREACH', 'ENOTFOUND', 'EAI_AGAIN',
+]);
+
+function isRecoverableError(err: unknown): boolean {
+  if (err instanceof GrammyError) {
+    // 429 Too Many Requests — respect retry_after
+    if (err.error_code === 429) return true;
+    // 5xx server errors
+    if (err.error_code >= 500) return true;
+    return false;
+  }
+  if (err instanceof HttpError) return true;
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code && RECOVERABLE_CODES.has(code)) return true;
+  }
+  return false;
+}
+
+function isTelegramHtmlParseError(err: unknown): boolean {
+  if (err instanceof GrammyError) {
+    const desc = err.description?.toLowerCase() ?? '';
+    return desc.includes('can\'t parse') || desc.includes('parse entities');
+  }
+  return false;
+}
+
+function isTelegramThreadNotFoundError(err: unknown): boolean {
+  if (err instanceof GrammyError) {
+    return err.description?.includes('message thread not found') ?? false;
+  }
+  return false;
+}
+
+function getRetryAfter(err: unknown): number {
+  if (err instanceof GrammyError && err.error_code === 429) {
+    const params = (err as any).parameters;
+    return (params?.retry_after ?? 5) * 1000;
+  }
+  return 0;
+}
+
+async function retryCall<T>(fn: () => Promise<T>, label: string): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRecoverableError(err)) throw err;
+
+      const retryAfterMs = getRetryAfter(err);
+      const delayMs = retryAfterMs || (1000 * Math.pow(2, attempt) + Math.random() * 500);
+      logger.warn(
+        { attempt: attempt + 1, label, delay: delayMs, err },
+        'Retrying Telegram API call',
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
+// ── Message chunking ───────────────────────────────────────────────
+
 function chunkMessage(text: string): string[] {
   if (text.length <= MAX_MESSAGE_LENGTH) return [text];
 
@@ -50,13 +130,11 @@ function chunkMessage(text: string): string[] {
 
     let splitAt = -1;
 
-    // Try double-newline (paragraph break) within limit
     const paraIdx = remaining.lastIndexOf('\n\n', MAX_MESSAGE_LENGTH);
     if (paraIdx > MAX_MESSAGE_LENGTH * 0.3) {
-      splitAt = paraIdx + 2; // include the newlines
+      splitAt = paraIdx + 2;
     }
 
-    // Try single newline
     if (splitAt === -1) {
       const nlIdx = remaining.lastIndexOf('\n', MAX_MESSAGE_LENGTH);
       if (nlIdx > MAX_MESSAGE_LENGTH * 0.3) {
@@ -64,7 +142,6 @@ function chunkMessage(text: string): string[] {
       }
     }
 
-    // Hard cut
     if (splitAt === -1) {
       splitAt = MAX_MESSAGE_LENGTH;
     }
@@ -76,24 +153,84 @@ function chunkMessage(text: string): string[] {
   return chunks;
 }
 
+// ── Fragment reassembly ────────────────────────────────────────────
+
+interface FragmentBuffer {
+  chatId: number;
+  senderId: number;
+  lastMessageId: number;
+  lastTime: number;
+  parts: string[];
+  totalChars: number;
+  /** Telegram message_id of the first fragment (for reply threading) */
+  firstPlatformMessageId: number;
+  flushTimer: ReturnType<typeof setTimeout>;
+}
+
+// ── Streaming state ────────────────────────────────────────────────
+
+interface StreamState {
+  messageId?: number;
+  text: string;
+  lastEditTime: number;
+  chatId: number;
+}
+
+// ── Channel class ──────────────────────────────────────────────────
+
 export class TelegramChannel implements Channel {
   name = 'telegram';
 
   private bot: Bot;
   private connected = false;
   private opts: TelegramChannelOpts;
+  private fragments = new Map<string, FragmentBuffer>();
+  private streams = new Map<string, StreamState>();
 
   constructor(opts: TelegramChannelOpts) {
     this.opts = opts;
     this.bot = new Bot(opts.botToken);
+
+    // Rate limiter — prevents hitting Telegram's API limits
+    this.bot.api.config.use(apiThrottler());
   }
 
   async connect(): Promise<void> {
-    // Handle incoming text messages
-    this.bot.on('message:text', (ctx) => this.handleMessage(ctx));
+    // Bot commands (registered before general message handler)
+    this.bot.command('chatid', (ctx) => {
+      const chatId = ctx.chat.id;
+      const jid = toJid(chatId);
+      const type = ctx.chat.type;
+      const name = type === 'private'
+        ? ctx.from?.first_name ?? 'DM'
+        : (ctx.chat as { title?: string }).title ?? 'Unknown';
+      const groups = this.opts.registeredGroups();
+      const registered = !!groups[jid];
+      ctx.reply(
+        `<b>JID:</b> <code>${escapeHtml(jid)}</code>\n` +
+        `<b>Type:</b> ${type}\n` +
+        `<b>Name:</b> ${escapeHtml(name)}\n` +
+        `<b>Registered:</b> ${registered ? 'yes' : 'no'}`,
+        { parse_mode: 'HTML' },
+      ).catch((err) => logger.debug({ err }, '/chatid reply failed'));
+    });
 
-    // Handle photo/video captions
-    this.bot.on('message:caption', (ctx) => this.handleMessage(ctx));
+    this.bot.command('ping', (ctx) => {
+      ctx.reply('pong').catch((err) => logger.debug({ err }, '/ping reply failed'));
+    });
+
+    // Handle all message types (text, caption, photo, document, audio, video, voice, sticker)
+    this.bot.on('message', (ctx) => this.handleMessage(ctx));
+
+    // Handle reaction updates
+    this.bot.on('message_reaction', (ctx) => {
+      const update = ctx.messageReaction;
+      if (!update) return;
+      logger.debug(
+        { chatId: update.chat.id, messageId: update.message_id },
+        'Reaction received',
+      );
+    });
 
     // Error handler
     this.bot.catch((err) => {
@@ -108,6 +245,8 @@ export class TelegramChannel implements Channel {
       },
     });
   }
+
+  // ── Inbound message handling ───────────────────────────────────
 
   private async handleMessage(ctx: Context): Promise<void> {
     const msg = ctx.message;
@@ -146,12 +285,22 @@ export class TelegramChannel implements Channel {
     const groups = this.opts.registeredGroups();
     if (!groups[jid]) return;
 
-    const content = msg.text || msg.caption || '';
+    // --- Extract content and media ---
+    const textContent = msg.text || msg.caption || '';
+    const media = this.extractMedia(msg);
+
+    // Skip messages with no text and no media
+    if (!textContent && media.length === 0) return;
+
+    // Build content string including media descriptions
+    let content = textContent;
+    if (media.length > 0 && !textContent) {
+      content = media.map((m) => `[${m.type}${m.fileName ? `: ${m.fileName}` : ''}]`).join(' ');
+    }
+
     if (!content) return;
 
     // --- Group mention gating ---
-    // In groups, only process messages that @mention the bot (unless requiresTrigger is false).
-    // Normalize @botUsername → @AssistantName so index.ts trigger check passes.
     let normalizedContent = content;
     if (isGroup) {
       const group = groups[jid];
@@ -166,27 +315,68 @@ export class TelegramChannel implements Channel {
         const hasTrigger = triggerPattern.test(content);
 
         if (!hasMention && !hasTrigger) {
-          return; // Skip — not addressed to the bot
+          return;
         }
 
-        // Normalize: replace @botUsername with @AssistantName so the
-        // router's TRIGGER_PATTERN (^@AssistantName\b) matches correctly
         if (hasMention && !hasTrigger && mentionPattern) {
           normalizedContent = content.replace(mentionPattern, `@${ASSISTANT_NAME}`);
         }
       }
     }
 
-    const sender = msg.from
-      ? `tg:${msg.from.id}`
-      : jid;
+    const sender = msg.from ? `tg:${msg.from.id}` : jid;
     const senderName = msg.from
       ? (msg.from.first_name + (msg.from.last_name ? ` ${msg.from.last_name}` : ''))
       : 'Unknown';
-
     const fromMe = msg.from?.id === this.bot.botInfo?.id;
     const isBotMessage = fromMe;
+    const platformMessageId = msg.message_id;
 
+    // --- Fragment reassembly ---
+    if (msg.from && !fromMe) {
+      const fragKey = `${chatId}:${msg.from.id}`;
+      const existing = this.fragments.get(fragKey);
+
+      if (
+        existing &&
+        msg.message_id - existing.lastMessageId <= FRAGMENT_MAX_ID_GAP &&
+        Date.now() - existing.lastTime < FRAGMENT_MAX_GAP_MS &&
+        existing.parts.length < FRAGMENT_MAX_PARTS &&
+        existing.totalChars + normalizedContent.length < FRAGMENT_MAX_CHARS
+      ) {
+        // Accumulate fragment
+        clearTimeout(existing.flushTimer);
+        existing.parts.push(normalizedContent);
+        existing.lastMessageId = msg.message_id;
+        existing.lastTime = Date.now();
+        existing.totalChars += normalizedContent.length;
+        existing.flushTimer = setTimeout(() => this.flushFragment(fragKey, jid, sender, senderName, timestamp, media), FRAGMENT_MAX_GAP_MS);
+        return;
+      }
+
+      // Flush any existing fragment for this sender
+      if (existing) {
+        clearTimeout(existing.flushTimer);
+        this.flushFragment(fragKey, jid, sender, senderName, timestamp, []);
+      }
+
+      // Check if this message might be the start of a fragment
+      if (normalizedContent.length >= 4000) {
+        this.fragments.set(fragKey, {
+          chatId,
+          senderId: msg.from.id,
+          lastMessageId: msg.message_id,
+          lastTime: Date.now(),
+          parts: [normalizedContent],
+          totalChars: normalizedContent.length,
+          firstPlatformMessageId: platformMessageId,
+          flushTimer: setTimeout(() => this.flushFragment(fragKey, jid, sender, senderName, timestamp, media), FRAGMENT_MAX_GAP_MS),
+        });
+        return;
+      }
+    }
+
+    // --- Deliver single message ---
     this.opts.onMessage(jid, {
       id: String(msg.message_id),
       chat_jid: jid,
@@ -196,24 +386,316 @@ export class TelegramChannel implements Channel {
       timestamp,
       is_from_me: fromMe,
       is_bot_message: isBotMessage,
+      platform_message_id: platformMessageId,
+      media: media.length > 0 ? media : undefined,
     });
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
-    const chatId = fromJid(jid);
-    const prefixed = `${ASSISTANT_NAME}: ${text}`;
-    const chunks = chunkMessage(prefixed);
+  private flushFragment(
+    fragKey: string,
+    jid: string,
+    sender: string,
+    senderName: string,
+    timestamp: string,
+    media: MediaAttachment[],
+  ): void {
+    const frag = this.fragments.get(fragKey);
+    if (!frag) return;
+    this.fragments.delete(fragKey);
 
+    const combined = frag.parts.join('\n');
+    logger.debug(
+      { chatId: frag.chatId, parts: frag.parts.length, totalChars: combined.length },
+      'Flushed reassembled message fragments',
+    );
+
+    this.opts.onMessage(jid, {
+      id: String(frag.firstPlatformMessageId),
+      chat_jid: jid,
+      sender,
+      sender_name: senderName,
+      content: combined,
+      timestamp,
+      is_from_me: false,
+      is_bot_message: false,
+      platform_message_id: frag.firstPlatformMessageId,
+      media: media.length > 0 ? media : undefined,
+    });
+  }
+
+  // ── Media extraction ─────────────────────────────────────────────
+
+  private extractMedia(msg: NonNullable<Context['message']>): MediaAttachment[] {
+    const media: MediaAttachment[] = [];
+
+    if (msg.photo && msg.photo.length > 0) {
+      // Use largest photo (last in array)
+      const largest = msg.photo[msg.photo.length - 1];
+      media.push({
+        type: 'photo',
+        fileId: largest.file_id,
+        fileSize: largest.file_size,
+      });
+    }
+
+    if (msg.document) {
+      media.push({
+        type: 'document',
+        fileId: msg.document.file_id,
+        fileName: msg.document.file_name,
+        mimeType: msg.document.mime_type,
+        fileSize: msg.document.file_size,
+      });
+    }
+
+    if (msg.audio) {
+      media.push({
+        type: 'audio',
+        fileId: msg.audio.file_id,
+        fileName: msg.audio.file_name,
+        mimeType: msg.audio.mime_type,
+        fileSize: msg.audio.file_size,
+      });
+    }
+
+    if (msg.video) {
+      media.push({
+        type: 'video',
+        fileId: msg.video.file_id,
+        fileName: msg.video.file_name,
+        mimeType: msg.video.mime_type,
+        fileSize: msg.video.file_size,
+      });
+    }
+
+    if (msg.voice) {
+      media.push({
+        type: 'voice',
+        fileId: msg.voice.file_id,
+        mimeType: msg.voice.mime_type,
+        fileSize: msg.voice.file_size,
+      });
+    }
+
+    if (msg.sticker) {
+      media.push({
+        type: 'sticker',
+        fileId: msg.sticker.file_id,
+        fileSize: msg.sticker.file_size,
+      });
+    }
+
+    return media;
+  }
+
+  // ── Outbound: send message (with HTML formatting + fallback) ───
+
+  async sendMessage(jid: string, text: string, replyToMessageId?: number): Promise<void> {
+    const chatId = fromJid(jid);
+    const chunks = formatAndChunk(text);
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const replyParams = i === 0 && replyToMessageId
+        ? { reply_parameters: { message_id: replyToMessageId } }
+        : {};
+
+      await this.sendWithHtmlFallback(chatId, chunk.html, chunk.plain, replyParams);
+    }
+    logger.info({ jid, length: text.length, chunks: chunks.length }, 'Telegram message sent');
+  }
+
+  private async sendWithHtmlFallback(
+    chatId: number,
+    html: string,
+    plain: string,
+    extraParams: Record<string, unknown> = {},
+  ): Promise<number> {
     try {
-      for (const chunk of chunks) {
-        await this.bot.api.sendMessage(chatId, chunk);
-      }
-      logger.info({ jid, length: text.length, chunks: chunks.length }, 'Telegram message sent');
+      const sent = await retryCall(
+        () => this.bot.api.sendMessage(chatId, html, {
+          parse_mode: 'HTML',
+          ...extraParams,
+        }),
+        'sendMessage-html',
+      );
+      return sent.message_id;
     } catch (err) {
-      logger.error({ jid, err }, 'Failed to send Telegram message');
+      if (isTelegramHtmlParseError(err)) {
+        logger.warn({ chatId }, 'HTML parse failed, falling back to plain text');
+        // Retry without reply_parameters if thread not found
+        try {
+          const sent = await retryCall(
+            () => this.bot.api.sendMessage(chatId, plain, extraParams),
+            'sendMessage-plain',
+          );
+          return sent.message_id;
+        } catch (err2) {
+          if (isTelegramThreadNotFoundError(err2)) {
+            const { reply_parameters: _, ...noReply } = extraParams;
+            const sent = await retryCall(
+              () => this.bot.api.sendMessage(chatId, plain, noReply),
+              'sendMessage-plain-nothread',
+            );
+            return sent.message_id;
+          }
+          throw err2;
+        }
+      }
+      // Thread not found — retry without reply
+      if (isTelegramThreadNotFoundError(err)) {
+        const { reply_parameters: _, ...noReply } = extraParams;
+        const sent = await retryCall(
+          () => this.bot.api.sendMessage(chatId, html, { parse_mode: 'HTML', ...noReply }),
+          'sendMessage-html-nothread',
+        );
+        return sent.message_id;
+      }
       throw err;
     }
   }
+
+  // ── Streaming: send → edit → edit → ... → finalize ─────────────
+
+  async sendStreamingChunk(jid: string, text: string, messageId?: number, replyToMessageId?: number): Promise<number> {
+    const chatId = fromJid(jid);
+    const html = markdownToTelegramHtml(text);
+
+    // Trim to Telegram's limit
+    const trimmedHtml = html.length > MAX_MESSAGE_LENGTH
+      ? html.slice(0, MAX_MESSAGE_LENGTH - 3) + '...'
+      : html;
+
+    if (messageId == null) {
+      // First chunk — send new message (with reply threading if available)
+      const replyParams = replyToMessageId
+        ? { reply_parameters: { message_id: replyToMessageId } }
+        : {};
+      const sent = await this.sendWithHtmlFallback(chatId, trimmedHtml, text, replyParams);
+      this.streams.set(jid, {
+        messageId: sent,
+        text,
+        lastEditTime: Date.now(),
+        chatId,
+      });
+      return sent;
+    }
+
+    // Subsequent chunks — throttle edits
+    const stream = this.streams.get(jid);
+    const now = Date.now();
+    if (stream && now - stream.lastEditTime < STREAM_THROTTLE_MS) {
+      // Too soon — just update local state, skip API call
+      stream.text = text;
+      return messageId;
+    }
+
+    try {
+      await retryCall(
+        () => this.bot.api.editMessageText(chatId, messageId, trimmedHtml, {
+          parse_mode: 'HTML',
+        }),
+        'editMessageText-stream',
+      );
+    } catch (err) {
+      // "message is not modified" is a no-op
+      if (err instanceof GrammyError && err.description?.includes('not modified')) {
+        // Silently ignore
+      } else if (isTelegramHtmlParseError(err)) {
+        // Fallback to plain text edit
+        const plain = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH - 3) + '...' : text;
+        try {
+          await retryCall(
+            () => this.bot.api.editMessageText(chatId, messageId, plain),
+            'editMessageText-plain',
+          );
+        } catch {
+          // Give up silently — next edit will try again
+        }
+      } else {
+        logger.debug({ jid, err }, 'Streaming edit failed');
+      }
+    }
+
+    if (stream) {
+      stream.text = text;
+      stream.lastEditTime = now;
+    }
+
+    return messageId;
+  }
+
+  async finalizeStream(jid: string, messageId: number, text: string): Promise<void> {
+    const chatId = fromJid(jid);
+    this.streams.delete(jid);
+
+    // If text exceeds limit, we need to split into chunks
+    if (text.length > MAX_MESSAGE_LENGTH) {
+      const chunks = formatAndChunk(text);
+      // Edit first message with first chunk
+      try {
+        await retryCall(
+          () => this.bot.api.editMessageText(chatId, messageId, chunks[0].html, {
+            parse_mode: 'HTML',
+          }),
+          'finalizeStream-edit',
+        );
+      } catch (err) {
+        if (isTelegramHtmlParseError(err)) {
+          await retryCall(
+            () => this.bot.api.editMessageText(chatId, messageId, chunks[0].plain),
+            'finalizeStream-edit-plain',
+          ).catch(() => {});
+        }
+        // Continue with remaining chunks regardless
+      }
+      // Send remaining chunks as new messages
+      for (let i = 1; i < chunks.length; i++) {
+        await this.sendWithHtmlFallback(chatId, chunks[i].html, chunks[i].plain);
+      }
+      return;
+    }
+
+    // Single chunk — do final edit
+    const html = markdownToTelegramHtml(text);
+    try {
+      await retryCall(
+        () => this.bot.api.editMessageText(chatId, messageId, html, {
+          parse_mode: 'HTML',
+        }),
+        'finalizeStream-edit',
+      );
+    } catch (err) {
+      if (err instanceof GrammyError && err.description?.includes('not modified')) {
+        // Already up to date
+      } else if (isTelegramHtmlParseError(err)) {
+        await retryCall(
+          () => this.bot.api.editMessageText(chatId, messageId, text),
+          'finalizeStream-edit-plain',
+        ).catch(() => {});
+      } else {
+        logger.debug({ jid, err }, 'Stream finalize edit failed');
+      }
+    }
+  }
+
+  // ── Reactions ────────────────────────────────────────────────────
+
+  async sendReaction(jid: string, messageId: number, emoji: string): Promise<void> {
+    const chatId = fromJid(jid);
+    try {
+      await retryCall(
+        () => this.bot.api.setMessageReaction(chatId, messageId, [
+          { type: 'emoji', emoji } as any,
+        ]),
+        'setMessageReaction',
+      );
+    } catch (err) {
+      logger.debug({ jid, messageId, emoji, err }, 'Failed to send reaction');
+    }
+  }
+
+  // ── Standard channel methods ─────────────────────────────────────
 
   isConnected(): boolean {
     return this.connected;
@@ -225,6 +707,13 @@ export class TelegramChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.connected = false;
+    // Flush all pending fragments
+    for (const [key] of this.fragments) {
+      const frag = this.fragments.get(key);
+      if (frag) clearTimeout(frag.flushTimer);
+    }
+    this.fragments.clear();
+    this.streams.clear();
     await this.bot.stop();
   }
 
