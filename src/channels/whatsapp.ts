@@ -25,6 +25,7 @@ export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  onSelfJidReady?: (jid: string) => void;
 }
 
 export class WhatsAppChannel implements Channel {
@@ -114,6 +115,10 @@ export class WhatsAppChannel implements Channel {
           if (lidUser && phoneUser) {
             this.lidToPhoneMap[lidUser] = `${phoneUser}@s.whatsapp.net`;
             logger.debug({ lidUser, phoneUser }, 'LID to phone mapping set');
+          }
+          // Notify orchestrator of our self-chat JID for main group bootstrap
+          if (phoneUser && this.opts.onSelfJidReady) {
+            this.opts.onSelfJidReady(`${phoneUser}@s.whatsapp.net`);
           }
         }
 

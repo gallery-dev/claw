@@ -444,6 +444,20 @@ async function main(): Promise<void> {
     onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
       storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onSelfJidReady: (selfJid: string) => {
+      // Auto-register self-chat as main group if no main group exists yet
+      const hasMain = Object.values(registeredGroups).some((g) => g.folder === MAIN_GROUP_FOLDER);
+      if (!hasMain) {
+        registerGroup(selfJid, {
+          name: 'Main',
+          folder: MAIN_GROUP_FOLDER,
+          trigger: '',
+          added_at: new Date().toISOString(),
+          requiresTrigger: false,
+        });
+        logger.info({ selfJid }, 'Auto-registered self-chat as main group');
+      }
+    },
   };
 
   // Create and connect channels
