@@ -224,6 +224,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (supportsStreaming && streamMessageId != null && accumulatedText) {
         await channel.finalizeStream!(chatJid, streamMessageId, accumulatedText);
       }
+      // Reset streaming state so the next piped message starts a fresh message
+      streamMessageId = undefined;
+      accumulatedText = '';
       queue.notifyIdle(chatJid);
     }
 
@@ -232,6 +235,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (supportsStreaming && streamMessageId != null && accumulatedText) {
         await channel.finalizeStream!(chatJid, streamMessageId, accumulatedText);
       }
+      // Reset streaming state
+      streamMessageId = undefined;
+      accumulatedText = '';
       hadError = true;
     }
   });
@@ -495,7 +501,24 @@ async function main(): Promise<void> {
 
   // Telegram (optional — only if bot token is configured)
   if (TELEGRAM_BOT_TOKEN) {
-    const telegram = new TelegramChannel({ ...channelOpts, botToken: TELEGRAM_BOT_TOKEN });
+    const telegram = new TelegramChannel({
+      ...channelOpts,
+      botToken: TELEGRAM_BOT_TOKEN,
+      onAutoRegisterDm: (jid: string, senderName: string) => {
+        if (registeredGroups[jid]) return; // Already registered
+
+        // Telegram DMs always use the "main" folder so they share the same
+        // system prompt, context, and tools as the primary channel.
+        registerGroup(jid, {
+          name: `${senderName} (Telegram)`,
+          folder: MAIN_GROUP_FOLDER,
+          trigger: '',
+          added_at: new Date().toISOString(),
+          requiresTrigger: false,
+        });
+        logger.info({ jid, senderName, folder: MAIN_GROUP_FOLDER }, 'Auto-registered Telegram DM');
+      },
+    });
     channels.push(telegram);
     await telegram.connect();
     logger.info('Telegram channel enabled');

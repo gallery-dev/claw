@@ -34,6 +34,9 @@ export interface TelegramChannelOpts {
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
   botToken: string;
+  /** Called when a Telegram DM arrives from a user who passes policy checks
+   *  but whose chat isn't registered yet. index.ts uses this to auto-register. */
+  onAutoRegisterDm?: (jid: string, senderName: string) => void;
 }
 
 // ── JID helpers ────────────────────────────────────────────────────
@@ -192,10 +195,24 @@ export class TelegramChannel implements Channel {
     this.bot = new Bot(opts.botToken);
 
     // Rate limiter — prevents hitting Telegram's API limits
-    this.bot.api.config.use(apiThrottler());
+    // NOTE: apiThrottler wraps ALL api calls including getUpdates.
+    // Only install it after polling is running to avoid interference.
+    this.throttlerInstalled = false;
   }
 
+  private throttlerInstalled: boolean;
+
   async connect(): Promise<void> {
+    // Raw update logger — fires for EVERY update received from Telegram
+    this.bot.use((ctx, next) => {
+      const updateKeys = Object.keys(ctx.update).filter((k) => k !== 'update_id');
+      logger.debug(
+        { updateId: ctx.update.update_id, types: updateKeys },
+        'Telegram update received',
+      );
+      return next();
+    });
+
     // Bot commands (registered before general message handler)
     this.bot.command('chatid', (ctx) => {
       const chatId = ctx.chat.id;
@@ -237,12 +254,29 @@ export class TelegramChannel implements Channel {
       logger.error({ err: err.error, update: err.ctx?.update?.update_id }, 'Telegram bot error');
     });
 
-    // Start long polling
+    // Start long polling (not awaited — runs in background)
+    logger.info('Starting Telegram long polling...');
     this.bot.start({
+      allowed_updates: ['message', 'message_reaction'],
       onStart: (botInfo) => {
         this.connected = true;
         logger.info({ username: botInfo.username, dmPolicy: TELEGRAM_DM_POLICY }, 'Connected to Telegram');
+
+        // Install throttler AFTER polling is established to avoid
+        // interfering with the initial getUpdates setup
+        if (!this.throttlerInstalled) {
+          this.bot.api.config.use(apiThrottler());
+          this.throttlerInstalled = true;
+          logger.debug('API throttler installed');
+        }
       },
+    }).then(() => {
+      // bot.start() resolves when bot.stop() is called — should not happen unexpectedly
+      logger.warn('Telegram polling loop ended');
+      this.connected = false;
+    }).catch((err) => {
+      this.connected = false;
+      logger.error({ err }, 'Telegram polling loop crashed');
     });
   }
 
@@ -281,8 +315,17 @@ export class TelegramChannel implements Channel {
     }
     this.opts.onChatMetadata(jid, timestamp, chatName, 'telegram', isGroup);
 
+    // Auto-register Telegram DMs that pass policy checks
+    let groups = this.opts.registeredGroups();
+    if (!groups[jid] && isDm && this.opts.onAutoRegisterDm) {
+      const senderName = msg.from
+        ? (msg.from.first_name + (msg.from.last_name ? ` ${msg.from.last_name}` : ''))
+        : 'Telegram DM';
+      this.opts.onAutoRegisterDm(jid, senderName);
+      groups = this.opts.registeredGroups(); // Refresh after registration
+    }
+
     // Only deliver full message for registered groups
-    const groups = this.opts.registeredGroups();
     if (!groups[jid]) return;
 
     // --- Extract content and media ---
