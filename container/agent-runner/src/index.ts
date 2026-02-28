@@ -69,6 +69,7 @@ class MessageStream {
   private done = false;
 
   push(text: string): void {
+    if (this.done) return;
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
@@ -242,7 +243,7 @@ class ToolCallTracker {
     const str = JSON.stringify(input);
     let hash = 5381;
     for (let i = 0; i < str.length; i++) {
-      hash = ((hash << 5) + hash) + str.charCodeAt(i);
+      hash = ((hash << 5) + hash + str.charCodeAt(i)) | 0;
     }
     return (hash >>> 0).toString(36);
   }
@@ -330,6 +331,12 @@ function createLoopDetectionHook(tracker: ToolCallTracker): HookCallback {
     if (loopDetected && !tracker.hasIssuedWarning()) {
       log(`[loop-detect] WARNING: Repetitive tool use detected for ${toolName}`);
       tracker.markWarningIssued();
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          message: 'WARNING: You appear to be repeating the same tool calls. Consider trying a different approach before this call gets blocked.',
+        },
+      };
     }
 
     if (!loopDetected) {
@@ -548,87 +555,89 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
-  for await (const message of query({
-    prompt: stream,
-    options: {
-      cwd: '/workspace/group',
-      additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
-      resume: sessionId,
-      resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__claw__*'
-      ],
-      env: sdkEnv,
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
-      mcpServers: {
-        claw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            CLAW_CHAT_JID: containerInput.chatJid,
-            CLAW_GROUP_FOLDER: containerInput.groupFolder,
-            CLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+  try {
+    for await (const message of query({
+      prompt: stream,
+      options: {
+        cwd: '/workspace/group',
+        additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
+        resume: sessionId,
+        resumeSessionAt: resumeAt,
+        systemPrompt: globalClaudeMd
+          ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+          : undefined,
+        allowedTools: [
+          'Bash',
+          'Read', 'Write', 'Edit', 'Glob', 'Grep',
+          'WebSearch', 'WebFetch',
+          'Task', 'TaskOutput', 'TaskStop',
+          'TeamCreate', 'TeamDelete', 'SendMessage',
+          'TodoWrite', 'ToolSearch', 'Skill',
+          'NotebookEdit',
+          'mcp__claw__*'
+        ],
+        env: sdkEnv,
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        settingSources: ['project', 'user'],
+        mcpServers: {
+          claw: {
+            command: 'node',
+            args: [mcpServerPath],
+            env: {
+              CLAW_CHAT_JID: containerInput.chatJid,
+              CLAW_GROUP_FOLDER: containerInput.groupFolder,
+              CLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            },
           },
         },
-      },
-      hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
-        PreToolUse: [
-          { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
-          { hooks: [createLoopDetectionHook(loopTracker)] },
-        ],
-      },
-    }
-  })) {
-    messageCount++;
-    const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
+        hooks: {
+          PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
+          PreToolUse: [
+            { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
+            { hooks: [createLoopDetectionHook(loopTracker)] },
+          ],
+        },
+      }
+    })) {
+      messageCount++;
+      const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
+      log(`[msg #${messageCount}] type=${msgType}`);
 
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
-    }
+      if (message.type === 'assistant' && 'uuid' in message) {
+        lastAssistantUuid = (message as { uuid: string }).uuid;
+      }
 
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
-      // Persist session ID to disk for crash recovery.
-      // If the container crashes before the host reads stdout, the host
-      // can recover the session ID from this file on next run.
-      try {
-        fs.writeFileSync('/workspace/group/.current-session-id', newSessionId);
-      } catch { /* non-fatal */ }
-    }
+      if (message.type === 'system' && message.subtype === 'init') {
+        newSessionId = message.session_id;
+        log(`Session initialized: ${newSessionId}`);
+        // Persist session ID to disk for crash recovery.
+        // If the container crashes before the host reads stdout, the host
+        // can recover the session ID from this file on next run.
+        try {
+          fs.writeFileSync('/workspace/group/.current-session-id', newSessionId);
+        } catch { /* non-fatal */ }
+      }
 
-    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-      const tn = message as { task_id: string; status: string; summary: string };
-      log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
-    }
+      if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
+        const tn = message as { task_id: string; status: string; summary: string };
+        log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
+      }
 
-    if (message.type === 'result') {
-      resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      writeOutput({
-        status: 'success',
-        result: textResult || null,
-        newSessionId
-      });
+      if (message.type === 'result') {
+        resultCount++;
+        const textResult = 'result' in message ? (message as { result?: string }).result : null;
+        log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+        writeOutput({
+          status: 'success',
+          result: textResult || null,
+          newSessionId
+        });
+      }
     }
+  } finally {
+    ipcPolling = false;
   }
-
-  ipcPolling = false;
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }

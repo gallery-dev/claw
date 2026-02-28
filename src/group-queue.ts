@@ -341,12 +341,11 @@ export class GroupQueue {
     }
   }
 
-  async shutdown(_gracePeriodMs: number): Promise<void> {
+  async shutdown(gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
 
     // Count active containers but don't kill them — they'll finish on their own
     // via idle timeout or container timeout. The --rm flag cleans them up on exit.
-    // This prevents WhatsApp reconnection restarts from killing working agents.
     const activeContainers: string[] = [];
     for (const [jid, state] of this.groups) {
       if (state.process && !state.process.killed && state.containerName) {
@@ -356,7 +355,21 @@ export class GroupQueue {
 
     logger.info(
       { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      'GroupQueue shutting down — waiting for active containers',
     );
+
+    // Wait for active containers to finish (up to gracePeriodMs)
+    if (this.activeCount > 0 && gracePeriodMs > 0) {
+      const deadline = Date.now() + gracePeriodMs;
+      while (this.activeCount > 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      if (this.activeCount > 0) {
+        logger.warn(
+          { activeCount: this.activeCount },
+          'Grace period expired, detaching remaining containers',
+        );
+      }
+    }
   }
 }

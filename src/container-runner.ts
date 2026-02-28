@@ -310,6 +310,8 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
+    let resolved = false;
+
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -440,6 +442,8 @@ export async function runContainerAgent(
     };
 
     container.on('close', (code) => {
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
 
@@ -635,6 +639,8 @@ export async function runContainerAgent(
     });
 
     container.on('error', (err) => {
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timeout);
       logger.error(
         { group: group.name, containerName, error: err },

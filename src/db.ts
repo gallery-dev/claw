@@ -540,15 +540,19 @@ export function getRegisteredGroup(
     );
     return undefined;
   }
+  let containerConfig;
+  try {
+    containerConfig = row.container_config ? JSON.parse(row.container_config) : undefined;
+  } catch {
+    containerConfig = undefined;
+  }
   return {
     jid: row.jid,
     name: row.name,
     folder: row.folder,
     trigger: row.trigger_pattern,
     added_at: row.added_at,
-    containerConfig: row.container_config
-      ? JSON.parse(row.container_config)
-      : undefined,
+    containerConfig,
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
   };
@@ -591,14 +595,18 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       );
       continue;
     }
+    let containerConfig;
+    try {
+      containerConfig = row.container_config ? JSON.parse(row.container_config) : undefined;
+    } catch {
+      containerConfig = undefined;
+    }
     result[row.jid] = {
       name: row.name,
       folder: row.folder,
       trigger: row.trigger_pattern,
       added_at: row.added_at,
-      containerConfig: row.container_config
-        ? JSON.parse(row.container_config)
-        : undefined,
+      containerConfig,
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     };

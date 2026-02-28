@@ -356,8 +356,22 @@ export class TelegramChannel implements Channel {
       logger.warn('Telegram polling loop ended');
       this.connected = false;
     }).catch((err) => {
+      logger.error({ err }, 'Telegram bot polling crashed');
       this.connected = false;
-      logger.error({ err }, 'Telegram polling loop crashed');
+      // Auto-reconnect after 5 seconds
+      setTimeout(() => {
+        logger.info('Attempting Telegram bot reconnect...');
+        this.bot.start({ drop_pending_updates: true })
+          .then(() => {
+            this.connected = false;
+            logger.warn('Telegram bot polling stopped');
+          })
+          .catch((reconnectErr) => {
+            logger.error({ err: reconnectErr }, 'Telegram bot reconnect failed');
+            this.connected = false;
+          });
+        this.connected = true;
+      }, 5000);
     });
   }
 
@@ -831,10 +845,13 @@ export class TelegramChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.connected = false;
-    // Flush all pending fragments
-    for (const [key] of this.fragments) {
-      const frag = this.fragments.get(key);
-      if (frag) clearTimeout(frag.flushTimer);
+    // Flush all pending fragments before clearing
+    for (const [key, frag] of this.fragments) {
+      clearTimeout(frag.flushTimer);
+      const jid = toJid(frag.chatId);
+      const sender = `tg:${frag.senderId}`;
+      const timestamp = new Date().toISOString();
+      this.flushFragment(key, jid, sender, 'Unknown', timestamp, []);
     }
     this.fragments.clear();
     this.streams.clear();
