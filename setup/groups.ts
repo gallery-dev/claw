@@ -2,7 +2,7 @@
  * Step: groups — Connect to WhatsApp, fetch group metadata, write to DB.
  * Replaces 05-sync-groups.sh + 05b-list-groups.sh
  */
-import { execSync, spawnSync } from 'child_process';
+import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -17,7 +17,10 @@ function parseArgs(args: string[]): { list: boolean; limit: number } {
   let limit = 30;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--list') list = true;
-    if (args[i] === '--limit' && args[i + 1]) { limit = parseInt(args[i + 1], 10); i++; }
+    if (args[i] === '--limit' && args[i + 1]) {
+      limit = parseInt(args[i + 1], 10);
+      i++;
+    }
   }
   return { list, limit };
 }
@@ -43,12 +46,14 @@ async function listGroups(limit: number): Promise<void> {
   }
 
   const db = new Database(dbPath, { readonly: true });
-  const rows = db.prepare(
-    `SELECT jid, name FROM chats
+  const rows = db
+    .prepare(
+      `SELECT jid, name FROM chats
      WHERE jid LIKE '%@g.us' AND jid <> '__group_sync__' AND name <> jid
      ORDER BY last_message_time DESC
      LIMIT ?`,
-  ).all(limit) as Array<{ jid: string; name: string }>;
+    )
+    .all(limit) as Array<{ jid: string; name: string }>;
   db.close();
 
   for (const row of rows) {
@@ -153,23 +158,17 @@ sock.ev.on('connection.update', async (update) => {
 });
 `;
 
-    const tmpScript = path.join(projectRoot, 'store', '_sync-groups.mjs');
-    fs.writeFileSync(tmpScript, syncScript);
-    try {
-      const result = spawnSync('node', [tmpScript], {
+    const output = execSync(
+      `node --input-type=module -e ${JSON.stringify(syncScript)}`,
+      {
         cwd: projectRoot,
         encoding: 'utf-8',
         timeout: 45000,
         stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      const output = result.stdout || '';
-      syncOk = output.includes('SYNCED:');
-      if (syncOk) {
-        logger.info({ output: output.trim() }, 'Sync output');
-      }
-    } finally {
-      fs.rmSync(tmpScript, { force: true });
-    }
+      },
+    );
+    syncOk = output.includes('SYNCED:');
+    logger.info({ output: output.trim() }, 'Sync output');
   } catch (err) {
     logger.error({ err }, 'Sync failed');
   }
@@ -180,9 +179,11 @@ sock.ev.on('connection.update', async (update) => {
   if (fs.existsSync(dbPath)) {
     try {
       const db = new Database(dbPath, { readonly: true });
-      const row = db.prepare(
-        "SELECT COUNT(*) as count FROM chats WHERE jid LIKE '%@g.us' AND jid <> '__group_sync__'",
-      ).get() as { count: number };
+      const row = db
+        .prepare(
+          "SELECT COUNT(*) as count FROM chats WHERE jid LIKE '%@g.us' AND jid <> '__group_sync__'",
+        )
+        .get() as { count: number };
       groupsInDb = row.count;
       db.close();
     } catch {
