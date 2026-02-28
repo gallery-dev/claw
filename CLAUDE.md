@@ -1,10 +1,10 @@
-# NanoClaw
+# Claw
 
-Personal Claude assistant. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
+Personal AI agent runtime, powered by Gallery.dev. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
 
 ## Quick Context
 
-Single Node.js process that connects to WhatsApp, routes messages to Claude Agent SDK running in containers (Linux VMs). Each group has isolated filesystem and memory.
+Single Node.js process that connects to messaging channels (WhatsApp, Telegram), routes messages to Claude Agent SDK running in containers (Linux VMs). Each group has isolated filesystem and memory. Gallery.dev manages agent configuration, task tracking, and billing.
 
 ## Key Files
 

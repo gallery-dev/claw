@@ -53,6 +53,11 @@ export class GroupQueue {
     return state;
   }
 
+  isActive(groupJid: string): boolean {
+    const state = this.groups.get(groupJid);
+    return state?.active ?? false;
+  }
+
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
   }

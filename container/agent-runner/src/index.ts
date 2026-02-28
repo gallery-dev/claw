@@ -142,6 +142,8 @@ function getSessionSummary(sessionId: string, transcriptPath: string): string | 
 
 /**
  * Archive the full transcript to conversations/ before compaction.
+ * Also writes a compaction marker to the daily memory log so the agent
+ * knows context was reset (mirrors OpenClaw's pre-compaction flush).
  */
 function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -177,6 +179,17 @@ function createPreCompactHook(assistantName?: string): HookCallback {
       fs.writeFileSync(filePath, markdown);
 
       log(`Archived conversation to ${filePath}`);
+
+      // Write compaction marker to daily memory log
+      // This helps the agent know context was reset and where to find the archived conversation
+      const memoryDir = '/workspace/group/memory';
+      fs.mkdirSync(memoryDir, { recursive: true });
+      const dailyFile = path.join(memoryDir, `${date}.md`);
+      const timestamp = new Date().toISOString().split('T')[1].replace(/\.\d+Z$/, '');
+      const marker = `\n## Context compacted at ${timestamp}\n\nConversation archived to \`conversations/${filename}\`${summary ? `\nSummary: ${summary}` : ''}\n`;
+
+      fs.appendFileSync(dailyFile, marker);
+      log(`Wrote compaction marker to memory/${date}.md`);
     } catch (err) {
       log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -208,6 +221,126 @@ function createSanitizeBashHook(): HookCallback {
     };
   };
 }
+
+// ─── Tool Loop Detection ──────────────────────────────
+
+const LOOP_SAME_CALL_THRESHOLD = parseInt(process.env.LOOP_SAME_CALL_THRESHOLD || '3', 10);
+const LOOP_FORCE_STOP_THRESHOLD = parseInt(process.env.LOOP_FORCE_STOP_THRESHOLD || '6', 10);
+const LOOP_CYCLE_THRESHOLD = parseInt(process.env.LOOP_CYCLE_THRESHOLD || '3', 10);
+const LOOP_HISTORY_SIZE = 20;
+
+interface ToolCallRecord {
+  toolName: string;
+  inputHash: string;
+}
+
+class ToolCallTracker {
+  private history: ToolCallRecord[] = [];
+  private warningIssued = false;
+
+  private hashInput(input: unknown): string {
+    const str = JSON.stringify(input);
+    let hash = 5381;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) + hash) + str.charCodeAt(i);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  track(toolName: string, toolInput: unknown): { loopDetected: boolean; shouldStop: boolean } {
+    this.history.push({ toolName, inputHash: this.hashInput(toolInput) });
+    if (this.history.length > LOOP_HISTORY_SIZE) {
+      this.history.shift();
+    }
+
+    // Check 1: Same tool + same input N times in a row
+    const sameCallCount = this.countConsecutiveSame();
+    if (sameCallCount >= LOOP_FORCE_STOP_THRESHOLD) {
+      return { loopDetected: true, shouldStop: true };
+    }
+    if (sameCallCount >= LOOP_SAME_CALL_THRESHOLD) {
+      return { loopDetected: true, shouldStop: false };
+    }
+
+    // Check 2: Repeating cycle of 2-3 tools
+    const cycles2 = this.detectCycle(2);
+    const cycles3 = this.detectCycle(3);
+    if (cycles2 >= LOOP_CYCLE_THRESHOLD || cycles3 >= LOOP_CYCLE_THRESHOLD) {
+      const totalRepeats = Math.max(cycles2, cycles3);
+      return { loopDetected: true, shouldStop: totalRepeats >= LOOP_FORCE_STOP_THRESHOLD };
+    }
+
+    return { loopDetected: false, shouldStop: false };
+  }
+
+  private countConsecutiveSame(): number {
+    if (this.history.length === 0) return 0;
+    const last = this.history[this.history.length - 1];
+    let count = 0;
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      if (this.history[i].toolName === last.toolName && this.history[i].inputHash === last.inputHash) {
+        count++;
+      } else {
+        break;
+      }
+    }
+    return count;
+  }
+
+  private detectCycle(cycleLength: number): number {
+    if (this.history.length < cycleLength * 2) return 0;
+    const recent = this.history.slice(-cycleLength);
+    let repetitions = 1;
+    for (let offset = cycleLength; offset <= this.history.length - cycleLength; offset += cycleLength) {
+      const segment = this.history.slice(-(offset + cycleLength), -offset);
+      if (segment.length !== cycleLength) break;
+      const matches = segment.every(
+        (rec, i) => rec.toolName === recent[i].toolName && rec.inputHash === recent[i].inputHash,
+      );
+      if (matches) repetitions++;
+      else break;
+    }
+    return repetitions;
+  }
+
+  resetWarning(): void { this.warningIssued = false; }
+  hasIssuedWarning(): boolean { return this.warningIssued; }
+  markWarningIssued(): void { this.warningIssued = true; }
+}
+
+function createLoopDetectionHook(tracker: ToolCallTracker): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const preInput = input as PreToolUseHookInput;
+    const toolName = (preInput as { tool_name?: string }).tool_name || 'unknown';
+    const toolInput = preInput.tool_input;
+
+    const { loopDetected, shouldStop } = tracker.track(toolName, toolInput);
+
+    if (shouldStop) {
+      log(`[loop-detect] FORCE STOP: Tool ${toolName} in terminal loop`);
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          decision: 'block',
+          message: 'LOOP DETECTED: You have been calling the same tool with the same input repeatedly. This call is blocked. Try a completely different approach.',
+        },
+      };
+    }
+
+    if (loopDetected && !tracker.hasIssuedWarning()) {
+      log(`[loop-detect] WARNING: Repetitive tool use detected for ${toolName}`);
+      tracker.markWarningIssued();
+    }
+
+    if (!loopDetected) {
+      tracker.resetWarning();
+    }
+
+    return {};
+  };
+}
+
+// ─── End Tool Loop Detection ──────────────────────────
 
 function sanitizeFilename(summary: string): string {
   return summary
@@ -386,6 +519,7 @@ async function runQuery(
   };
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
 
+  const loopTracker = new ToolCallTracker();
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
@@ -451,7 +585,10 @@ async function runQuery(
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
-        PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
+          { hooks: [createLoopDetectionHook(loopTracker)] },
+        ],
       },
     }
   })) {
@@ -466,6 +603,12 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+      // Persist session ID to disk for crash recovery.
+      // If the container crashes before the host reads stdout, the host
+      // can recover the session ID from this file on next run.
+      try {
+        fs.writeFileSync('/workspace/group/.current-session-id', newSessionId);
+      } catch { /* non-fatal */ }
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -523,6 +666,15 @@ async function main(): Promise<void> {
 
   // Clean up stale _close sentinel from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+
+  // Clean up stale browser lock files from previous container runs.
+  // These prevent Chromium from starting if the previous container exited uncleanly.
+  const browserProfileDir = process.env.CHROMIUM_USER_DATA_DIR;
+  if (browserProfileDir && fs.existsSync(browserProfileDir)) {
+    for (const lockFile of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+      try { fs.unlinkSync(path.join(browserProfileDir, lockFile)); } catch { /* ignore */ }
+    }
+  }
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;

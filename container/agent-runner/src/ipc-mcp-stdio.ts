@@ -280,6 +280,331 @@ Use available_groups.json to find the JID for a group. The folder name should be
   },
 );
 
+// ─── Memory Tools ──────────────────────────────────────
+// Adapted from Anthropic's Memory Tool protocol + OpenClaw's memory_search/memory_get.
+// Files stored in /workspace/group/memory/ (daily notes) and /workspace/group/MEMORY.md (long-term).
+
+const MEMORY_DIR = '/workspace/group/memory';
+const MEMORY_FILE = '/workspace/group/MEMORY.md';
+
+server.tool(
+  'memory_view',
+  `View memory directory contents or read a specific memory file. Use this to check what you've remembered from past sessions.
+
+IMPORTANT: Check your memory before starting any task to avoid repeating past work.
+
+Returns directory listing (with sizes) or file contents with line numbers.`,
+  {
+    path: z.string().default('/').describe('Relative path within memory. "/" lists the memory directory. "MEMORY.md" reads the long-term memory file. "2026-02-28.md" reads a daily note.'),
+    view_range: z.array(z.number()).length(2).optional().describe('Optional [startLine, endLine] to read a specific range of a file.'),
+  },
+  async (args) => {
+    const requestedPath = args.path === '/' ? '' : args.path;
+
+    // MEMORY.md lives at the group root, daily notes in memory/
+    let targetPath: string;
+    if (requestedPath === 'MEMORY.md' || requestedPath === '/MEMORY.md') {
+      targetPath = MEMORY_FILE;
+    } else if (requestedPath === '' || requestedPath === '/') {
+      // List both MEMORY.md and memory/ contents
+      const entries: string[] = [];
+
+      if (fs.existsSync(MEMORY_FILE)) {
+        const stat = fs.statSync(MEMORY_FILE);
+        entries.push(`${formatSize(stat.size)}\tMEMORY.md`);
+      }
+
+      if (fs.existsSync(MEMORY_DIR)) {
+        const files = fs.readdirSync(MEMORY_DIR).filter(f => !f.startsWith('.')).sort();
+        for (const file of files) {
+          const filePath = path.join(MEMORY_DIR, file);
+          const stat = fs.statSync(filePath);
+          if (stat.isFile()) {
+            entries.push(`${formatSize(stat.size)}\tmemory/${file}`);
+          } else if (stat.isDirectory()) {
+            entries.push(`${formatSize(stat.size)}\tmemory/${file}/`);
+          }
+        }
+      }
+
+      if (entries.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'Memory is empty. Use memory_write to save notes.' }] };
+      }
+
+      return { content: [{ type: 'text' as const, text: `Memory files:\n${entries.join('\n')}` }] };
+    } else {
+      targetPath = path.join(MEMORY_DIR, requestedPath);
+    }
+
+    // Security: ensure path stays within group workspace
+    const resolved = path.resolve(targetPath);
+    if (!resolved.startsWith('/workspace/group/')) {
+      return { content: [{ type: 'text' as const, text: `Error: path must be within your workspace.` }], isError: true };
+    }
+
+    if (!fs.existsSync(targetPath)) {
+      return { content: [{ type: 'text' as const, text: `No memory file at "${args.path}". Use memory_write to create one.` }] };
+    }
+
+    const stat = fs.statSync(targetPath);
+    if (stat.isDirectory()) {
+      const files = fs.readdirSync(targetPath).filter(f => !f.startsWith('.')).sort();
+      const entries = files.map(f => {
+        const s = fs.statSync(path.join(targetPath, f));
+        return `${formatSize(s.size)}\t${f}${s.isDirectory() ? '/' : ''}`;
+      });
+      return { content: [{ type: 'text' as const, text: entries.length > 0 ? entries.join('\n') : '(empty directory)' }] };
+    }
+
+    const content = fs.readFileSync(targetPath, 'utf-8');
+    const lines = content.split('\n');
+
+    if (args.view_range) {
+      const [start, end] = args.view_range;
+      const slice = lines.slice(Math.max(0, start - 1), end);
+      const numbered = slice.map((line, i) => `${String(start + i).padStart(6)}\t${line}`).join('\n');
+      return { content: [{ type: 'text' as const, text: `${args.path} (lines ${start}-${end}):\n${numbered}` }] };
+    }
+
+    const numbered = lines.map((line, i) => `${String(i + 1).padStart(6)}\t${line}`).join('\n');
+    return { content: [{ type: 'text' as const, text: `${args.path}:\n${numbered}` }] };
+  },
+);
+
+server.tool(
+  'memory_write',
+  `Write or update a memory file. Use this to persist important information across sessions.
+
+Best practices:
+• MEMORY.md — curated long-term facts, decisions, preferences. Append-only unless reorganizing.
+• memory/YYYY-MM-DD.md — daily notes, running context, progress logs.
+• memory/topic.md — structured data about specific topics.
+
+When updating, prefer str_replace mode to avoid overwriting existing content.`,
+  {
+    path: z.string().describe('File path relative to memory. Examples: "MEMORY.md", "2026-02-28.md", "project-status.md"'),
+    content: z.string().describe('Content to write. For "append" mode, this is added to the end. For "replace" mode, this replaces the entire file. For "create" mode, this creates a new file.'),
+    mode: z.enum(['append', 'replace', 'create']).default('append').describe('append=add to end (default), replace=overwrite entire file, create=new file only (fails if exists)'),
+  },
+  async (args) => {
+    let targetPath: string;
+    if (args.path === 'MEMORY.md' || args.path === '/MEMORY.md') {
+      targetPath = MEMORY_FILE;
+    } else {
+      targetPath = path.join(MEMORY_DIR, args.path);
+    }
+
+    // Security: ensure path stays within group workspace
+    const resolved = path.resolve(targetPath);
+    if (!resolved.startsWith('/workspace/group/')) {
+      return { content: [{ type: 'text' as const, text: `Error: path must be within your workspace.` }], isError: true };
+    }
+
+    // Ensure parent directory exists
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+
+    if (args.mode === 'create' && fs.existsSync(targetPath)) {
+      return { content: [{ type: 'text' as const, text: `Error: "${args.path}" already exists. Use mode "append" or "replace".` }], isError: true };
+    }
+
+    if (args.mode === 'append') {
+      const existing = fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf-8') : '';
+      const separator = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
+      fs.writeFileSync(targetPath, existing + separator + args.content);
+    } else {
+      fs.writeFileSync(targetPath, args.content);
+    }
+
+    const stat = fs.statSync(targetPath);
+    return { content: [{ type: 'text' as const, text: `Memory written: ${args.path} (${formatSize(stat.size)})` }] };
+  },
+);
+
+server.tool(
+  'memory_search',
+  `Search across all memory files for relevant information. Uses keyword matching across MEMORY.md, memory/*.md, and conversations/*.md.
+
+Returns matching snippets with file paths and line numbers. Use this when you need to find something but don't know which file it's in.`,
+  {
+    query: z.string().describe('Search query — keywords or phrases to find in memory files'),
+    scope: z.enum(['memory', 'conversations', 'all']).default('all').describe('Where to search: memory=MEMORY.md + memory/, conversations=conversations/, all=everything'),
+  },
+  async (args) => {
+    const results: Array<{ file: string; line: number; text: string }> = [];
+    const queryLower = args.query.toLowerCase();
+    const queryTerms = queryLower.split(/\s+/).filter(Boolean);
+
+    const searchFile = (filePath: string, displayName: string) => {
+      try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const lines = content.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          const lineLower = lines[i].toLowerCase();
+          if (queryTerms.some(term => lineLower.includes(term))) {
+            // Include context: line before + matched line + line after
+            const start = Math.max(0, i - 1);
+            const end = Math.min(lines.length, i + 2);
+            const snippet = lines.slice(start, end).join('\n');
+            results.push({ file: displayName, line: i + 1, text: snippet.slice(0, 300) });
+          }
+        }
+      } catch { /* skip unreadable files */ }
+    };
+
+    const searchDir = (dirPath: string, prefix: string) => {
+      if (!fs.existsSync(dirPath)) return;
+      const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.md')).sort();
+      for (const file of files) {
+        searchFile(path.join(dirPath, file), `${prefix}${file}`);
+      }
+    };
+
+    // Search memory files
+    if (args.scope === 'memory' || args.scope === 'all') {
+      if (fs.existsSync(MEMORY_FILE)) {
+        searchFile(MEMORY_FILE, 'MEMORY.md');
+      }
+      searchDir(MEMORY_DIR, 'memory/');
+    }
+
+    // Search conversations
+    if (args.scope === 'conversations' || args.scope === 'all') {
+      searchDir('/workspace/group/conversations', 'conversations/');
+    }
+
+    if (results.length === 0) {
+      return { content: [{ type: 'text' as const, text: `No matches for "${args.query}" in ${args.scope} files.` }] };
+    }
+
+    // Deduplicate nearby results from the same file
+    const deduped = results.filter((r, i) => {
+      if (i === 0) return true;
+      const prev = results[i - 1];
+      return !(r.file === prev.file && Math.abs(r.line - prev.line) <= 2);
+    });
+
+    // Limit to top 10 results
+    const top = deduped.slice(0, 10);
+    const formatted = top.map(r => `**${r.file}:${r.line}**\n${r.text}`).join('\n\n---\n\n');
+    const truncated = deduped.length > 10 ? `\n\n(${deduped.length - 10} more results omitted)` : '';
+
+    return { content: [{ type: 'text' as const, text: `Found ${deduped.length} match(es) for "${args.query}":\n\n${formatted}${truncated}` }] };
+  },
+);
+
+server.tool(
+  'memory_delete',
+  'Delete a memory file that is no longer relevant. Keeps memory organized.',
+  {
+    path: z.string().describe('File path to delete, relative to memory. Examples: "2026-01-15.md", "old-project.md"'),
+  },
+  async (args) => {
+    let targetPath: string;
+    if (args.path === 'MEMORY.md' || args.path === '/MEMORY.md') {
+      targetPath = MEMORY_FILE;
+    } else {
+      targetPath = path.join(MEMORY_DIR, args.path);
+    }
+
+    const resolved = path.resolve(targetPath);
+    if (!resolved.startsWith('/workspace/group/')) {
+      return { content: [{ type: 'text' as const, text: `Error: path must be within your workspace.` }], isError: true };
+    }
+
+    if (!fs.existsSync(targetPath)) {
+      return { content: [{ type: 'text' as const, text: `File "${args.path}" not found.` }], isError: true };
+    }
+
+    fs.unlinkSync(targetPath);
+    return { content: [{ type: 'text' as const, text: `Deleted ${args.path}` }] };
+  },
+);
+
+// ─── Multi-Session Management Tools ──────────────────────
+
+server.tool(
+  'list_sessions',
+  'List all active agent sessions across groups. Main group only. Shows group name, folder, and container status.',
+  {},
+  async () => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can list all sessions.' }], isError: true };
+    }
+
+    const sessionsFile = path.join(IPC_DIR, 'active_sessions.json');
+    try {
+      if (!fs.existsSync(sessionsFile)) {
+        return { content: [{ type: 'text' as const, text: 'No session data available. Sessions are populated before each agent run.' }] };
+      }
+      const sessions = JSON.parse(fs.readFileSync(sessionsFile, 'utf-8'));
+      if (!Array.isArray(sessions) || sessions.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No groups registered.' }] };
+      }
+      const formatted = sessions
+        .map((s: { groupFolder: string; groupName: string; hasActiveContainer: boolean; hasSession: boolean }) =>
+          `- **${s.groupName}** (${s.groupFolder}): ${s.hasActiveContainer ? 'container active' : 'idle'}${s.hasSession ? ', has session' : ''}`)
+        .join('\n');
+      return { content: [{ type: 'text' as const, text: `Active sessions:\n${formatted}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error reading sessions: ${err instanceof Error ? err.message : String(err)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'send_to_group',
+  'Send a message to another group\'s agent. Main group only. The message will be queued as if a user sent it, triggering the target agent to process it.',
+  {
+    target_group_folder: z.string().describe('The target group folder name (e.g., "researcher", "family-chat")'),
+    text: z.string().describe('The message text to send to the target group\'s agent'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can send messages to other groups.' }], isError: true };
+    }
+
+    const data = {
+      type: 'send_to_group',
+      targetGroupFolder: args.target_group_folder,
+      text: args.text,
+      sourceGroup: groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+    return { content: [{ type: 'text' as const, text: `Message queued for group "${args.target_group_folder}".` }] };
+  },
+);
+
+server.tool(
+  'close_group_session',
+  'Close another group\'s active agent container. Main group only. Use to free resources or restart a stuck agent.',
+  {
+    target_group_folder: z.string().describe('The target group folder name to close'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can close other group sessions.' }], isError: true };
+    }
+
+    const data = {
+      type: 'close_group_session',
+      targetGroupFolder: args.target_group_folder,
+      sourceGroup: groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+    return { content: [{ type: 'text' as const, text: `Close request sent for group "${args.target_group_folder}".` }] };
+  },
+);
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}K`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}M`;
+}
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

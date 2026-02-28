@@ -12,6 +12,7 @@ const envConfig = readEnvFile([
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_DM_POLICY',
   'TELEGRAM_ALLOWED_USERS',
+  'TELEGRAM_BOT_POOL',
 ]);
 
 export const ASSISTANT_NAME =
@@ -31,6 +32,11 @@ export const TELEGRAM_ALLOWED_USERS = new Set(
     .map((s) => s.trim())
     .filter(Boolean),
 );
+// Comma-separated bot tokens for the agent swarm pool (send-only bots for sub-agent identities)
+export const TELEGRAM_BOT_POOL = (process.env.TELEGRAM_BOT_POOL || envConfig.TELEGRAM_BOT_POOL || '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 

@@ -1,20 +1,24 @@
 import fs from 'fs';
 import path from 'path';
 
+import { CronExpressionParser } from 'cron-parser';
 import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
+  TELEGRAM_BOT_POOL,
   TELEGRAM_BOT_TOKEN,
+  TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
-import { TelegramChannel } from './channels/telegram.js';
+import { TelegramChannel, initBotPool } from './channels/telegram.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
   runContainerAgent,
   writeGroupsSnapshot,
+  writeSessionsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
@@ -22,6 +26,7 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  createTask,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -29,6 +34,7 @@ import {
   getMessagesSince,
   getNewMessages,
   getRouterState,
+  getTasksForGroup,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
@@ -46,6 +52,16 @@ import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
+
+// Validate timezone on startup — invalid TZ silently breaks cron scheduling
+try {
+  CronExpressionParser.parse('0 0 * * *', { tz: TIMEZONE });
+} catch (err) {
+  logger.error(
+    { timezone: TIMEZONE, err },
+    `Invalid TIMEZONE "${TIMEZONE}". Cron tasks will not run correctly. Set TZ to a valid IANA timezone (e.g., "America/New_York").`,
+  );
+}
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
@@ -96,6 +112,37 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+
+  // Auto-register heartbeat task if HEARTBEAT.md exists and no heartbeat task yet
+  const heartbeatPath = path.join(groupDir, 'HEARTBEAT.md');
+  if (fs.existsSync(heartbeatPath)) {
+    try {
+      const existingTasks = getTasksForGroup(group.folder);
+      const hasHeartbeat = existingTasks.some(
+        (t) => t.prompt.includes('HEARTBEAT.md') && t.status === 'active',
+      );
+      if (!hasHeartbeat) {
+        const cronExpr = '0 */6 * * *'; // Every 6 hours
+        const nextRun = CronExpressionParser.parse(cronExpr, { tz: TIMEZONE }).next().toISOString();
+        const taskId = `heartbeat-${group.folder}-${Date.now()}`;
+        createTask({
+          id: taskId,
+          group_folder: group.folder,
+          chat_jid: jid,
+          prompt: 'Read HEARTBEAT.md in your workspace. Check each item on the checklist. Act on anything that needs attention (check memory, check tasks, update daily notes). If nothing needs attention, reply exactly: HEARTBEAT_OK',
+          schedule_type: 'cron',
+          schedule_value: cronExpr,
+          context_mode: 'group',
+          next_run: nextRun,
+          status: 'active',
+          created_at: new Date().toISOString(),
+        });
+        logger.info({ group: group.name, taskId }, 'Auto-registered heartbeat task');
+      }
+    } catch (err) {
+      logger.warn({ err, group: group.name }, 'Failed to auto-register heartbeat task');
+    }
+  }
 
   logger.info(
     { jid, name: group.name, folder: group.folder },
@@ -287,7 +334,32 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
+  let sessionId = sessions[group.folder];
+
+  // Session crash recovery: if we don't have a session ID in memory,
+  // check the group directory for a file written by the container.
+  // This handles the case where the container crashed after getting a
+  // session ID but before the host could capture it from stdout.
+  if (!sessionId) {
+    const recoveryFile = path.join(
+      resolveGroupFolderPath(group.folder),
+      '.current-session-id',
+    );
+    try {
+      if (fs.existsSync(recoveryFile)) {
+        const recovered = fs.readFileSync(recoveryFile, 'utf-8').trim();
+        if (recovered) {
+          sessionId = recovered;
+          sessions[group.folder] = recovered;
+          setSession(group.folder, recovered);
+          logger.info(
+            { group: group.name, sessionId: recovered },
+            'Recovered session ID from crash recovery file',
+          );
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -313,6 +385,17 @@ async function runAgent(
     availableGroups,
     new Set(Object.keys(registeredGroups)),
   );
+
+  // Update sessions snapshot for multi-session management (main group only)
+  if (isMain) {
+    const sessionData = Object.entries(registeredGroups).map(([jid, g]) => ({
+      groupFolder: g.folder,
+      groupName: g.name,
+      hasActiveContainer: queue.isActive(jid),
+      hasSession: !!sessions[g.folder],
+    }));
+    writeSessionsSnapshot(group.folder, isMain, sessionData);
+  }
 
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
@@ -552,6 +635,11 @@ async function main(): Promise<void> {
     channels.push(telegram);
     await telegram.connect();
     logger.info('Telegram channel enabled');
+
+    // Initialize bot pool for agent swarm (sub-agents get their own bot identities)
+    if (TELEGRAM_BOT_POOL.length > 0) {
+      await initBotPool(TELEGRAM_BOT_POOL);
+    }
   }
 
   // Start subsystems (independently of connection handler)

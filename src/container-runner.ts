@@ -74,6 +74,17 @@ function buildVolumeMounts(
       readonly: true,
     });
 
+    // Shadow .env so the agent cannot read secrets from the mounted project root.
+    // Secrets are passed via stdin instead (see readSecrets()).
+    const envFile = path.join(projectRoot, '.env');
+    if (fs.existsSync(envFile)) {
+      mounts.push({
+        hostPath: '/dev/null',
+        containerPath: '/workspace/project/.env',
+        readonly: true,
+      });
+    }
+
     // Main also gets its group folder as the working directory
     mounts.push({
       hostPath: groupDir,
@@ -186,6 +197,20 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Per-group browser profile (persists cookies, localStorage across container runs)
+  const browserProfileDir = path.join(
+    DATA_DIR,
+    'sessions',
+    group.folder,
+    'browser-profile',
+  );
+  fs.mkdirSync(browserProfileDir, { recursive: true });
+  mounts.push({
+    hostPath: browserProfileDir,
+    containerPath: '/home/node/.browser-profile',
+    readonly: false,
+  });
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -215,6 +240,9 @@ function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Browser profile directory for persistent authentication across container runs
+  args.push('-e', 'CHROMIUM_USER_DATA_DIR=/home/node/.browser-profile');
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -659,6 +687,23 @@ export interface AvailableGroup {
  * Only main group can see all available groups (for activation).
  * Non-main groups only see their own registration status.
  */
+export function writeSessionsSnapshot(
+  groupFolder: string,
+  isMain: boolean,
+  sessionData: Array<{
+    groupFolder: string;
+    groupName: string;
+    hasActiveContainer: boolean;
+    hasSession: boolean;
+  }>,
+): void {
+  if (!isMain) return;
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+  const sessionsFile = path.join(groupIpcDir, 'active_sessions.json');
+  fs.writeFileSync(sessionsFile, JSON.stringify(sessionData, null, 2));
+}
+
 export function writeGroupsSnapshot(
   groupFolder: string,
   isMain: boolean,

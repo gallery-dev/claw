@@ -149,8 +149,15 @@ async function runTask(
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          // Suppress HEARTBEAT_OK — agent confirms nothing needs attention
+          const isHeartbeatOk =
+            streamedOutput.result.trim() === 'HEARTBEAT_OK' ||
+            streamedOutput.result.trim().startsWith('HEARTBEAT_OK');
+          if (!isHeartbeatOk) {
+            await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          } else {
+            logger.debug({ taskId: task.id }, 'Heartbeat OK — suppressing output');
+          }
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {
@@ -213,6 +220,7 @@ async function runTask(
 }
 
 let schedulerRunning = false;
+const runningTaskIds = new Set<string>();
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
   if (schedulerRunning) {
@@ -236,9 +244,23 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
-        deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, () =>
-          runTask(currentTask, deps),
-        );
+        // Skip if this task is already running (overlap prevention)
+        if (runningTaskIds.has(currentTask.id)) {
+          logger.debug(
+            { taskId: currentTask.id },
+            'Task already running, skipping this interval',
+          );
+          continue;
+        }
+
+        runningTaskIds.add(currentTask.id);
+        deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, async () => {
+          try {
+            await runTask(currentTask, deps);
+          } finally {
+            runningTaskIds.delete(currentTask.id);
+          }
+        });
       }
     } catch (err) {
       logger.error({ err }, 'Error in scheduler loop');

@@ -118,6 +118,15 @@ agent-browser state load auth.json
 agent-browser open https://app.example.com/dashboard
 ```
 
+### Persistent Browser Profile
+
+Your browser profile persists across sessions. Cookies, localStorage, and browser data survive container restarts:
+- **Login once, stay logged in.** Sessions persist automatically via the mounted profile directory.
+- **No need for `state save/load`** for basic cookie persistence — it happens automatically.
+- **Use `state save/load`** only when you need to switch between different authentication contexts.
+
+The profile directory is at `$CHROMIUM_USER_DATA_DIR` (defaults to `/home/node/.browser-profile`).
+
 ### Cookies & Storage
 
 ```bash

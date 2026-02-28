@@ -13,6 +13,7 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import { sendPoolMessage } from './channels/telegram.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -79,9 +80,18 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  if (data.sender && data.chatJid.startsWith('tg:')) {
+                    await sendPoolMessage(
+                      data.chatJid,
+                      data.text,
+                      data.sender,
+                      sourceGroup,
+                    );
+                  } else {
+                    await deps.sendMessage(data.chatJid, data.text);
+                  }
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
+                    { chatJid: data.chatJid, sourceGroup, sender: data.sender },
                     'IPC message sent',
                   );
                 } else {
@@ -170,6 +180,9 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For multi-session management
+    targetGroupFolder?: string;
+    text?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -380,6 +393,55 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'send_to_group': {
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized send_to_group attempt blocked');
+        break;
+      }
+      const targetFolder = data.targetGroupFolder as string | undefined;
+      const text = data.text as string | undefined;
+      if (!targetFolder || !text) {
+        logger.warn({ data }, 'Invalid send_to_group — missing fields');
+        break;
+      }
+      if (!isValidGroupFolder(targetFolder)) {
+        logger.warn({ targetFolder }, 'send_to_group: invalid target folder name');
+        break;
+      }
+      // Write to the target group's IPC input directory
+      const targetInputDir = path.join(DATA_DIR, 'ipc', targetFolder, 'input');
+      fs.mkdirSync(targetInputDir, { recursive: true });
+      const msgFilename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+      const msgFilepath = path.join(targetInputDir, msgFilename);
+      const tempMsgPath = `${msgFilepath}.tmp`;
+      fs.writeFileSync(tempMsgPath, JSON.stringify({ type: 'message', text }));
+      fs.renameSync(tempMsgPath, msgFilepath);
+      logger.info({ sourceGroup, targetFolder }, 'Inter-group message routed via IPC');
+      break;
+    }
+
+    case 'close_group_session': {
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized close_group_session attempt blocked');
+        break;
+      }
+      const closeTargetFolder = data.targetGroupFolder as string | undefined;
+      if (!closeTargetFolder) {
+        logger.warn({ data }, 'Invalid close_group_session — missing targetGroupFolder');
+        break;
+      }
+      if (!isValidGroupFolder(closeTargetFolder)) {
+        logger.warn({ closeTargetFolder }, 'close_group_session: invalid target folder name');
+        break;
+      }
+      // Write _close sentinel to target group's IPC input
+      const closeInputDir = path.join(DATA_DIR, 'ipc', closeTargetFolder, 'input');
+      fs.mkdirSync(closeInputDir, { recursive: true });
+      fs.writeFileSync(path.join(closeInputDir, '_close'), '');
+      logger.info({ sourceGroup, targetFolder: closeTargetFolder }, 'Close sentinel written for target group');
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
