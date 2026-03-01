@@ -74,6 +74,12 @@ Or run `/customize` for guided changes. The codebase is small enough that Claude
 
 Claw tracks [NanoClaw](https://github.com/qwibitai/NanoClaw) as an upstream remote. Use `/update` to pull upstream changes and merge with local customizations.
 
+**Third-party models:** Gallery.dev routes all AI requests through its AI proxy (`/api/ai`), which supports multiple model providers (Claude, Kimi, MiniMax, etc.). Users select models from the dashboard — no `.env` changes needed on the VM.
+
+## Community
+
+Questions? Ideas? [Join the Discord](https://discord.gg/VDdww8qS42).
+
 ## License
 
 MIT
