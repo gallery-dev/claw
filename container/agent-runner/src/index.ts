@@ -349,6 +349,73 @@ function createLoopDetectionHook(tracker: ToolCallTracker): HookCallback {
 
 // ─── End Tool Loop Detection ──────────────────────────
 
+// ─── Gallery Activity Posting ────────────────────────────
+
+/**
+ * Posts real-time agent activity to Gallery dashboard via Convex API.
+ * Batches events to avoid spamming mutations.
+ */
+type ActivityType = 'output' | 'tool_use' | 'thinking' | 'error' | 'status';
+
+class ActivityPoster {
+  private convexUrl: string | null;
+  private token: string | null;
+  private agentId: string;
+  private queue: { type: ActivityType; content: string; metadata?: unknown }[] = [];
+  private timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(secrets: Record<string, string>, agentId: string) {
+    this.convexUrl = secrets.GALLERY_CONVEX_URL || null;
+    this.token = secrets.GALLERY_GATEWAY_TOKEN || null;
+    this.agentId = agentId;
+
+    if (this.convexUrl && this.token) {
+      this.timer = setInterval(() => this.flush(), 2000);
+      log('[activity] Gallery activity posting enabled');
+    }
+  }
+
+  post(type: ActivityType, content: string, metadata?: unknown): void {
+    if (!this.convexUrl || !this.token) return;
+    this.queue.push({ type, content: content.slice(0, 4000), metadata });
+  }
+
+  async flush(): Promise<void> {
+    if (this.queue.length === 0 || !this.convexUrl || !this.token) return;
+
+    const batch = this.queue.splice(0, 10);
+    for (const event of batch) {
+      try {
+        await fetch(`${this.convexUrl}/api/mutation`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            path: 'agentActivity:push',
+            args: {
+              token: this.token,
+              agentId: this.agentId,
+              type: event.type,
+              content: event.content,
+              metadata: event.metadata,
+            },
+          }),
+        });
+      } catch {
+        // non-fatal — dashboard activity is best-effort
+      }
+    }
+  }
+
+  async stop(): Promise<void> {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    // Drain entire queue (flush takes max 10 at a time)
+    while (this.queue.length > 0) {
+      await this.flush();
+    }
+  }
+}
+
 function sanitizeFilename(summary: string): string {
   return summary
     .toLowerCase()
@@ -500,6 +567,7 @@ async function runQuery(
   mcpServerPath: string,
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
+  activityPoster: ActivityPoster,
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
@@ -606,11 +674,25 @@ async function runQuery(
 
       if (message.type === 'assistant' && 'uuid' in message) {
         lastAssistantUuid = (message as { uuid: string }).uuid;
+        // Post assistant text output to dashboard
+        const content = (message as any).message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === 'text' && block.text) {
+              activityPoster.post('output', block.text);
+            } else if (block.type === 'tool_use') {
+              activityPoster.post('tool_use', `${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
+            } else if (block.type === 'thinking' && block.thinking) {
+              activityPoster.post('thinking', block.thinking.slice(0, 500));
+            }
+          }
+        }
       }
 
       if (message.type === 'system' && message.subtype === 'init') {
         newSessionId = message.session_id;
         log(`Session initialized: ${newSessionId}`);
+        activityPoster.post('status', `Session initialized: ${newSessionId}`);
         // Persist session ID to disk for crash recovery.
         // If the container crashes before the host reads stdout, the host
         // can recover the session ID from this file on next run.
@@ -622,12 +704,14 @@ async function runQuery(
       if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
         const tn = message as { task_id: string; status: string; summary: string };
         log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
+        activityPoster.post('status', `Task ${tn.status}: ${tn.summary}`);
       }
 
       if (message.type === 'result') {
         resultCount++;
         const textResult = 'result' in message ? (message as { result?: string }).result : null;
         log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+        activityPoster.post('output', textResult ? textResult.slice(0, 500) : 'Query completed');
         writeOutput({
           status: 'success',
           result: textResult || null,
@@ -667,6 +751,13 @@ async function main(): Promise<void> {
     sdkEnv[key] = value;
   }
 
+  // Initialize activity poster for real-time dashboard streaming
+  const activityPoster = new ActivityPoster(
+    containerInput.secrets || {},
+    containerInput.assistantName || containerInput.groupFolder,
+  );
+  activityPoster.post('status', 'Agent container started');
+
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
@@ -702,7 +793,7 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, activityPoster, resumeAt);
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
@@ -736,6 +827,8 @@ async function main(): Promise<void> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+    activityPoster.post('error', errorMessage);
+    await activityPoster.stop();
     writeOutput({
       status: 'error',
       result: null,
@@ -744,6 +837,9 @@ async function main(): Promise<void> {
     });
     process.exit(1);
   }
+
+  activityPoster.post('status', 'Agent container stopped');
+  await activityPoster.stop();
 }
 
 main();
