@@ -31,6 +31,7 @@ import { fileURLToPath } from 'url';
 
 const WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace';
 const SESSION_ID_FILE = path.join(WORKSPACE_DIR, '.current-session-id');
+const RESUME_AT_FILE = path.join(WORKSPACE_DIR, '.resume-at');
 
 function log(message: string): void {
   console.error(`[claw] ${message}`);
@@ -51,6 +52,21 @@ function persistSessionId(sessionId: string): void {
   try {
     fs.mkdirSync(path.dirname(SESSION_ID_FILE), { recursive: true });
     fs.writeFileSync(SESSION_ID_FILE, sessionId);
+  } catch { /* non-fatal */ }
+}
+
+function getPersistedResumeAt(): string | undefined {
+  try {
+    if (fs.existsSync(RESUME_AT_FILE)) {
+      return fs.readFileSync(RESUME_AT_FILE, 'utf-8').trim() || undefined;
+    }
+  } catch { /* ignore */ }
+  return undefined;
+}
+
+function persistResumeAt(resumeAt: string): void {
+  try {
+    fs.writeFileSync(RESUME_AT_FILE, resumeAt);
   } catch { /* non-fatal */ }
 }
 
@@ -250,78 +266,99 @@ class ToolCallTracker {
     return (hash >>> 0).toString(36);
   }
 
-  record(toolName: string, input: unknown): { loopDetected: boolean; shouldStop: boolean } {
-    const inputHash = this.hashInput(input);
-    this.history.push({ toolName, inputHash });
+  track(toolName: string, toolInput: unknown): { loopDetected: boolean; shouldStop: boolean } {
+    this.history.push({ toolName, inputHash: this.hashInput(toolInput) });
     if (this.history.length > LOOP_HISTORY_SIZE) {
       this.history.shift();
     }
 
-    // Detection 1: Same tool + same input repeated
-    const sameCount = this.history.filter(
-      h => h.toolName === toolName && h.inputHash === inputHash
-    ).length;
-
-    if (sameCount >= LOOP_FORCE_STOP_THRESHOLD) {
+    // Check 1: Same tool + same input N times consecutively from the tail
+    const sameCallCount = this.countConsecutiveSame();
+    if (sameCallCount >= LOOP_FORCE_STOP_THRESHOLD) {
       return { loopDetected: true, shouldStop: true };
     }
-    if (sameCount >= LOOP_SAME_CALL_THRESHOLD) {
-      const shouldWarn = !this.warningIssued;
-      this.warningIssued = true;
-      return { loopDetected: shouldWarn, shouldStop: false };
+    if (sameCallCount >= LOOP_SAME_CALL_THRESHOLD) {
+      return { loopDetected: true, shouldStop: false };
     }
 
-    // Detection 2: Repeating cycle of 2-3 tools
-    for (const cycleLen of [2, 3]) {
-      if (this.history.length >= cycleLen * LOOP_CYCLE_THRESHOLD) {
-        const recent = this.history.slice(-cycleLen);
-        const recentKey = recent.map(h => `${h.toolName}:${h.inputHash}`).join('|');
-
-        let cycleCount = 0;
-        for (let i = this.history.length - cycleLen; i >= 0; i -= cycleLen) {
-          const segment = this.history.slice(i, i + cycleLen);
-          const segmentKey = segment.map(h => `${h.toolName}:${h.inputHash}`).join('|');
-          if (segmentKey === recentKey) cycleCount++;
-          else break;
-        }
-
-        if (cycleCount >= LOOP_CYCLE_THRESHOLD) {
-          return { loopDetected: true, shouldStop: cycleCount >= LOOP_CYCLE_THRESHOLD + 1 };
-        }
-      }
+    // Check 2: Repeating cycle of 2-3 tools
+    const cycles2 = this.detectCycle(2);
+    const cycles3 = this.detectCycle(3);
+    if (cycles2 >= LOOP_CYCLE_THRESHOLD || cycles3 >= LOOP_CYCLE_THRESHOLD) {
+      const totalRepeats = Math.max(cycles2, cycles3);
+      return { loopDetected: true, shouldStop: totalRepeats >= LOOP_FORCE_STOP_THRESHOLD };
     }
 
     return { loopDetected: false, shouldStop: false };
   }
+
+  private countConsecutiveSame(): number {
+    if (this.history.length === 0) return 0;
+    const last = this.history[this.history.length - 1];
+    let count = 0;
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      if (this.history[i].toolName === last.toolName && this.history[i].inputHash === last.inputHash) {
+        count++;
+      } else {
+        break;
+      }
+    }
+    return count;
+  }
+
+  private detectCycle(cycleLength: number): number {
+    if (this.history.length < cycleLength * 2) return 0;
+    const recent = this.history.slice(-cycleLength);
+    let repetitions = 1;
+    for (let offset = cycleLength; offset <= this.history.length - cycleLength; offset += cycleLength) {
+      const segment = this.history.slice(-(offset + cycleLength), -offset);
+      if (segment.length !== cycleLength) break;
+      const matches = segment.every(
+        (rec, i) => rec.toolName === recent[i].toolName && rec.inputHash === recent[i].inputHash,
+      );
+      if (matches) repetitions++;
+      else break;
+    }
+    return repetitions;
+  }
+
+  resetWarning(): void { this.warningIssued = false; }
+  hasIssuedWarning(): boolean { return this.warningIssued; }
+  markWarningIssued(): void { this.warningIssued = true; }
 }
 
 function createLoopDetectionHook(tracker: ToolCallTracker): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preInput = input as PreToolUseHookInput;
-    const toolName = preInput.tool_name;
+    const toolName = (preInput as { tool_name?: string }).tool_name || 'unknown';
     const toolInput = preInput.tool_input;
 
-    const { loopDetected, shouldStop } = tracker.record(toolName, toolInput);
+    const { loopDetected, shouldStop } = tracker.track(toolName, toolInput);
 
     if (shouldStop) {
-      log(`[loop] Force-stopping repeated tool call: ${toolName}`);
+      log(`[loop-detect] FORCE STOP: Tool ${toolName} in terminal loop`);
       return {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           decision: 'block',
-          message: `Tool loop detected: "${toolName}" has been called with the same input too many times. Stop and try a different approach.`,
+          message: 'LOOP DETECTED: You have been calling the same tool with the same input repeatedly. This call is blocked. Try a completely different approach.',
         },
       };
     }
 
-    if (loopDetected) {
-      log(`[loop] Warning: repeated tool call detected: ${toolName}`);
+    if (loopDetected && !tracker.hasIssuedWarning()) {
+      log(`[loop-detect] WARNING: Repetitive tool use detected for ${toolName}`);
+      tracker.markWarningIssued();
       return {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
-          message: `Warning: You've called "${toolName}" with similar input multiple times. Consider a different approach.`,
+          message: 'WARNING: You appear to be repeating the same tool calls. Consider trying a different approach before this call gets blocked.',
         },
       };
+    }
+
+    if (!loopDetected) {
+      tracker.resetWarning();
     }
 
     return {};
@@ -407,8 +444,9 @@ export interface MessageResult {
 }
 
 // Persistent state across requests (sprite stays alive between requests)
+// On sleep/wake, the process restarts — read from disk to survive hibernation
 let activityPoster: ActivityPoster | null = null;
-let lastResumeAt: string | undefined;
+let lastResumeAt: string | undefined = getPersistedResumeAt();
 
 export async function processMessage(params: MessageParams): Promise<MessageResult> {
   const { message, isScheduledTask, assistantName } = params;
@@ -441,7 +479,7 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
   const loopTracker = new ToolCallTracker();
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
-  let resultText: string | null = null;
+  const resultTexts: string[] = [];
   let messageCount = 0;
 
   try {
@@ -528,9 +566,9 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
 
       if (msg.type === 'result') {
         const textResult = 'result' in msg ? (msg as { result?: string }).result : null;
-        log(`Result: ${textResult ? textResult.slice(0, 200) : '(no text)'}`);
+        log(`Result #${resultTexts.length + 1}: ${textResult ? textResult.slice(0, 200) : '(no text)'}`);
         activityPoster.post('output', textResult ? textResult.slice(0, 500) : 'Query completed');
-        resultText = textResult || null;
+        if (textResult) resultTexts.push(textResult);
       }
     }
   } catch (err) {
@@ -545,13 +583,15 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
     };
   }
 
-  // Update resume point for next request
+  // Update resume point for next request (persist to survive sleep/wake)
   if (lastAssistantUuid) {
     lastResumeAt = lastAssistantUuid;
+    persistResumeAt(lastAssistantUuid);
   }
 
   const finalSessionId = newSessionId || sessionId || '';
-  log(`Query done. Messages: ${messageCount}, sessionId: ${finalSessionId}`);
+  const resultText = resultTexts.length > 0 ? resultTexts.join('\n\n') : null;
+  log(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${finalSessionId}`);
   activityPoster.post('status', 'Message processed');
 
   return {
@@ -559,6 +599,16 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
     result: resultText,
     sessionId: finalSessionId,
   };
+}
+
+/**
+ * Flush pending activity events. Call on SIGTERM before exit.
+ */
+export async function shutdown(): Promise<void> {
+  if (activityPoster) {
+    activityPoster.post('status', 'Sprite shutting down');
+    await activityPoster.stop();
+  }
 }
 
 /**

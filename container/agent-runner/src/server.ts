@@ -10,7 +10,7 @@
  */
 
 import http from 'http';
-import { processMessage, getStatus, type MessageParams } from './agent.js';
+import { processMessage, getStatus, shutdown, type MessageParams } from './agent.js';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
@@ -200,4 +200,12 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   log(`Claw agent service running on 0.0.0.0:${PORT}`);
+});
+
+// Graceful shutdown — flush activity poster before sprite sleeps
+process.on('SIGTERM', async () => {
+  log('SIGTERM received, shutting down...');
+  server.close();
+  await shutdown();
+  process.exit(0);
 });
