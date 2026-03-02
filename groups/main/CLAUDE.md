@@ -247,6 +247,49 @@ You can read and write to `/workspace/project/groups/global/CLAUDE.md` for facts
 
 ---
 
+## CRITICAL: Gallery.dev Dashboard Sync
+
+You are connected to the Gallery.dev dashboard via MCP tools (prefixed `gallery_`). **Every agent, task, and status change must be synced to the dashboard.** The dashboard is the user's primary interface — if something exists here but not in Gallery, it's invisible to them.
+
+### Protocol
+
+1. **Creating agents** → Always call `mcp__gallery__gallery_create_agent` with name, description, model, group, and systemPrompt. The agent will appear instantly in the Gallery dashboard.
+2. **Updating agents** → Call `mcp__gallery__gallery_update_agent` when changing status, description, model, or group.
+3. **Deleting agents** → Call `mcp__gallery__gallery_delete_agent` to remove from dashboard.
+4. **Creating tasks** → Call `mcp__gallery__gallery_create_task` with title, description, priority, and optionally assignedAgent.
+5. **Updating tasks** → Call `mcp__gallery__gallery_update_task` when status, priority, or assignee changes.
+6. **Progress updates** → Call `mcp__gallery__gallery_add_task_comment` to post progress notes visible in the dashboard activity feed.
+7. **Reviews** → Call `mcp__gallery__gallery_request_review` when you need human approval, have questions, or want to report completion/errors.
+
+### Available Gallery Tools
+
+| Tool | Purpose |
+|------|---------|
+| `gallery_list_agents` | List all agents (with optional status filter) |
+| `gallery_create_agent` | Create a new agent |
+| `gallery_update_agent` | Update agent by name |
+| `gallery_delete_agent` | Delete agent by name |
+| `gallery_list_tasks` | List kanban tasks |
+| `gallery_create_task` | Create a task |
+| `gallery_update_task` | Update task by title |
+| `gallery_delete_task` | Delete task by title |
+| `gallery_add_task_comment` | Add comment to a task |
+| `gallery_list_task_activity` | Get task activity log |
+| `gallery_request_review` | Request human review |
+| `gallery_list_reviews` | List review requests |
+| `gallery_resolve_review` | Resolve a review |
+| `gallery_dismiss_review` | Dismiss a review |
+| `gallery_workspace_info` | Get workspace overview |
+| `gallery_get_credits` | Check credit balance |
+
+### Key Rules
+
+- **Never create an agent locally without also calling `gallery_create_agent`.** If someone asks "create a Support Bot", the agent must appear in Gallery.
+- **Always sync task status changes.** Moving a task to "done" locally must also update Gallery.
+- **Use reviews for anything blocking.** Don't just log it — create a review so the user sees it in their dashboard.
+
+---
+
 ## Scheduling for Other Groups
 
 When scheduling tasks for other groups, use the `target_group_jid` parameter with the group's JID from `registered_groups.json`:

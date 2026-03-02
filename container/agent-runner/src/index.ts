@@ -642,7 +642,8 @@ async function runQuery(
           'TeamCreate', 'TeamDelete', 'SendMessage',
           'TodoWrite', 'ToolSearch', 'Skill',
           'NotebookEdit',
-          'mcp__claw__*'
+          'mcp__claw__*',
+          'mcp__gallery__*',
         ],
         env: sdkEnv,
         permissionMode: 'bypassPermissions',
@@ -658,6 +659,13 @@ async function runQuery(
               CLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
             },
           },
+          ...(sdkEnv.GALLERY_MCP_URL && sdkEnv.GALLERY_TOKEN ? {
+            gallery: {
+              type: 'http' as const,
+              url: sdkEnv.GALLERY_MCP_URL,
+              headers: { Authorization: `Bearer ${sdkEnv.GALLERY_TOKEN}` },
+            },
+          } : {}),
         },
         hooks: {
           PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],

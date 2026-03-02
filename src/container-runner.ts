@@ -236,6 +236,8 @@ function readSecrets(): Record<string, string> {
     'ANTHROPIC_AUTH_TOKEN',
     'GALLERY_GATEWAY_TOKEN',
     'GALLERY_CONVEX_URL',
+    'GALLERY_MCP_URL',
+    'GALLERY_TOKEN',
   ]);
 }
 

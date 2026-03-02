@@ -608,9 +608,15 @@ async function main(): Promise<void> {
   };
 
   // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
+
+  // WhatsApp (optional — only if explicitly enabled)
+  const whatsappEnabled = (process.env.WHATSAPP_ENABLED ?? '').toLowerCase() === 'true';
+  if (whatsappEnabled) {
+    whatsapp = new WhatsAppChannel(channelOpts);
+    channels.push(whatsapp);
+    await whatsapp.connect();
+    logger.info('WhatsApp channel enabled');
+  }
 
   // Telegram (optional — only if bot token is configured)
   if (TELEGRAM_BOT_TOKEN) {
