@@ -462,7 +462,10 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
   activityPoster.post('status', 'Processing message');
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpToolsPath = path.join(__dirname, 'mcp-tools.js');
+  // Try bundled file first, fall back to tsc output
+  const mcpBundlePath = path.join(__dirname, 'mcp-tools.bundle.js');
+  const mcpTscPath = path.join(__dirname, 'mcp-tools.js');
+  const mcpToolsPath = fs.existsSync(mcpBundlePath) ? mcpBundlePath : mcpTscPath;
 
   // Ensure workspace exists
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
