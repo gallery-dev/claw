@@ -3,6 +3,8 @@ node_modules/
 .npm-cache/
 # Build output
 dist/
+# Exception: agent-runner dist is deployed to sprites
+!container/agent-runner/dist/
 
 # Local data & auth
 store/
