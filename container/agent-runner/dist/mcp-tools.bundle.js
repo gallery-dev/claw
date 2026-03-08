@@ -30062,6 +30062,21 @@ server.tool(
   }
 );
 server.tool(
+  "update_task",
+  "Update an existing scheduled task's prompt, schedule, or status.",
+  {
+    task_id: external_exports3.string().describe("The task ID to update"),
+    prompt: external_exports3.string().optional().describe("New prompt/instruction for the task"),
+    schedule_type: external_exports3.enum(["cron", "interval", "once"]).optional().describe("New schedule type"),
+    schedule_value: external_exports3.string().optional().describe("New schedule value")
+  },
+  async () => {
+    return {
+      content: [{ type: "text", text: "Task management is being migrated to Gallery. Please use the Gallery dashboard." }]
+    };
+  }
+);
+server.tool(
   "memory_view",
   `View memory directory contents or read a specific memory file. Use this to check what you've remembered from past sessions.
 

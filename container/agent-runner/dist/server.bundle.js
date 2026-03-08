@@ -4,8 +4,8 @@
 import http from "http";
 
 // src/agent.ts
-import fs from "fs";
-import path from "path";
+import fs2 from "fs";
+import path2 from "path";
 
 // node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs
 import { join as fK } from "path";
@@ -9162,55 +9162,10 @@ function Wg({ prompt: Q, options: X }) {
 
 // src/agent.ts
 import { fileURLToPath } from "url";
-var WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || "/home/sprite/workspace";
-var SESSION_ID_FILE = path.join(WORKSPACE_DIR, ".current-session-id");
-var RESUME_AT_FILE = path.join(WORKSPACE_DIR, ".resume-at");
-function log(message) {
-  console.error(`[claw] ${message}`);
-}
-function getPersistedSessionId() {
-  try {
-    if (fs.existsSync(SESSION_ID_FILE)) {
-      return fs.readFileSync(SESSION_ID_FILE, "utf-8").trim() || void 0;
-    }
-  } catch {
-  }
-  return void 0;
-}
-function persistSessionId(sessionId) {
-  try {
-    fs.mkdirSync(path.dirname(SESSION_ID_FILE), { recursive: true });
-    fs.writeFileSync(SESSION_ID_FILE, sessionId);
-  } catch {
-  }
-}
-function getPersistedResumeAt() {
-  try {
-    if (fs.existsSync(RESUME_AT_FILE)) {
-      return fs.readFileSync(RESUME_AT_FILE, "utf-8").trim() || void 0;
-    }
-  } catch {
-  }
-  return void 0;
-}
-function persistResumeAt(resumeAt) {
-  try {
-    fs.writeFileSync(RESUME_AT_FILE, resumeAt);
-  } catch {
-  }
-}
-function getSessionSummary(sessionId, transcriptPath) {
-  const projectDir = path.dirname(transcriptPath);
-  const indexPath = path.join(projectDir, "sessions-index.json");
-  if (!fs.existsSync(indexPath)) return null;
-  try {
-    const index = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
-    const entry = index.entries.find((e2) => e2.sessionId === sessionId);
-    if (entry?.summary) return entry.summary;
-  } catch {
-  }
-  return null;
-}
+
+// src/shared.ts
+import fs from "fs";
+import path from "path";
 function parseTranscript(content) {
   const messages = [];
   for (const line of content.split("\n")) {
@@ -9261,33 +9216,49 @@ function formatTranscriptMarkdown(messages, title, assistantName) {
   }
   return lines.join("\n");
 }
-function createPreCompactHook(assistantName) {
+function getSessionSummary(sessionId, transcriptPath, log3) {
+  const projectDir = path.dirname(transcriptPath);
+  const indexPath = path.join(projectDir, "sessions-index.json");
+  if (!fs.existsSync(indexPath)) {
+    log3?.(`Sessions index not found at ${indexPath}`);
+    return null;
+  }
+  try {
+    const index = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
+    const entry = index.entries.find((e2) => e2.sessionId === sessionId);
+    if (entry?.summary) return entry.summary;
+  } catch (err) {
+    log3?.(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return null;
+}
+function createPreCompactHook(workspaceDir, assistantName, log3) {
   return async (input, _toolUseId, _context) => {
     const preCompact = input;
     const transcriptPath = preCompact.transcript_path;
     const sessionId = preCompact.session_id;
     if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      log("No transcript found for archiving");
+      log3?.("No transcript found for archiving");
       return {};
     }
     try {
       const content = fs.readFileSync(transcriptPath, "utf-8");
       const messages = parseTranscript(content);
       if (messages.length === 0) {
-        log("No messages to archive");
+        log3?.("No messages to archive");
         return {};
       }
-      const summary = getSessionSummary(sessionId, transcriptPath);
+      const summary = getSessionSummary(sessionId, transcriptPath, log3);
       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-      const conversationsDir = path.join(WORKSPACE_DIR, "conversations");
+      const conversationsDir = path.join(workspaceDir, "conversations");
       fs.mkdirSync(conversationsDir, { recursive: true });
       const date = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
       const filename = `${date}-${name}.md`;
       const filePath = path.join(conversationsDir, filename);
       const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
       fs.writeFileSync(filePath, markdown);
-      log(`Archived conversation to ${filePath}`);
-      const memoryDir = path.join(WORKSPACE_DIR, "memory");
+      log3?.(`Archived conversation to ${filePath}`);
+      const memoryDir = path.join(workspaceDir, "memory");
       fs.mkdirSync(memoryDir, { recursive: true });
       const dailyFile = path.join(memoryDir, `${date}.md`);
       const timestamp = (/* @__PURE__ */ new Date()).toISOString().split("T")[1].replace(/\.\d+Z$/, "");
@@ -9298,9 +9269,9 @@ Conversation archived to \`conversations/${filename}\`${summary ? `
 Summary: ${summary}` : ""}
 `;
       fs.appendFileSync(dailyFile, marker);
-      log(`Wrote compaction marker to memory/${date}.md`);
+      log3?.(`Wrote compaction marker to memory/${date}.md`);
     } catch (err) {
-      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
+      log3?.(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
     }
     return {};
   };
@@ -9396,14 +9367,14 @@ var ToolCallTracker = class {
     this.warningIssued = true;
   }
 };
-function createLoopDetectionHook(tracker) {
+function createLoopDetectionHook(tracker, log3) {
   return async (input, _toolUseId, _context) => {
     const preInput = input;
     const toolName = preInput.tool_name || "unknown";
     const toolInput = preInput.tool_input;
     const { loopDetected, shouldStop } = tracker.track(toolName, toolInput);
     if (shouldStop) {
-      log(`[loop-detect] FORCE STOP: Tool ${toolName} in terminal loop`);
+      log3?.(`[loop-detect] FORCE STOP: Tool ${toolName} in terminal loop`);
       return {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
@@ -9413,7 +9384,7 @@ function createLoopDetectionHook(tracker) {
       };
     }
     if (loopDetected && !tracker.hasIssuedWarning()) {
-      log(`[loop-detect] WARNING: Repetitive tool use detected for ${toolName}`);
+      log3?.(`[loop-detect] WARNING: Repetitive tool use detected for ${toolName}`);
       tracker.markWarningIssued();
       return {
         hookSpecificOutput: {
@@ -9428,24 +9399,35 @@ function createLoopDetectionHook(tracker) {
     return {};
   };
 }
-var ActivityPoster = class {
+var ActivityPoster = class _ActivityPoster {
+  static MAX_QUEUE = 100;
   convexUrl;
   token;
   agentId;
   queue = [];
   timer = null;
-  constructor(agentId) {
-    this.convexUrl = process.env.GALLERY_CONVEX_URL || null;
-    this.token = process.env.GALLERY_GATEWAY_TOKEN || null;
+  droppedCount = 0;
+  constructor(convexUrl, token, agentId) {
+    this.convexUrl = convexUrl;
+    this.token = token;
     this.agentId = agentId;
     if (this.convexUrl && this.token) {
       this.timer = setInterval(() => this.flush(), 2e3);
-      log("[activity] Gallery activity posting enabled");
     }
   }
   post(type, content, metadata) {
     if (!this.convexUrl || !this.token) return;
     this.queue.push({ type, content: content.slice(0, 4e3), metadata });
+    while (this.queue.length > _ActivityPoster.MAX_QUEUE) {
+      this.queue.shift();
+      this.droppedCount++;
+    }
+  }
+  getQueueSize() {
+    return this.queue.length;
+  }
+  getDroppedCount() {
+    return this.droppedCount;
   }
   async flush() {
     if (this.queue.length === 0 || !this.convexUrl || !this.token) return;
@@ -9478,6 +9460,45 @@ var ActivityPoster = class {
     }
   }
 };
+
+// src/agent.ts
+var WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || "/home/sprite/workspace";
+var SESSION_ID_FILE = path2.join(WORKSPACE_DIR, ".current-session-id");
+var RESUME_AT_FILE = path2.join(WORKSPACE_DIR, ".resume-at");
+function log(message) {
+  console.error(`[claw] ${message}`);
+}
+function getPersistedSessionId() {
+  try {
+    if (fs2.existsSync(SESSION_ID_FILE)) {
+      return fs2.readFileSync(SESSION_ID_FILE, "utf-8").trim() || void 0;
+    }
+  } catch {
+  }
+  return void 0;
+}
+function persistSessionId(sessionId) {
+  try {
+    fs2.mkdirSync(path2.dirname(SESSION_ID_FILE), { recursive: true });
+    fs2.writeFileSync(SESSION_ID_FILE, sessionId);
+  } catch {
+  }
+}
+function getPersistedResumeAt() {
+  try {
+    if (fs2.existsSync(RESUME_AT_FILE)) {
+      return fs2.readFileSync(RESUME_AT_FILE, "utf-8").trim() || void 0;
+    }
+  } catch {
+  }
+  return void 0;
+}
+function persistResumeAt(resumeAt) {
+  try {
+    fs2.writeFileSync(RESUME_AT_FILE, resumeAt);
+  } catch {
+  }
+}
 var activityPoster = null;
 var lastResumeAt = getPersistedResumeAt();
 async function processMessage(params) {
@@ -9485,20 +9506,39 @@ async function processMessage(params) {
   let sessionId = params.sessionId || getPersistedSessionId();
   const agentId = process.env.AGENT_ID || assistantName || "unknown";
   if (!activityPoster) {
-    activityPoster = new ActivityPoster(agentId);
+    activityPoster = new ActivityPoster(
+      process.env.GALLERY_CONVEX_URL || null,
+      process.env.GALLERY_GATEWAY_TOKEN || null,
+      agentId
+    );
+    log("[activity] Gallery activity posting enabled");
   }
   activityPoster.post("status", "Processing message");
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpBundlePath = path.join(__dirname, "mcp-tools.bundle.js");
-  const mcpTscPath = path.join(__dirname, "mcp-tools.js");
-  const mcpToolsPath = fs.existsSync(mcpBundlePath) ? mcpBundlePath : mcpTscPath;
-  fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
-  let prompt = message;
-  if (isScheduledTask) {
-    prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user.]
+  const __dirname = path2.dirname(fileURLToPath(import.meta.url));
+  const mcpBundlePath = path2.join(__dirname, "mcp-tools.bundle.js");
+  const mcpTscPath = path2.join(__dirname, "mcp-tools.js");
+  const mcpToolsPath = fs2.existsSync(mcpBundlePath) ? mcpBundlePath : mcpTscPath;
+  fs2.mkdirSync(WORKSPACE_DIR, { recursive: true });
+  const tz2 = process.env.AGENT_TIMEZONE || "UTC";
+  const localTime = (/* @__PURE__ */ new Date()).toLocaleString("en-US", {
+    timeZone: tz2,
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true
+  });
+  let prompt = `<context timezone="${tz2}" localTime="${localTime}" />
 
-${prompt}`;
+`;
+  if (isScheduledTask) {
+    prompt += `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user.]
+
+`;
   }
+  prompt += message;
   const sdkEnv = { ...process.env };
   const loopTracker = new ToolCallTracker();
   let newSessionId;
@@ -9510,6 +9550,10 @@ ${prompt}`;
       prompt,
       options: {
         cwd: WORKSPACE_DIR,
+        model: process.env.CLAW_MODEL || "claude-opus-4-6",
+        thinking: { type: "adaptive" },
+        effort: process.env.CLAW_EFFORT || "high",
+        maxTurns: parseInt(process.env.CLAW_MAX_TURNS || "50", 10),
         resume: sessionId,
         resumeSessionAt: lastResumeAt,
         allowedTools: [
@@ -9557,10 +9601,10 @@ ${prompt}`;
           } : {}
         },
         hooks: {
-          PreCompact: [{ hooks: [createPreCompactHook(assistantName)] }],
+          PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
           PreToolUse: [
             { matcher: "Bash", hooks: [createSanitizeBashHook()] },
-            { hooks: [createLoopDetectionHook(loopTracker)] }
+            { hooks: [createLoopDetectionHook(loopTracker, log)] }
           ]
         }
       }
@@ -9632,16 +9676,22 @@ async function shutdown() {
     await activityPoster.stop();
   }
 }
+function getActivityMetrics() {
+  return {
+    activityQueueSize: activityPoster?.getQueueSize() ?? 0,
+    activityDropped: activityPoster?.getDroppedCount() ?? 0
+  };
+}
 function getStatus() {
   const sessionId = getPersistedSessionId();
   const memoryFiles = [];
-  const memoryDir = path.join(WORKSPACE_DIR, "memory");
-  if (fs.existsSync(path.join(WORKSPACE_DIR, "MEMORY.md"))) {
+  const memoryDir = path2.join(WORKSPACE_DIR, "memory");
+  if (fs2.existsSync(path2.join(WORKSPACE_DIR, "MEMORY.md"))) {
     memoryFiles.push("MEMORY.md");
   }
-  if (fs.existsSync(memoryDir)) {
+  if (fs2.existsSync(memoryDir)) {
     try {
-      const files = fs.readdirSync(memoryDir).filter((f) => !f.startsWith("."));
+      const files = fs2.readdirSync(memoryDir).filter((f) => !f.startsWith("."));
       memoryFiles.push(...files.map((f) => `memory/${f}`));
     } catch {
     }
@@ -9656,12 +9706,17 @@ function getStatus() {
 
 // src/server.ts
 var PORT = parseInt(process.env.PORT || "8080", 10);
+var MAX_QUEUE_SIZE = parseInt(process.env.CLAW_MAX_QUEUE_SIZE || "50", 10);
+var REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || "600000", 10);
 function log2(message) {
   console.error(`[claw-server] ${message}`);
 }
 var processing = false;
 var requestQueue = [];
 async function enqueueMessage(params) {
+  if (requestQueue.length >= MAX_QUEUE_SIZE) {
+    throw new Error("QUEUE_FULL");
+  }
   return new Promise((resolve, reject) => {
     requestQueue.push({ params, resolve, reject });
     processQueue();
@@ -9671,12 +9726,17 @@ async function processQueue() {
   if (processing || requestQueue.length === 0) return;
   processing = true;
   const { params, resolve, reject } = requestQueue.shift();
+  let timer;
   try {
-    const result = await processMessage(params);
+    const timeoutPromise = new Promise((_, rej) => {
+      timer = setTimeout(() => rej(new Error("REQUEST_TIMEOUT")), REQUEST_TIMEOUT_MS);
+    });
+    const result = await Promise.race([processMessage(params), timeoutPromise]);
     resolve(result);
   } catch (err) {
     reject(err instanceof Error ? err : new Error(String(err)));
   } finally {
+    if (timer) clearTimeout(timer);
     processing = false;
     if (requestQueue.length > 0) {
       processQueue();
@@ -9701,6 +9761,20 @@ function sendJson(res, status, data) {
   });
   res.end(body);
 }
+var version = true ? "1.0.0" : "dev";
+var buildTime = true ? "2026-03-08T02:22:38.505Z" : "";
+var ready = false;
+setTimeout(() => {
+  ready = true;
+}, 1e4);
+function markReady() {
+  ready = true;
+}
+function errorStatus(msg) {
+  if (msg === "QUEUE_FULL") return 503;
+  if (msg === "REQUEST_TIMEOUT") return 504;
+  return 500;
+}
 async function handleMessage(req, res) {
   const body = await readBody(req);
   let parsed;
@@ -9723,14 +9797,16 @@ async function handleMessage(req, res) {
   log2(`POST /message (${params.message.length} chars, queue: ${requestQueue.length})`);
   try {
     const result = await enqueueMessage(params);
+    markReady();
     sendJson(res, 200, result);
   } catch (err) {
-    log2(`Error processing message: ${err instanceof Error ? err.message : String(err)}`);
-    sendJson(res, 500, {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log2(`Error processing message: ${errMsg}`);
+    sendJson(res, errorStatus(errMsg), {
       status: "error",
       result: null,
       sessionId: "",
-      error: err instanceof Error ? err.message : String(err)
+      error: errMsg
     });
   }
 }
@@ -9758,27 +9834,41 @@ async function handleTask(req, res) {
     const result = await enqueueMessage(params);
     sendJson(res, 200, result);
   } catch (err) {
-    log2(`Error processing task: ${err instanceof Error ? err.message : String(err)}`);
-    sendJson(res, 500, {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log2(`Error processing task: ${errMsg}`);
+    sendJson(res, errorStatus(errMsg), {
       status: "error",
       result: null,
       sessionId: "",
-      error: err instanceof Error ? err.message : String(err)
+      error: errMsg
     });
   }
 }
 function handleHealth(_req, res) {
   sendJson(res, 200, {
     status: "ok",
+    version,
+    buildTime,
     uptime: process.uptime(),
+    ready,
     queueLength: requestQueue.length,
-    processing
+    maxQueueSize: MAX_QUEUE_SIZE,
+    processing,
+    ...getActivityMetrics()
   });
+}
+function handleReady(_req, res) {
+  if (ready) {
+    sendJson(res, 200, { status: "ready" });
+  } else {
+    sendJson(res, 503, { status: "not_ready" });
+  }
 }
 function handleStatus(_req, res) {
   const status = getStatus();
   sendJson(res, 200, {
     ...status,
+    version,
     queueLength: requestQueue.length,
     processing
   });
@@ -9793,6 +9883,8 @@ var server = http.createServer(async (req, res) => {
       await handleTask(req, res);
     } else if (method === "GET" && url === "/health") {
       handleHealth(req, res);
+    } else if (method === "GET" && url === "/ready") {
+      handleReady(req, res);
     } else if (method === "GET" && url === "/status") {
       handleStatus(req, res);
     } else {

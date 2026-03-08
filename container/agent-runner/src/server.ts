@@ -10,9 +10,11 @@
  */
 
 import http from 'http';
-import { processMessage, getStatus, shutdown, type MessageParams } from './agent.js';
+import { processMessage, getStatus, getActivityMetrics, shutdown, type MessageParams } from './agent.js';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
+const MAX_QUEUE_SIZE = parseInt(process.env.CLAW_MAX_QUEUE_SIZE || '50', 10);
+const REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || '600000', 10);
 
 function log(message: string): void {
   console.error(`[claw-server] ${message}`);
@@ -28,6 +30,9 @@ const requestQueue: Array<{
 }> = [];
 
 async function enqueueMessage(params: MessageParams): Promise<any> {
+  if (requestQueue.length >= MAX_QUEUE_SIZE) {
+    throw new Error('QUEUE_FULL');
+  }
   return new Promise((resolve, reject) => {
     requestQueue.push({ params, resolve, reject });
     processQueue();
@@ -40,12 +45,17 @@ async function processQueue(): Promise<void> {
   processing = true;
   const { params, resolve, reject } = requestQueue.shift()!;
 
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const result = await processMessage(params);
+    const timeoutPromise = new Promise<never>((_, rej) => {
+      timer = setTimeout(() => rej(new Error('REQUEST_TIMEOUT')), REQUEST_TIMEOUT_MS);
+    });
+    const result = await Promise.race([processMessage(params), timeoutPromise]);
     resolve(result);
   } catch (err) {
     reject(err instanceof Error ? err : new Error(String(err)));
   } finally {
+    if (timer) clearTimeout(timer);
     processing = false;
     // Process next in queue
     if (requestQueue.length > 0) {
@@ -72,6 +82,24 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
     'Content-Length': Buffer.byteLength(body),
   });
   res.end(body);
+}
+
+// ─── Version (injected by esbuild at build time) ────────
+declare const CLAW_VERSION: string | undefined;
+declare const CLAW_BUILD_TIME: string | undefined;
+const version = typeof CLAW_VERSION !== 'undefined' ? CLAW_VERSION : 'dev';
+const buildTime = typeof CLAW_BUILD_TIME !== 'undefined' ? CLAW_BUILD_TIME : '';
+
+// ─── Readiness tracking ─────────────────────────────────
+let ready = false;
+setTimeout(() => { ready = true; }, 10_000); // ready after 10s warmup
+
+function markReady(): void { ready = true; }
+
+function errorStatus(msg: string): number {
+  if (msg === 'QUEUE_FULL') return 503;
+  if (msg === 'REQUEST_TIMEOUT') return 504;
+  return 500;
 }
 
 // ─── Route Handlers ──────────────────────────────────────
@@ -103,14 +131,16 @@ async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse
 
   try {
     const result = await enqueueMessage(params);
+    markReady();
     sendJson(res, 200, result);
   } catch (err) {
-    log(`Error processing message: ${err instanceof Error ? err.message : String(err)}`);
-    sendJson(res, 500, {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log(`Error processing message: ${errMsg}`);
+    sendJson(res, errorStatus(errMsg), {
       status: 'error',
       result: null,
       sessionId: '',
-      error: err instanceof Error ? err.message : String(err),
+      error: errMsg,
     });
   }
 }
@@ -144,12 +174,13 @@ async function handleTask(req: http.IncomingMessage, res: http.ServerResponse): 
     const result = await enqueueMessage(params);
     sendJson(res, 200, result);
   } catch (err) {
-    log(`Error processing task: ${err instanceof Error ? err.message : String(err)}`);
-    sendJson(res, 500, {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log(`Error processing task: ${errMsg}`);
+    sendJson(res, errorStatus(errMsg), {
       status: 'error',
       result: null,
       sessionId: '',
-      error: err instanceof Error ? err.message : String(err),
+      error: errMsg,
     });
   }
 }
@@ -157,16 +188,30 @@ async function handleTask(req: http.IncomingMessage, res: http.ServerResponse): 
 function handleHealth(_req: http.IncomingMessage, res: http.ServerResponse): void {
   sendJson(res, 200, {
     status: 'ok',
+    version,
+    buildTime,
     uptime: process.uptime(),
+    ready,
     queueLength: requestQueue.length,
+    maxQueueSize: MAX_QUEUE_SIZE,
     processing,
+    ...getActivityMetrics(),
   });
+}
+
+function handleReady(_req: http.IncomingMessage, res: http.ServerResponse): void {
+  if (ready) {
+    sendJson(res, 200, { status: 'ready' });
+  } else {
+    sendJson(res, 503, { status: 'not_ready' });
+  }
 }
 
 function handleStatus(_req: http.IncomingMessage, res: http.ServerResponse): void {
   const status = getStatus();
   sendJson(res, 200, {
     ...status,
+    version,
     queueLength: requestQueue.length,
     processing,
   });
@@ -185,6 +230,8 @@ const server = http.createServer(async (req, res) => {
       await handleTask(req, res);
     } else if (method === 'GET' && url === '/health') {
       handleHealth(req, res);
+    } else if (method === 'GET' && url === '/ready') {
+      handleReady(req, res);
     } else if (method === 'GET' && url === '/status') {
       handleStatus(req, res);
     } else {

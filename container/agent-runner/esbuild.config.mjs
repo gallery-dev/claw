@@ -10,6 +10,9 @@
  */
 
 import { build } from 'esbuild';
+import { readFileSync } from 'fs';
+
+const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'));
 
 const shared = {
   bundle: true,
@@ -19,6 +22,10 @@ const shared = {
   outdir: 'dist',
   sourcemap: false,
   minify: false, // keep readable for debugging on sprites
+  define: {
+    'CLAW_VERSION': JSON.stringify(pkg.version),
+    'CLAW_BUILD_TIME': JSON.stringify(new Date().toISOString()),
+  },
   // Node built-ins stay as imports — everything else gets bundled
   external: [
     'fs', 'path', 'http', 'https', 'url', 'net', 'tls', 'os', 'crypto',

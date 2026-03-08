@@ -143,6 +143,22 @@ server.tool(
   },
 );
 
+server.tool(
+  'update_task',
+  "Update an existing scheduled task's prompt, schedule, or status.",
+  {
+    task_id: z.string().describe('The task ID to update'),
+    prompt: z.string().optional().describe('New prompt/instruction for the task'),
+    schedule_type: z.enum(['cron', 'interval', 'once']).optional().describe('New schedule type'),
+    schedule_value: z.string().optional().describe('New schedule value'),
+  },
+  async () => {
+    return {
+      content: [{ type: 'text' as const, text: 'Task management is being migrated to Gallery. Please use the Gallery dashboard.' }],
+    };
+  },
+);
+
 // ─── Memory Tools ──────────────────────────────────────
 
 server.tool(
