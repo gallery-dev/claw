@@ -323,7 +323,7 @@ export function createLoopDetectionHook(tracker: ToolCallTracker, log?: (msg: st
 
 // ─── Gallery Activity Posting ────────────────────────────
 
-export type ActivityType = 'output' | 'tool_use' | 'thinking' | 'error' | 'status';
+export type ActivityType = 'output' | 'tool_use' | 'thinking' | 'error' | 'status' | 'subtask_started' | 'subtask_completed' | 'subtask_failed' | 'progress';
 
 export class ActivityPoster {
   private static readonly MAX_QUEUE = 100;

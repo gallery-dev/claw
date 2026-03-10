@@ -11,6 +11,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
@@ -155,6 +156,222 @@ server.tool(
   async () => {
     return {
       content: [{ type: 'text' as const, text: 'Task management is being migrated to Gallery. Please use the Gallery dashboard.' }],
+    };
+  },
+);
+
+// ─── Activity Posting (for subtask + progress events) ────
+
+type ActivityType = 'output' | 'tool_use' | 'thinking' | 'error' | 'status' | 'subtask_started' | 'subtask_completed' | 'subtask_failed' | 'progress';
+
+const convexUrl = process.env.GALLERY_CONVEX_URL || '';
+const gatewayToken = process.env.GALLERY_GATEWAY_TOKEN || '';
+
+async function postActivity(type: ActivityType, content: string, metadata?: unknown): Promise<void> {
+  if (!convexUrl || !gatewayToken) return;
+  try {
+    await fetch(`${convexUrl}/api/mutation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: 'agentActivity:push',
+        args: { token: gatewayToken, agentId, type, content: content.slice(0, 4000), metadata },
+      }),
+    });
+  } catch { /* best-effort */ }
+}
+
+// ─── Sub-task Decomposition ──────────────────────────────
+
+const SUBTASK_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+const MAX_CONCURRENT_SUBTASKS = 3;
+const MAX_SUBTASKS = 5;
+
+interface SubtaskResult {
+  index: number;
+  description: string;
+  status: 'success' | 'error' | 'timeout';
+  result?: string;
+  error?: string;
+  durationMs: number;
+}
+
+async function runSubtask(
+  subtask: { description: string; context?: string },
+  index: number,
+): Promise<SubtaskResult> {
+  const start = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SUBTASK_TIMEOUT_MS);
+
+  const prompt = [
+    'You are a focused subtask worker. Complete this task and return a clear, structured result.',
+    '',
+    `Task: ${subtask.description}`,
+    subtask.context ? `\nContext: ${subtask.context}` : '',
+    '',
+    'IMPORTANT: Complete this task directly. Do NOT try to spawn sub-tasks. Return your result as clear text.',
+  ].join('\n');
+
+  try {
+    postActivity('subtask_started', `Subtask ${index + 1}: ${subtask.description}`);
+    const resultTexts: string[] = [];
+
+    for await (const msg of query({
+      prompt,
+      options: {
+        cwd: WORKSPACE_DIR,
+        model: 'claude-sonnet-4-6',
+        maxTurns: 15,
+        allowedTools: [
+          'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+          'WebSearch', 'WebFetch',
+          // No mcp__claw__* — subtasks cannot decompose further or use agent messaging
+        ],
+        env: {
+          ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || '',
+          ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+          PATH: process.env.PATH || '',
+          HOME: process.env.HOME || '',
+        },
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        abortController: controller,
+      },
+    })) {
+      if (msg.type === 'result') {
+        const text = 'result' in msg ? (msg as { result?: string }).result : null;
+        if (text) resultTexts.push(text);
+      }
+    }
+
+    clearTimeout(timeout);
+    const duration = Date.now() - start;
+    postActivity('subtask_completed', `Subtask ${index + 1} completed in ${(duration / 1000).toFixed(1)}s`, { index, description: subtask.description });
+    return {
+      index,
+      description: subtask.description,
+      status: 'success',
+      result: resultTexts.join('\n\n') || '(completed with no text output)',
+      durationMs: duration,
+    };
+  } catch (err) {
+    clearTimeout(timeout);
+    const duration = Date.now() - start;
+    const isAbort = err instanceof Error && err.name === 'AbortError';
+    postActivity('subtask_failed', `Subtask ${index + 1} ${isAbort ? 'timed out' : 'failed'}: ${subtask.description}`, { index, error: isAbort ? 'timeout' : String(err) });
+    return {
+      index,
+      description: subtask.description,
+      status: isAbort ? 'timeout' : 'error',
+      error: isAbort ? `Subtask timed out after ${SUBTASK_TIMEOUT_MS / 1000}s` : (err instanceof Error ? err.message : String(err)),
+      durationMs: duration,
+    };
+  }
+}
+
+server.tool(
+  'decompose_task',
+  `Split a complex task into parallel subtasks. Each subtask runs as an independent AI worker with access to the filesystem, bash, and web tools. Use this when a task has independent parts that can run simultaneously (e.g., "research 3 competitors", "review 5 files", "generate reports for each region").
+
+GUIDELINES:
+- Max ${MAX_SUBTASKS} subtasks per call
+- ${MAX_CONCURRENT_SUBTASKS} run in parallel at a time
+- Each subtask gets up to 15 minutes and 15 tool calls
+- Subtasks share the workspace filesystem — avoid writing to the same files
+- Subtasks CANNOT spawn their own subtasks (1 level only)
+- Use this for genuinely parallel work, not sequential steps`,
+  {
+    subtasks: z.array(z.object({
+      description: z.string().describe('What this subtask should accomplish — be specific'),
+      context: z.string().optional().describe('Additional data, instructions, or file paths relevant to this subtask'),
+    })).min(1).max(MAX_SUBTASKS).describe('Array of subtasks to execute in parallel'),
+  },
+  async (args) => {
+    const { subtasks } = args;
+    const allResults: SubtaskResult[] = [];
+
+    // Execute in batches of MAX_CONCURRENT_SUBTASKS
+    for (let i = 0; i < subtasks.length; i += MAX_CONCURRENT_SUBTASKS) {
+      const batch = subtasks.slice(i, i + MAX_CONCURRENT_SUBTASKS);
+      const batchResults = await Promise.allSettled(
+        batch.map((subtask, batchIndex) => runSubtask(subtask, i + batchIndex)),
+      );
+
+      for (let j = 0; j < batchResults.length; j++) {
+        const result = batchResults[j];
+        if (result.status === 'fulfilled') {
+          allResults.push(result.value);
+        } else {
+          allResults.push({
+            index: i + j,
+            description: batch[j]?.description || 'unknown',
+            status: 'error',
+            error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+            durationMs: 0,
+          });
+        }
+      }
+    }
+
+    // Format results
+    const succeeded = allResults.filter(r => r.status === 'success').length;
+    const failed = allResults.filter(r => r.status === 'error').length;
+    const timedOut = allResults.filter(r => r.status === 'timeout').length;
+
+    const summary = `Completed ${allResults.length} subtasks: ${succeeded} succeeded, ${failed} failed, ${timedOut} timed out.`;
+
+    const details = allResults.map(r => {
+      const header = `## Subtask ${r.index + 1}: ${r.description}`;
+      const status = `**Status:** ${r.status} (${(r.durationMs / 1000).toFixed(1)}s)`;
+      const body = r.status === 'success' ? r.result : `**Error:** ${r.error}`;
+      return `${header}\n${status}\n\n${body}`;
+    }).join('\n\n---\n\n');
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `${summary}\n\n${details}`,
+      }],
+    };
+  },
+);
+
+// ─── Progress Tracking ──────────────────────────────────
+
+server.tool(
+  'update_progress',
+  `Report your progress on a multi-step task. The dashboard shows this as a real-time progress indicator so the user knows what you're working on.
+
+Use this at natural milestones — don't call it on every minor step.`,
+  {
+    steps: z.array(z.string()).describe('All steps in the task (e.g., ["Research competitors", "Analyze pricing", "Write report"])'),
+    current: z.number().describe('Index of the current step (0-based)'),
+    status: z.enum(['in_progress', 'completed', 'blocked']).default('in_progress').describe('Status of the current step'),
+    note: z.string().optional().describe('Optional detail about what is happening in the current step'),
+  },
+  async (args) => {
+    const { steps, current, status, note } = args;
+    const progress = Math.round(((current + (status === 'completed' ? 1 : 0)) / steps.length) * 100);
+
+    postActivity('progress', `Step ${current + 1}/${steps.length}: ${steps[current]} [${status}]${note ? ` — ${note}` : ''}`, {
+      steps,
+      current,
+      status,
+      progress,
+    });
+
+    const display = steps.map((step, i) => {
+      if (i < current) return `  [x] ${step}`;
+      if (i === current) return `  [${status === 'completed' ? 'x' : status === 'blocked' ? '!' : '>'}] ${step}${note ? ` — ${note}` : ''}`;
+      return `  [ ] ${step}`;
+    }).join('\n');
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Progress: ${progress}%\n${display}`,
+      }],
     };
   },
 );

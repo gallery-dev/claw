@@ -182,6 +182,11 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
               GALLERY_API_URL: process.env.GALLERY_API_URL || '',
               GALLERY_TOKEN: process.env.GALLERY_TOKEN || '',
               AGENT_ID: process.env.AGENT_ID || '',
+              ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || '',
+              ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+              CLAW_WORKSPACE_DIR: process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace',
+              GALLERY_CONVEX_URL: process.env.GALLERY_CONVEX_URL || '',
+              GALLERY_GATEWAY_TOKEN: process.env.GALLERY_GATEWAY_TOKEN || '',
             },
           },
           ...(process.env.GALLERY_MCP_URL && process.env.GALLERY_TOKEN ? {
