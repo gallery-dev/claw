@@ -43,7 +43,28 @@ async function processQueue(): Promise<void> {
   if (processing || requestQueue.length === 0) return;
 
   processing = true;
-  const { params, resolve, reject } = requestQueue.shift()!;
+
+  // Batch: if multiple messages queued, combine into single prompt
+  // This avoids N sequential agent invocations for rapid-fire messages
+  const items = requestQueue.splice(0, requestQueue.length);
+  let params: MessageParams;
+
+  if (items.length === 1) {
+    params = items[0].params;
+  } else {
+    // Merge messages into one prompt, preserve metadata from first item
+    const first = items[0].params;
+    const combined = items.map((item, i) =>
+      `[Message ${i + 1}]: ${item.params.message}`
+    ).join('\n\n');
+    params = {
+      message: combined,
+      sessionId: first.sessionId,
+      isScheduledTask: first.isScheduledTask,
+      assistantName: first.assistantName,
+    };
+    log(`Batched ${items.length} queued messages into single prompt`);
+  }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -51,13 +72,19 @@ async function processQueue(): Promise<void> {
       timer = setTimeout(() => rej(new Error('REQUEST_TIMEOUT')), REQUEST_TIMEOUT_MS);
     });
     const result = await Promise.race([processMessage(params), timeoutPromise]);
-    resolve(result);
+    // Resolve all batched requests with the same result
+    for (const item of items) {
+      item.resolve(result);
+    }
   } catch (err) {
-    reject(err instanceof Error ? err : new Error(String(err)));
+    const error = err instanceof Error ? err : new Error(String(err));
+    for (const item of items) {
+      item.reject(error);
+    }
   } finally {
     if (timer) clearTimeout(timer);
     processing = false;
-    // Process next in queue
+    // Process next batch if more arrived while processing
     if (requestQueue.length > 0) {
       processQueue();
     }

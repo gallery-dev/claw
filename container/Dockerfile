@@ -65,6 +65,10 @@ RUN mkdir -p /home/node/.browser-profile
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace /home/node/.browser-profile && chmod 777 /home/node
 
+# Health check — sprite orchestrator uses this to verify container is alive
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
 # Switch to non-root user (required for --dangerously-skip-permissions)
 USER node
 

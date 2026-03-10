@@ -202,6 +202,8 @@ export function createSanitizeBashHook(): HookCallback {
 export const LOOP_SAME_CALL_THRESHOLD = parseInt(process.env.LOOP_SAME_CALL_THRESHOLD || '3', 10);
 export const LOOP_FORCE_STOP_THRESHOLD = parseInt(process.env.LOOP_FORCE_STOP_THRESHOLD || '6', 10);
 export const LOOP_CYCLE_THRESHOLD = parseInt(process.env.LOOP_CYCLE_THRESHOLD || '3', 10);
+// Same tool called with different inputs N times = likely stuck on same goal
+export const LOOP_SAME_TOOL_THRESHOLD = parseInt(process.env.LOOP_SAME_TOOL_THRESHOLD || '5', 10);
 const LOOP_HISTORY_SIZE = 20;
 
 interface ToolCallRecord {
@@ -245,6 +247,15 @@ export class ToolCallTracker {
       return { loopDetected: true, shouldStop: totalRepeats >= LOOP_FORCE_STOP_THRESHOLD };
     }
 
+    // Check 3: Same tool called with different inputs — stuck on same goal
+    const sameToolCount = this.countConsecutiveSameTool();
+    if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD * 2) {
+      return { loopDetected: true, shouldStop: true };
+    }
+    if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD) {
+      return { loopDetected: true, shouldStop: false };
+    }
+
     return { loopDetected: false, shouldStop: false };
   }
 
@@ -254,6 +265,20 @@ export class ToolCallTracker {
     let count = 0;
     for (let i = this.history.length - 1; i >= 0; i--) {
       if (this.history[i].toolName === last.toolName && this.history[i].inputHash === last.inputHash) {
+        count++;
+      } else {
+        break;
+      }
+    }
+    return count;
+  }
+
+  private countConsecutiveSameTool(): number {
+    if (this.history.length === 0) return 0;
+    const last = this.history[this.history.length - 1];
+    let count = 0;
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      if (this.history[i].toolName === last.toolName) {
         count++;
       } else {
         break;

@@ -267,11 +267,80 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
   log(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${finalSessionId}`);
   activityPoster.post('status', 'Message processed');
 
+  // Fire-and-forget memory extraction — don't block the response
+  if (resultText && process.env.CLAW_AUTO_MEMORY !== 'false') {
+    extractMemory(message, resultText).catch(() => {});
+  }
+
   return {
     status: 'success',
     result: resultText,
     sessionId: finalSessionId,
   };
+}
+
+// ─── Automatic Memory Extraction ────────────────────────
+
+/**
+ * Post-conversation memory extraction. Sends a summary of the conversation
+ * to a cheap/fast model and appends extracted facts to MEMORY.md.
+ * Runs fire-and-forget — never blocks the response.
+ */
+async function extractMemory(userMessage: string, assistantResult: string): Promise<void> {
+  const memoryFile = path.join(WORKSPACE_DIR, 'MEMORY.md');
+  const existing = fs.existsSync(memoryFile) ? fs.readFileSync(memoryFile, 'utf-8') : '';
+
+  // Skip trivial interactions
+  if (userMessage.length < 20 && assistantResult.length < 100) return;
+
+  const baseUrl = process.env.ANTHROPIC_BASE_URL;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!baseUrl || !apiKey) return;
+
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 500,
+        messages: [{
+          role: 'user',
+          content: `Extract key facts, decisions, or preferences from this conversation that would be useful to remember in future sessions. Only extract genuinely important information — skip routine/trivial exchanges.
+
+EXISTING MEMORY (do NOT repeat what's already here):
+${existing.slice(0, 2000)}
+
+CONVERSATION:
+User: ${userMessage.slice(0, 3000)}
+Assistant: ${assistantResult.slice(0, 3000)}
+
+Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothing worth remembering. Do not include headers or timestamps — just bullet points.`,
+        }],
+      }),
+    });
+
+    if (!response.ok) {
+      log(`[memory] API returned ${response.status}`);
+      return;
+    }
+
+    const data = await response.json() as { content?: Array<{ type: string; text?: string }> };
+    const text = data.content?.[0]?.type === 'text' ? data.content[0].text?.trim() : '';
+    if (!text || text === 'NONE' || text.length < 5) return;
+
+    // Append with timestamp
+    const date = new Date().toISOString().split('T')[0];
+    const entry = `\n\n## Auto-extracted (${date})\n${text}\n`;
+    fs.appendFileSync(memoryFile, entry);
+    log(`[memory] Extracted ${text.split('\n').length} facts to MEMORY.md`);
+  } catch (err) {
+    log(`[memory] Extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /**
