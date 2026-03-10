@@ -207,6 +207,10 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
 
       if (msg.type === 'assistant' && 'uuid' in msg) {
         lastAssistantUuid = (msg as { uuid: string }).uuid;
+        // Persist resume point immediately — if sprite crashes mid-query,
+        // next request resumes from this point instead of starting over
+        lastResumeAt = lastAssistantUuid;
+        persistResumeAt(lastAssistantUuid);
         const content = (msg as any).message?.content;
         if (Array.isArray(content)) {
           for (const block of content) {
@@ -251,12 +255,6 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
       sessionId: sessionId || '',
       error: errorMessage,
     };
-  }
-
-  // Update resume point for next request (persist to survive sleep/wake)
-  if (lastAssistantUuid) {
-    lastResumeAt = lastAssistantUuid;
-    persistResumeAt(lastAssistantUuid);
   }
 
   const finalSessionId = newSessionId || sessionId || '';
