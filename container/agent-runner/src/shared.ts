@@ -204,6 +204,8 @@ export const LOOP_FORCE_STOP_THRESHOLD = parseInt(process.env.LOOP_FORCE_STOP_TH
 export const LOOP_CYCLE_THRESHOLD = parseInt(process.env.LOOP_CYCLE_THRESHOLD || '3', 10);
 // Same tool called with different inputs N times = likely stuck on same goal
 export const LOOP_SAME_TOOL_THRESHOLD = parseInt(process.env.LOOP_SAME_TOOL_THRESHOLD || '5', 10);
+// Read-only tools are commonly called many times consecutively (codebase exploration)
+const SAME_TOOL_EXEMPT = new Set(['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch', 'ToolSearch']);
 const LOOP_HISTORY_SIZE = 20;
 
 interface ToolCallRecord {
@@ -248,12 +250,15 @@ export class ToolCallTracker {
     }
 
     // Check 3: Same tool called with different inputs — stuck on same goal
-    const sameToolCount = this.countConsecutiveSameTool();
-    if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD * 2) {
-      return { loopDetected: true, shouldStop: true };
-    }
-    if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD) {
-      return { loopDetected: true, shouldStop: false };
+    // Skip for read-only tools (agents legitimately read many files in a row)
+    if (!SAME_TOOL_EXEMPT.has(toolName)) {
+      const sameToolCount = this.countConsecutiveSameTool();
+      if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD * 2) {
+        return { loopDetected: true, shouldStop: true };
+      }
+      if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD) {
+        return { loopDetected: true, shouldStop: false };
+      }
     }
 
     return { loopDetected: false, shouldStop: false };
@@ -350,6 +355,30 @@ export function createLoopDetectionHook(tracker: ToolCallTracker, log?: (msg: st
 
 export type ActivityType = 'output' | 'tool_use' | 'thinking' | 'error' | 'status' | 'subtask_started' | 'subtask_completed' | 'subtask_failed' | 'progress';
 
+/**
+ * One-shot fire-and-forget Convex activity post. Used by MCP server process
+ * which can't share the ActivityPoster queue with the main agent process.
+ */
+export async function postConvexActivity(
+  convexUrl: string,
+  token: string,
+  agentId: string,
+  type: ActivityType,
+  content: string,
+  metadata?: unknown,
+): Promise<void> {
+  try {
+    await fetch(`${convexUrl}/api/mutation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: 'agentActivity:push',
+        args: { token, agentId, type, content: content.slice(0, 4000), metadata },
+      }),
+    });
+  } catch { /* best-effort */ }
+}
+
 export class ActivityPoster {
   private static readonly MAX_QUEUE = 100;
   private convexUrl: string | null;
@@ -386,24 +415,7 @@ export class ActivityPoster {
 
     const batch = this.queue.splice(0, 10);
     for (const event of batch) {
-      try {
-        await fetch(`${this.convexUrl}/api/mutation`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            path: 'agentActivity:push',
-            args: {
-              token: this.token,
-              agentId: this.agentId,
-              type: event.type,
-              content: event.content,
-              metadata: event.metadata,
-            },
-          }),
-        });
-      } catch {
-        // non-fatal — dashboard activity is best-effort
-      }
+      await postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata);
     }
   }
 

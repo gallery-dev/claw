@@ -297,9 +297,13 @@ async function extractMemory(userMessage: string, assistantResult: string): Prom
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!baseUrl || !apiKey) return;
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+
   try {
     const response = await fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
+      signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': apiKey,
@@ -340,6 +344,8 @@ Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothi
     log(`[memory] Extracted ${text.split('\n').length} facts to MEMORY.md`);
   } catch (err) {
     log(`[memory] Extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

@@ -44,26 +44,33 @@ async function processQueue(): Promise<void> {
 
   processing = true;
 
-  // Batch: if multiple messages queued, combine into single prompt
-  // This avoids N sequential agent invocations for rapid-fire messages
-  const items = requestQueue.splice(0, requestQueue.length);
+  // Take the first item, then batch any queued items of the same type
+  // (don't mix tasks with regular messages — they have different semantics)
+  const first = requestQueue.shift()!;
+  const items = [first];
+  const isTask = first.params.isScheduledTask;
+
+  // Collect same-type items from the front of the queue
+  while (requestQueue.length > 0 && requestQueue[0].params.isScheduledTask === isTask) {
+    items.push(requestQueue.shift()!);
+  }
+
   let params: MessageParams;
 
   if (items.length === 1) {
     params = items[0].params;
   } else {
     // Merge messages into one prompt, preserve metadata from first item
-    const first = items[0].params;
     const combined = items.map((item, i) =>
       `[Message ${i + 1}]: ${item.params.message}`
     ).join('\n\n');
     params = {
       message: combined,
-      sessionId: first.sessionId,
-      isScheduledTask: first.isScheduledTask,
-      assistantName: first.assistantName,
+      sessionId: first.params.sessionId,
+      isScheduledTask: isTask,
+      assistantName: first.params.assistantName,
     };
-    log(`Batched ${items.length} queued messages into single prompt`);
+    log(`Batched ${items.length} queued ${isTask ? 'tasks' : 'messages'} into single prompt`);
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined;

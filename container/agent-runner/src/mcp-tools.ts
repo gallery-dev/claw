@@ -15,6 +15,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
+import { type ActivityType, postConvexActivity } from './shared.js';
 
 const WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace';
 const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
@@ -160,25 +161,14 @@ server.tool(
   },
 );
 
-// ─── Activity Posting (for subtask + progress events) ────
-
-type ActivityType = 'output' | 'tool_use' | 'thinking' | 'error' | 'status' | 'subtask_started' | 'subtask_completed' | 'subtask_failed' | 'progress';
+// ─── Activity Posting ────────────────────────────────────
 
 const convexUrl = process.env.GALLERY_CONVEX_URL || '';
 const gatewayToken = process.env.GALLERY_GATEWAY_TOKEN || '';
 
-async function postActivity(type: ActivityType, content: string, metadata?: unknown): Promise<void> {
+function postActivity(type: ActivityType, content: string, metadata?: unknown): void {
   if (!convexUrl || !gatewayToken) return;
-  try {
-    await fetch(`${convexUrl}/api/mutation`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        path: 'agentActivity:push',
-        args: { token: gatewayToken, agentId, type, content: content.slice(0, 4000), metadata },
-      }),
-    });
-  } catch { /* best-effort */ }
+  postConvexActivity(convexUrl, gatewayToken, agentId, type, content, metadata);
 }
 
 // ─── Sub-task Decomposition ──────────────────────────────
