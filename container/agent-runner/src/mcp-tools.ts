@@ -366,6 +366,131 @@ Use this at natural milestones — don't call it on every minor step.`,
   },
 );
 
+// ─── Agent Collaboration ─────────────────────────────────
+
+server.tool(
+  'gallery_delegate_task',
+  `Delegate a task to another agent in your workspace. The target agent will execute the task and return its result.
+
+Use this when:
+- A task requires skills or knowledge another agent specializes in
+- You want to parallelize work across multiple agents
+- You need to hand off a subtask to a dedicated agent
+
+The target agent runs the full task as a message (same as a user sending it). This call blocks until the target agent completes.
+
+IMPORTANT: You must know the target agent's Convex ID (agentId) to delegate. You can find agent IDs by asking the user or checking workspace context.`,
+  {
+    toAgentId: z.string().describe("Convex document ID of the target agent"),
+    task: z.string().describe("The task or instruction to send to the target agent — be specific and complete"),
+    context: z.string().optional().describe("Additional context, data, or files the target agent needs"),
+  },
+  async (args) => {
+    if (!galleryApiUrl || !galleryToken) {
+      return {
+        content: [{ type: 'text' as const, text: 'Agent delegation requires Gallery API (not configured).' }],
+        isError: true,
+      };
+    }
+
+    try {
+      const response = await fetch(`${galleryApiUrl}/api/claw/delegate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${galleryToken}`,
+        },
+        body: JSON.stringify({
+          type: 'task',
+          toAgentId: args.toAgentId,
+          fromAgentId: agentId,
+          task: args.task,
+          context: args.context,
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text();
+        return {
+          content: [{ type: 'text' as const, text: `Delegation failed (${response.status}): ${err}` }],
+          isError: true,
+        };
+      }
+
+      const data = await response.json() as { success: boolean; result?: string | null };
+      return {
+        content: [{
+          type: 'text' as const,
+          text: data.result
+            ? `Agent completed task.\n\nResult:\n${data.result}`
+            : 'Agent completed task (no text output).',
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Delegation error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'gallery_message_agent',
+  `Send a message to another agent and get their response. Use for quick questions, status checks, or collaboration where you need an immediate answer.
+
+Unlike gallery_delegate_task, this is for conversational exchanges — asking an agent a question or requesting a brief output. The target agent's reply is returned directly.`,
+  {
+    toAgentId: z.string().describe("Convex document ID of the target agent"),
+    message: z.string().describe("The message to send"),
+  },
+  async (args) => {
+    if (!galleryApiUrl || !galleryToken) {
+      return {
+        content: [{ type: 'text' as const, text: 'Agent messaging requires Gallery API (not configured).' }],
+        isError: true,
+      };
+    }
+
+    try {
+      const response = await fetch(`${galleryApiUrl}/api/claw/delegate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${galleryToken}`,
+        },
+        body: JSON.stringify({
+          type: 'message',
+          toAgentId: args.toAgentId,
+          fromAgentId: agentId,
+          message: args.message,
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text();
+        return {
+          content: [{ type: 'text' as const, text: `Message failed (${response.status}): ${err}` }],
+          isError: true,
+        };
+      }
+
+      const data = await response.json() as { success: boolean; result?: string | null };
+      return {
+        content: [{
+          type: 'text' as const,
+          text: data.result || '(Agent replied with no text output)',
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Message error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
 // ─── Memory Tools ──────────────────────────────────────
 
 server.tool(

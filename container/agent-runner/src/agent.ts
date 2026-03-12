@@ -109,7 +109,7 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
   if (!activityPoster) {
     activityPoster = new ActivityPoster(
       process.env.GALLERY_CONVEX_URL || null,
-      process.env.GALLERY_GATEWAY_TOKEN || null,
+      process.env.GALLERY_GATEWAY_TOKEN || process.env.GALLERY_TOKEN || null,
       agentId,
     );
     log('[activity] Gallery activity posting enabled');
@@ -186,7 +186,7 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
               ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
               CLAW_WORKSPACE_DIR: process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace',
               GALLERY_CONVEX_URL: process.env.GALLERY_CONVEX_URL || '',
-              GALLERY_GATEWAY_TOKEN: process.env.GALLERY_GATEWAY_TOKEN || '',
+              GALLERY_GATEWAY_TOKEN: process.env.GALLERY_GATEWAY_TOKEN || process.env.GALLERY_TOKEN || '',
             },
           },
           ...(process.env.GALLERY_MCP_URL && process.env.GALLERY_TOKEN ? {
