@@ -46,6 +46,22 @@ function log(message: string): void {
   console.error(`[claw] ${message}`);
 }
 
+/** Default context window sizes by model family. Refined at runtime from modelUsage. */
+function getDefaultContextWindow(model: string): number {
+  const m = model.toLowerCase();
+  // Anthropic — all current Claude models are 200k
+  if (m.includes('claude') || m.startsWith('anthropic/')) return 200_000;
+  // OpenAI
+  if (m.includes('gpt-5')) return 256_000;
+  if (m.includes('gpt-4')) return 128_000;
+  // Google
+  if (m.includes('gemini-3') || m.includes('gemini-2.5')) return 1_000_000;
+  // DeepSeek
+  if (m.includes('deepseek')) return 128_000;
+  // Safe default
+  return 128_000;
+}
+
 // ─── Session Management ──────────────────────────────────
 
 function getPersistedSessionId(): string | undefined {
@@ -204,11 +220,8 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
   const contextTracker = new ContextWindowTracker();
   // Set a default context window based on model — will be refined from modelUsage in result
   const model = process.env.CLAW_MODEL || 'claude-opus-4-6';
-  if (model.includes('opus') || model.includes('sonnet')) {
-    contextTracker.contextWindow = 200_000;
-  } else if (model.includes('haiku')) {
-    contextTracker.contextWindow = 200_000;
-  }
+  const isClaude = model.includes('claude') || model.startsWith('anthropic/');
+  contextTracker.contextWindow = getDefaultContextWindow(model);
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   const resultTexts: string[] = [];
@@ -225,8 +238,11 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
       options: {
         cwd: WORKSPACE_DIR,
         model: process.env.CLAW_MODEL || 'claude-opus-4-6',
-        thinking: { type: 'adaptive' as const },
-        effort: (process.env.CLAW_EFFORT || 'high') as 'low' | 'medium' | 'high' | 'max',
+        // thinking + effort are Claude-only — omit for non-Claude models
+        ...(isClaude ? {
+          thinking: { type: 'adaptive' as const },
+          effort: (process.env.CLAW_EFFORT || 'high') as 'low' | 'medium' | 'high' | 'max',
+        } : {}),
         maxTurns: parseInt(process.env.CLAW_MAX_TURNS || '50', 10),
         resume: sessionId,
         resumeSessionAt: lastResumeAt,
