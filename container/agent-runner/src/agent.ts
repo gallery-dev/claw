@@ -110,6 +110,47 @@ export interface MessageResult {
   usage?: UsageInfo;
 }
 
+// ─── Dynamic MCP Server Loading ──────────────────────────
+
+interface McpServerConfig {
+  name: string;
+  url: string;
+  authHeader?: string;
+}
+
+/**
+ * Load customer-provided MCP servers from .mcp-servers.json.
+ * Written by Gallery during provisioning (from Convex mcpServers table).
+ * Returns SDK-compatible mcpServers entries keyed by name.
+ */
+function loadDynamicMcpServers(): Record<string, { type: 'http'; url: string; headers?: Record<string, string> }> {
+  const configPath = path.join(WORKSPACE_DIR, '.mcp-servers.json');
+  const servers: Record<string, { type: 'http'; url: string; headers?: Record<string, string> }> = {};
+
+  try {
+    if (!fs.existsSync(configPath)) return servers;
+    const raw = fs.readFileSync(configPath, 'utf-8');
+    const configs: McpServerConfig[] = JSON.parse(raw);
+
+    for (const cfg of configs) {
+      if (!cfg.name || !cfg.url) continue;
+      servers[cfg.name] = {
+        type: 'http' as const,
+        url: cfg.url,
+        ...(cfg.authHeader ? { headers: { Authorization: cfg.authHeader } } : {}),
+      };
+    }
+
+    if (Object.keys(servers).length > 0) {
+      log(`[mcp] Loaded ${Object.keys(servers).length} dynamic MCP servers: ${Object.keys(servers).join(', ')}`);
+    }
+  } catch (err) {
+    log(`[mcp] Failed to load .mcp-servers.json (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  return servers;
+}
+
 // Persistent state across requests (sprite stays alive between requests)
 // On sleep/wake, the process restarts — read from disk to survive hibernation
 let activityPoster: ActivityPoster | null = null;
@@ -174,6 +215,10 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
   let messageCount = 0;
   let usageInfo: UsageInfo | undefined;
 
+  // Load customer-provided MCP servers (re-read on each message in case config was updated)
+  const dynamicMcpServers = loadDynamicMcpServers();
+  const dynamicToolPatterns = Object.keys(dynamicMcpServers).map(name => `mcp__${name}__*`);
+
   try {
     for await (const msg of query({
       prompt,
@@ -195,6 +240,7 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
           'NotebookEdit',
           'mcp__claw__*',
           'mcp__gallery__*',
+          ...dynamicToolPatterns,
         ],
         env: sdkEnv,
         permissionMode: 'bypassPermissions',
@@ -222,6 +268,7 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
               headers: { Authorization: `Bearer ${process.env.GALLERY_TOKEN}` },
             },
           } : {}),
+          ...dynamicMcpServers,
         },
         hooks: {
           PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
