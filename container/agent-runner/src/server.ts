@@ -15,9 +15,36 @@ import { processMessage, getStatus, getActivityMetrics, shutdown, type MessagePa
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const MAX_QUEUE_SIZE = parseInt(process.env.CLAW_MAX_QUEUE_SIZE || '50', 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || '600000', 10);
+const AUTH_TOKEN = process.env.CLAW_AUTH_TOKEN || process.env.GALLERY_GATEWAY_TOKEN || '';
 
 function log(message: string): void {
   console.error(`[claw-server] ${message}`);
+}
+
+// ─── Auth ────────────────────────────────────────────────
+
+/**
+ * Validate Bearer token on protected endpoints.
+ * Returns true if authorized, false (and sends 401) if not.
+ * If no AUTH_TOKEN is configured, all requests are allowed (dev mode).
+ */
+function requireAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  if (!AUTH_TOKEN) return true; // no token configured = dev mode
+
+  const authHeader = req.headers['authorization'];
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    sendJson(res, 401, { error: 'Missing Authorization header' });
+    return false;
+  }
+
+  const token = authHeader.slice(7);
+  if (token !== AUTH_TOKEN) {
+    log(`Auth failed: invalid token from ${req.socket.remoteAddress}`);
+    sendJson(res, 401, { error: 'Invalid token' });
+    return false;
+  }
+
+  return true;
 }
 
 // ─── Request Queue (one query at a time) ─────────────────
@@ -100,10 +127,21 @@ async function processQueue(): Promise<void> {
 
 // ─── HTTP Request Helpers ────────────────────────────────
 
+const MAX_BODY_BYTES = 1024 * 1024; // 1MB
+
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', (chunk: string) => { body += chunk; });
+    let bytes = 0;
+    req.on('data', (chunk: Buffer | string) => {
+      bytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+      if (bytes > MAX_BODY_BYTES) {
+        req.destroy();
+        reject(new Error('BODY_TOO_LARGE'));
+        return;
+      }
+      body += chunk;
+    });
     req.on('end', () => resolve(body));
     req.on('error', reject);
   });
@@ -133,6 +171,7 @@ function markReady(): void { ready = true; }
 function errorStatus(msg: string): number {
   if (msg === 'QUEUE_FULL') return 503;
   if (msg === 'REQUEST_TIMEOUT') return 504;
+  if (msg === 'BODY_TOO_LARGE') return 413;
   return 500;
 }
 
@@ -259,8 +298,10 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (method === 'POST' && url === '/message') {
+      if (!requireAuth(req, res)) return;
       await handleMessage(req, res);
     } else if (method === 'POST' && url === '/task') {
+      if (!requireAuth(req, res)) return;
       await handleTask(req, res);
     } else if (method === 'GET' && url === '/health') {
       handleHealth(req, res);

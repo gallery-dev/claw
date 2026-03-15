@@ -351,6 +351,99 @@ export function createLoopDetectionHook(tracker: ToolCallTracker, log?: (msg: st
   };
 }
 
+// ─── Context Window Safety ───────────────────────────────
+
+export const CONTEXT_WARN_THRESHOLD = parseFloat(process.env.CLAW_CONTEXT_WARN_THRESHOLD || '0.70');
+export const CONTEXT_CHECKPOINT_THRESHOLD = parseFloat(process.env.CLAW_CONTEXT_CHECKPOINT_THRESHOLD || '0.80');
+
+export class ContextWindowTracker {
+  /** Last known input_tokens from the most recent assistant message (cumulative per API) */
+  lastInputTokens = 0;
+  lastOutputTokens = 0;
+  contextWindow = 0;
+  private warnedAt70 = false;
+  private checkpointedAt80 = false;
+
+  update(inputTokens: number, outputTokens: number, contextWindow?: number): void {
+    this.lastInputTokens = inputTokens;
+    this.lastOutputTokens = outputTokens;
+    if (contextWindow && contextWindow > 0) this.contextWindow = contextWindow;
+  }
+
+  getPercentage(): number {
+    if (this.contextWindow <= 0) return 0;
+    // input_tokens represents the full context sent to the model (system + messages + tools)
+    return this.lastInputTokens / this.contextWindow;
+  }
+
+  shouldWarn(): boolean {
+    if (this.warnedAt70) return false;
+    if (this.getPercentage() >= CONTEXT_WARN_THRESHOLD) {
+      this.warnedAt70 = true;
+      return true;
+    }
+    return false;
+  }
+
+  shouldCheckpoint(): boolean {
+    if (this.checkpointedAt80) return false;
+    if (this.getPercentage() >= CONTEXT_CHECKPOINT_THRESHOLD) {
+      this.checkpointedAt80 = true;
+      return true;
+    }
+    return false;
+  }
+
+  reset(): void {
+    this.warnedAt70 = false;
+    this.checkpointedAt80 = false;
+  }
+}
+
+export function createContextSafetyHook(
+  tracker: ContextWindowTracker,
+  activityPoster: { post: (type: ActivityType, content: string, metadata?: unknown) => void } | null,
+  log?: (msg: string) => void,
+): HookCallback {
+  return async (_input, _toolUseId, _context) => {
+    const pct = tracker.getPercentage();
+
+    if (tracker.shouldCheckpoint()) {
+      const pctStr = Math.round(pct * 100);
+      log?.(`[context-safety] CHECKPOINT: Context at ${pctStr}% — advising agent to save progress`);
+      activityPoster?.post('status', `Context window at ${pctStr}% — checkpoint recommended`, {
+        contextPercentage: pctStr,
+        inputTokens: tracker.lastInputTokens,
+        contextWindow: tracker.contextWindow,
+      });
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          message: `WARNING: Your context window is ${pctStr}% full (${tracker.lastInputTokens.toLocaleString()} / ${tracker.contextWindow.toLocaleString()} tokens). Save your progress now: write important findings to MEMORY.md or files before context compaction occurs. Summarize your current state and next steps.`,
+        },
+      };
+    }
+
+    if (tracker.shouldWarn()) {
+      const pctStr = Math.round(pct * 100);
+      log?.(`[context-safety] WARNING: Context at ${pctStr}%`);
+      activityPoster?.post('status', `Context window at ${pctStr}%`, {
+        contextPercentage: pctStr,
+        inputTokens: tracker.lastInputTokens,
+        contextWindow: tracker.contextWindow,
+      });
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          message: `Note: Your context window is ${pctStr}% full. Be concise in your remaining tool calls and consider wrapping up soon.`,
+        },
+      };
+    }
+
+    return {};
+  };
+}
+
 // ─── Gallery Activity Posting ────────────────────────────
 
 export type ActivityType = 'output' | 'tool_use' | 'thinking' | 'error' | 'status' | 'subtask_started' | 'subtask_completed' | 'subtask_failed' | 'progress';

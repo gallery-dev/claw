@@ -29,9 +29,11 @@ import { fileURLToPath } from 'url';
 import {
   ToolCallTracker,
   ActivityPoster,
+  ContextWindowTracker,
   createPreCompactHook,
   createSanitizeBashHook,
   createLoopDetectionHook,
+  createContextSafetyHook,
 } from './shared.js';
 
 // ─── Configuration ──────────────────────────────────────
@@ -86,11 +88,26 @@ export interface MessageParams {
   assistantName?: string;
 }
 
+export interface UsageInfo {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalCostUsd: number;
+  numTurns: number;
+  durationMs: number;
+  /** Context window size for the model used */
+  contextWindow: number;
+  /** Approximate percentage of context window used: (input + output) / contextWindow */
+  contextPercentage: number;
+}
+
 export interface MessageResult {
   status: 'success' | 'error';
   result: string | null;
   sessionId: string;
   error?: string;
+  usage?: UsageInfo;
 }
 
 // Persistent state across requests (sprite stays alive between requests)
@@ -143,10 +160,19 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
 
   const loopTracker = new ToolCallTracker();
+  const contextTracker = new ContextWindowTracker();
+  // Set a default context window based on model — will be refined from modelUsage in result
+  const model = process.env.CLAW_MODEL || 'claude-opus-4-6';
+  if (model.includes('opus') || model.includes('sonnet')) {
+    contextTracker.contextWindow = 200_000;
+  } else if (model.includes('haiku')) {
+    contextTracker.contextWindow = 200_000;
+  }
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   const resultTexts: string[] = [];
   let messageCount = 0;
+  let usageInfo: UsageInfo | undefined;
 
   try {
     for await (const msg of query({
@@ -202,6 +228,7 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
           PreToolUse: [
             { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
             { hooks: [createLoopDetectionHook(loopTracker, log)] },
+            { hooks: [createContextSafetyHook(contextTracker, activityPoster, log)] },
           ],
         },
       }
@@ -216,6 +243,16 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
         // next request resumes from this point instead of starting over
         lastResumeAt = lastAssistantUuid;
         persistResumeAt(lastAssistantUuid);
+
+        // Track context window usage from the API response
+        const msgUsage = (msg as any).message?.usage;
+        if (msgUsage) {
+          contextTracker.update(
+            msgUsage.input_tokens ?? 0,
+            msgUsage.output_tokens ?? 0,
+          );
+        }
+
         const content = (msg as any).message?.content;
         if (Array.isArray(content)) {
           for (const block of content) {
@@ -248,6 +285,45 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
         log(`Result #${resultTexts.length + 1}: ${textResult ? textResult.slice(0, 200) : '(no text)'}`);
         activityPoster.post('output', textResult ? textResult.slice(0, 500) : 'Query completed');
         if (textResult) resultTexts.push(textResult);
+
+        // Extract usage data from the result message
+        const resultMsg = msg as {
+          usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+          modelUsage?: Record<string, { inputTokens: number; outputTokens: number; contextWindow: number; costUSD: number }>;
+          total_cost_usd?: number;
+          num_turns?: number;
+          duration_ms?: number;
+        };
+
+        if (resultMsg.usage || resultMsg.modelUsage) {
+          // Get context window from modelUsage (first model entry)
+          const modelEntries = resultMsg.modelUsage ? Object.values(resultMsg.modelUsage) : [];
+          const contextWindow = modelEntries[0]?.contextWindow ?? contextTracker.contextWindow;
+          // Update tracker with authoritative context window from API
+          if (contextWindow > 0) contextTracker.contextWindow = contextWindow;
+          const inputTokens = resultMsg.usage?.input_tokens ?? 0;
+          const outputTokens = resultMsg.usage?.output_tokens ?? 0;
+          const contextPercentage = contextWindow > 0
+            ? Math.round((inputTokens + outputTokens) / contextWindow * 100)
+            : 0;
+
+          usageInfo = {
+            inputTokens,
+            outputTokens,
+            cacheReadTokens: resultMsg.usage?.cache_read_input_tokens ?? 0,
+            cacheCreationTokens: resultMsg.usage?.cache_creation_input_tokens ?? 0,
+            totalCostUsd: resultMsg.total_cost_usd ?? 0,
+            numTurns: resultMsg.num_turns ?? 0,
+            durationMs: resultMsg.duration_ms ?? 0,
+            contextWindow,
+            contextPercentage,
+          };
+
+          log(`[usage] ${inputTokens} in / ${outputTokens} out | context: ${contextPercentage}% of ${contextWindow}`);
+          activityPoster.post('status', `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, {
+            usage: usageInfo,
+          });
+        }
       }
     }
   } catch (err) {
@@ -276,6 +352,7 @@ export async function processMessage(params: MessageParams): Promise<MessageResu
     status: 'success',
     result: resultText,
     sessionId: finalSessionId,
+    usage: usageInfo,
   };
 }
 
@@ -337,10 +414,15 @@ Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothi
     const text = data.content?.[0]?.type === 'text' ? data.content[0].text?.trim() : '';
     if (!text || text === 'NONE' || text.length < 5) return;
 
-    // Append with timestamp
+    // Append under today's date section (reuse existing header if present)
     const date = new Date().toISOString().split('T')[0];
-    const entry = `\n\n## Auto-extracted (${date})\n${text}\n`;
-    fs.appendFileSync(memoryFile, entry);
+    const header = `## Auto-extracted (${date})`;
+    if (existing.includes(header)) {
+      // Append to existing day section
+      fs.appendFileSync(memoryFile, `\n${text}\n`);
+    } else {
+      fs.appendFileSync(memoryFile, `\n\n${header}\n${text}\n`);
+    }
     log(`[memory] Extracted ${text.split('\n').length} facts to MEMORY.md`);
   } catch (err) {
     log(`[memory] Extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);

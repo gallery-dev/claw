@@ -5,8 +5,9 @@
  * Changes from Docker version:
  * - Memory tools: paths updated (/workspace/group → /home/sprite/workspace)
  * - send_message: POST to Gallery API instead of filesystem IPC
- * - Scheduling tools: stubbed (wired to Gallery in Phase 2)
- * - Removed: register_group, list_sessions, send_to_group, close_group_session
+ * - Agent collaboration: gallery_delegate_task, gallery_message_agent
+ * - Sub-task decomposition: decompose_task with parallel workers
+ * - Removed: register_group, list_sessions, send_to_group, close_group_session, scheduling stubs
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -79,88 +80,6 @@ server.tool(
   },
 );
 
-// ─── Scheduling Tools (stubbed for Phase 2) ──────────────
-
-server.tool(
-  'schedule_task',
-  `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
-
-SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
-• cron: Standard cron expression (e.g., "0 9 * * *" for daily at 9am)
-• interval: Milliseconds between runs (e.g., "3600000" for 1 hour)
-• once: Local time (e.g., "2026-03-01T15:30:00")`,
-  {
-    prompt: z.string().describe('What the agent should do when the task runs.'),
-    schedule_type: z.enum(['cron', 'interval', 'once']).describe('cron | interval | once'),
-    schedule_value: z.string().describe('The schedule value'),
-  },
-  async () => {
-    return {
-      content: [{ type: 'text' as const, text: 'Task scheduling is being migrated to Gallery. This feature will be available soon. For now, please ask the user to set up scheduled tasks in the Gallery dashboard.' }],
-    };
-  },
-);
-
-server.tool(
-  'list_tasks',
-  "List all scheduled tasks.",
-  {},
-  async () => {
-    return {
-      content: [{ type: 'text' as const, text: 'Task listing is being migrated to Gallery. Please check the Gallery dashboard for scheduled tasks.' }],
-    };
-  },
-);
-
-server.tool(
-  'pause_task',
-  'Pause a scheduled task.',
-  { task_id: z.string().describe('The task ID to pause') },
-  async () => {
-    return {
-      content: [{ type: 'text' as const, text: 'Task management is being migrated to Gallery. Please use the Gallery dashboard.' }],
-    };
-  },
-);
-
-server.tool(
-  'resume_task',
-  'Resume a paused task.',
-  { task_id: z.string().describe('The task ID to resume') },
-  async () => {
-    return {
-      content: [{ type: 'text' as const, text: 'Task management is being migrated to Gallery. Please use the Gallery dashboard.' }],
-    };
-  },
-);
-
-server.tool(
-  'cancel_task',
-  'Cancel and delete a scheduled task.',
-  { task_id: z.string().describe('The task ID to cancel') },
-  async () => {
-    return {
-      content: [{ type: 'text' as const, text: 'Task management is being migrated to Gallery. Please use the Gallery dashboard.' }],
-    };
-  },
-);
-
-server.tool(
-  'update_task',
-  "Update an existing scheduled task's prompt, schedule, or status.",
-  {
-    task_id: z.string().describe('The task ID to update'),
-    prompt: z.string().optional().describe('New prompt/instruction for the task'),
-    schedule_type: z.enum(['cron', 'interval', 'once']).optional().describe('New schedule type'),
-    schedule_value: z.string().optional().describe('New schedule value'),
-  },
-  async () => {
-    return {
-      content: [{ type: 'text' as const, text: 'Task management is being migrated to Gallery. Please use the Gallery dashboard.' }],
-    };
-  },
-);
-
 // ─── Activity Posting ────────────────────────────────────
 
 const convexUrl = process.env.GALLERY_CONVEX_URL || '';
@@ -173,6 +92,7 @@ function postActivity(type: ActivityType, content: string, metadata?: unknown): 
 
 // ─── Sub-task Decomposition ──────────────────────────────
 
+const DELEGATION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const SUBTASK_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 const MAX_CONCURRENT_SUBTASKS = 3;
 const MAX_SUBTASKS = 5;
@@ -393,9 +313,13 @@ IMPORTANT: You must know the target agent's Convex ID (agentId) to delegate. You
       };
     }
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), DELEGATION_TIMEOUT_MS);
+
     try {
       const response = await fetch(`${galleryApiUrl}/api/claw/delegate`, {
         method: 'POST',
+        signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${galleryToken}`,
@@ -427,10 +351,14 @@ IMPORTANT: You must know the target agent's Convex ID (agentId) to delegate. You
         }],
       };
     } catch (err) {
+      const isAbort = err instanceof Error && err.name === 'AbortError';
+      const msg = isAbort ? `Delegation timed out after ${DELEGATION_TIMEOUT_MS / 1000}s` : (err instanceof Error ? err.message : String(err));
       return {
-        content: [{ type: 'text' as const, text: `Delegation error: ${err instanceof Error ? err.message : String(err)}` }],
+        content: [{ type: 'text' as const, text: `Delegation error: ${msg}` }],
         isError: true,
       };
+    } finally {
+      clearTimeout(timeout);
     }
   },
 );
@@ -452,9 +380,13 @@ Unlike gallery_delegate_task, this is for conversational exchanges — asking an
       };
     }
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), DELEGATION_TIMEOUT_MS);
+
     try {
       const response = await fetch(`${galleryApiUrl}/api/claw/delegate`, {
         method: 'POST',
+        signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${galleryToken}`,
@@ -483,10 +415,14 @@ Unlike gallery_delegate_task, this is for conversational exchanges — asking an
         }],
       };
     } catch (err) {
+      const isAbort = err instanceof Error && err.name === 'AbortError';
+      const msg = isAbort ? `Message timed out after ${DELEGATION_TIMEOUT_MS / 1000}s` : (err instanceof Error ? err.message : String(err));
       return {
-        content: [{ type: 'text' as const, text: `Message error: ${err instanceof Error ? err.message : String(err)}` }],
+        content: [{ type: 'text' as const, text: `Message error: ${msg}` }],
         isError: true,
       };
+    } finally {
+      clearTimeout(timeout);
     }
   },
 );
