@@ -90,6 +90,58 @@ function postActivity(type: ActivityType, content: string, metadata?: unknown): 
   postConvexActivity(convexUrl, gatewayToken, agentId, type, content, metadata);
 }
 
+// ─── Convex Memory Index ─────────────────────────────────
+
+/** Fire-and-forget: index a memory file in Convex for full-text search. */
+async function indexMemoryEntry(memPath: string, body: string): Promise<void> {
+  if (!convexUrl || !gatewayToken) return;
+  try {
+    await fetch(`${convexUrl}/api/mutation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: 'memoryEntries:upsert',
+        args: { token: gatewayToken, agentId, path: memPath, body },
+      }),
+    });
+  } catch { /* best-effort */ }
+}
+
+/** Fire-and-forget: remove a memory entry from Convex index. */
+async function removeMemoryEntry(memPath: string): Promise<void> {
+  if (!convexUrl || !gatewayToken) return;
+  try {
+    await fetch(`${convexUrl}/api/mutation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: 'memoryEntries:remove',
+        args: { token: gatewayToken, agentId, path: memPath },
+      }),
+    });
+  } catch { /* best-effort */ }
+}
+
+/** Search memory entries via Convex full-text search. Returns null on failure. */
+async function searchMemoryEntries(searchQuery: string, limit: number = 10): Promise<Array<{ path: string; body: string }> | null> {
+  if (!convexUrl || !gatewayToken) return null;
+  try {
+    const res = await fetch(`${convexUrl}/api/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: 'memoryEntries:search',
+        args: { token: gatewayToken, agentId, query: searchQuery, limit },
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.value ?? data ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Sub-task Decomposition ──────────────────────────────
 
 const DELEGATION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -552,73 +604,126 @@ Best practices:
       fs.writeFileSync(targetPath, args.content);
     }
 
+    // Index in Convex for full-text search (fire-and-forget)
+    const fullContent = fs.readFileSync(targetPath, 'utf-8');
+    indexMemoryEntry(args.path, fullContent);
+
     const stat = fs.statSync(targetPath);
     return { content: [{ type: 'text' as const, text: `Memory written: ${args.path} (${formatSize(stat.size)})` }] };
   },
 );
 
+/** Local keyword search across memory or conversation files. */
+function localKeywordSearch(
+  queryTerms: string[],
+  scope: 'memory' | 'conversations',
+): Array<{ file: string; line: number; text: string }> {
+  const results: Array<{ file: string; line: number; text: string }> = [];
+
+  const searchFile = (filePath: string, displayName: string) => {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const lines = content.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const lineLower = lines[i].toLowerCase();
+        if (queryTerms.some(term => lineLower.includes(term))) {
+          const start = Math.max(0, i - 1);
+          const end = Math.min(lines.length, i + 2);
+          const snippet = lines.slice(start, end).join('\n');
+          results.push({ file: displayName, line: i + 1, text: snippet.slice(0, 300) });
+        }
+      }
+    } catch { /* skip unreadable files */ }
+  };
+
+  const searchDir = (dirPath: string, prefix: string) => {
+    if (!fs.existsSync(dirPath)) return;
+    const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.md')).sort();
+    for (const file of files) {
+      searchFile(path.join(dirPath, file), `${prefix}${file}`);
+    }
+  };
+
+  if (scope === 'memory') {
+    if (fs.existsSync(MEMORY_FILE)) {
+      searchFile(MEMORY_FILE, 'MEMORY.md');
+    }
+    searchDir(MEMORY_DIR, 'memory/');
+  } else {
+    searchDir(path.join(WORKSPACE_DIR, 'conversations'), 'conversations/');
+  }
+
+  // Deduplicate adjacent matches in the same file
+  return results.filter((r, i) => {
+    if (i === 0) return true;
+    const prev = results[i - 1];
+    return !(r.file === prev.file && Math.abs(r.line - prev.line) <= 2);
+  });
+}
+
 server.tool(
   'memory_search',
-  `Search across all memory files for relevant information. Uses keyword matching across MEMORY.md, memory/*.md, and conversations/*.md.`,
+  `Search across all memory files for relevant information. Uses full-text search (BM25 ranking) for relevance-ranked results. Falls back to keyword matching if search index is unavailable.`,
   {
-    query: z.string().describe('Search query — keywords or phrases to find in memory files'),
+    query: z.string().describe('Search query — natural language or keywords to find in memory files'),
     scope: z.enum(['memory', 'conversations', 'all']).default('all').describe('Where to search'),
+    limit: z.number().default(10).describe('Max results to return'),
   },
   async (args) => {
-    const results: Array<{ file: string; line: number; text: string }> = [];
-    const queryLower = args.query.toLowerCase();
-    const queryTerms = queryLower.split(/\s+/).filter(Boolean);
+    const queryTerms = args.query.toLowerCase().split(/\s+/).filter(Boolean);
+    if (queryTerms.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'Search query is empty.' }], isError: true };
+    }
 
-    const searchFile = (filePath: string, displayName: string) => {
-      try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const lines = content.split('\n');
-        for (let i = 0; i < lines.length; i++) {
-          const lineLower = lines[i].toLowerCase();
-          if (queryTerms.some(term => lineLower.includes(term))) {
-            const start = Math.max(0, i - 1);
-            const end = Math.min(lines.length, i + 2);
-            const snippet = lines.slice(start, end).join('\n');
-            results.push({ file: displayName, line: i + 1, text: snippet.slice(0, 300) });
+    const sections: string[] = [];
+    let totalMatches = 0;
+
+    // ── Convex full-text search for memory files (BM25-ranked) ──
+    if (args.scope !== 'conversations') {
+      const indexed = await searchMemoryEntries(args.query, args.limit);
+      if (indexed && indexed.length > 0) {
+        totalMatches += indexed.length;
+        const formatted = indexed.map(entry => {
+          const lines = entry.body.split('\n');
+          const snippets: string[] = [];
+          for (let i = 0; i < lines.length && snippets.length < 3; i++) {
+            const lineLower = lines[i].toLowerCase();
+            if (queryTerms.some(term => lineLower.includes(term))) {
+              const start = Math.max(0, i - 1);
+              const end = Math.min(lines.length, i + 2);
+              snippets.push(lines.slice(start, end).join('\n').slice(0, 300));
+            }
           }
+          if (snippets.length === 0) {
+            snippets.push(lines.slice(0, 4).join('\n').slice(0, 300));
+          }
+          return `**${entry.path}**\n${snippets.join('\n...\n')}`;
+        }).join('\n\n---\n\n');
+        sections.push(formatted);
+      } else {
+        // Convex unavailable or empty — fall back to local keyword search for memory
+        const memResults = localKeywordSearch(queryTerms, 'memory');
+        if (memResults.length > 0) {
+          totalMatches += memResults.length;
+          sections.push(memResults.slice(0, args.limit).map(r => `**${r.file}:${r.line}**\n${r.text}`).join('\n\n---\n\n'));
         }
-      } catch { /* skip unreadable files */ }
-    };
-
-    const searchDir = (dirPath: string, prefix: string) => {
-      if (!fs.existsSync(dirPath)) return;
-      const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.md')).sort();
-      for (const file of files) {
-        searchFile(path.join(dirPath, file), `${prefix}${file}`);
       }
-    };
-
-    if (args.scope === 'memory' || args.scope === 'all') {
-      if (fs.existsSync(MEMORY_FILE)) {
-        searchFile(MEMORY_FILE, 'MEMORY.md');
-      }
-      searchDir(MEMORY_DIR, 'memory/');
     }
 
+    // ── Local keyword search for conversations (not indexed in Convex) ──
     if (args.scope === 'conversations' || args.scope === 'all') {
-      searchDir(path.join(WORKSPACE_DIR, 'conversations'), 'conversations/');
+      const convResults = localKeywordSearch(queryTerms, 'conversations');
+      if (convResults.length > 0) {
+        totalMatches += convResults.length;
+        sections.push(convResults.slice(0, args.limit).map(r => `**${r.file}:${r.line}**\n${r.text}`).join('\n\n---\n\n'));
+      }
     }
 
-    if (results.length === 0) {
+    if (totalMatches === 0) {
       return { content: [{ type: 'text' as const, text: `No matches for "${args.query}" in ${args.scope} files.` }] };
     }
 
-    const deduped = results.filter((r, i) => {
-      if (i === 0) return true;
-      const prev = results[i - 1];
-      return !(r.file === prev.file && Math.abs(r.line - prev.line) <= 2);
-    });
-
-    const top = deduped.slice(0, 10);
-    const formatted = top.map(r => `**${r.file}:${r.line}**\n${r.text}`).join('\n\n---\n\n');
-    const truncated = deduped.length > 10 ? `\n\n(${deduped.length - 10} more results omitted)` : '';
-
-    return { content: [{ type: 'text' as const, text: `Found ${deduped.length} match(es) for "${args.query}":\n\n${formatted}${truncated}` }] };
+    return { content: [{ type: 'text' as const, text: `Found ${totalMatches} match(es) for "${args.query}":\n\n${sections.join('\n\n---\n\n')}` }] };
   },
 );
 
@@ -646,6 +751,10 @@ server.tool(
     }
 
     fs.unlinkSync(targetPath);
+
+    // Remove from Convex search index (fire-and-forget)
+    removeMemoryEntry(args.path);
+
     return { content: [{ type: 'text' as const, text: `Deleted ${args.path}` }] };
   },
 );
