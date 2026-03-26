@@ -15598,7 +15598,7 @@ var activityPoster = null;
 var lastResumeAt = getPersistedResumeAt();
 async function processMessage(params, onEvent) {
   const { message, isScheduledTask, assistantName } = params;
-  let sessionId = params.sessionId || getPersistedSessionId();
+  let sessionId = getPersistedSessionId();
   const agentId = process.env.AGENT_ID || assistantName || "unknown";
   if (!activityPoster) {
     activityPoster = new ActivityPoster(
@@ -15651,6 +15651,10 @@ async function processMessage(params, onEvent) {
     for await (const msg of Aa({
       prompt,
       options: {
+        pathToClaudeCodeExecutable: path2.join(path2.dirname(fileURLToPath(import.meta.url)), "cli.js"),
+        stderr: (data) => {
+          console.error(`[cli-stderr] ${data}`);
+        },
         cwd: WORKSPACE_DIR,
         model: process.env.CLAW_MODEL || "claude-opus-4-6",
         // thinking + effort are Claude-only — omit for non-Claude models
@@ -15659,6 +15663,7 @@ async function processMessage(params, onEvent) {
           effort: process.env.CLAW_EFFORT || "high"
         } : {},
         maxTurns: parseInt(process.env.CLAW_MAX_TURNS || "50", 10),
+        bare: true,
         resume: sessionId,
         resumeSessionAt: lastResumeAt,
         allowedTools: [
@@ -15685,8 +15690,7 @@ async function processMessage(params, onEvent) {
           ...dynamicToolPatterns
         ],
         env: sdkEnv,
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
+        permissionMode: "acceptEdits",
         settingSources: ["project", "user"],
         mcpServers: {
           claw: {
@@ -16029,7 +16033,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-26T17:26:41.688Z" : "";
+var buildTime = true ? "2026-03-26T22:46:47.532Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;

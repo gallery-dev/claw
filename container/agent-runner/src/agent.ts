@@ -182,8 +182,10 @@ let lastResumeAt: string | undefined = getPersistedResumeAt();
 export async function processMessage(params: MessageParams, onEvent?: (event: StreamEvent) => void): Promise<MessageResult> {
   const { message, isScheduledTask, assistantName } = params;
 
-  // Use provided sessionId, or fall back to persisted one
-  let sessionId = params.sessionId || getPersistedSessionId();
+  // Use persisted SDK session ID (UUID) for resume — NOT the conversation ID from params.
+  // params.sessionId is a Convex conversation ID (e.g. "chat_xxx") which is NOT a valid
+  // SDK session ID. The SDK generates its own UUID on the first call.
+  let sessionId = getPersistedSessionId();
 
   // Initialize activity poster on first call
   const agentId = process.env.AGENT_ID || assistantName || 'unknown';
@@ -243,6 +245,8 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
     for await (const msg of query({
       prompt,
       options: {
+        pathToClaudeCodeExecutable: path.join(path.dirname(fileURLToPath(import.meta.url)), 'cli.js'),
+        stderr: (data: string) => { console.error(`[cli-stderr] ${data}`); },
         cwd: WORKSPACE_DIR,
         model: process.env.CLAW_MODEL || 'claude-opus-4-6',
         // thinking + effort are Claude-only — omit for non-Claude models
@@ -251,6 +255,7 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
           effort: (process.env.CLAW_EFFORT || 'high') as 'low' | 'medium' | 'high' | 'max',
         } : {}),
         maxTurns: parseInt(process.env.CLAW_MAX_TURNS || '50', 10),
+        bare: true,
         resume: sessionId,
         resumeSessionAt: lastResumeAt,
         allowedTools: [
@@ -266,8 +271,7 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
           ...dynamicToolPatterns,
         ],
         env: sdkEnv,
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
+        permissionMode: 'acceptEdits',
         settingSources: ['project', 'user'],
         mcpServers: {
           claw: {
