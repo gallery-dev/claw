@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+# Exception: agent-runner bundles are deployed
+!container/agent-runner/dist/
+container/agent-runner/dist/*.js
+container/agent-runner/dist/*.d.ts
+!container/agent-runner/dist/server.bundle.js
+!container/agent-runner/dist/mcp-tools.bundle.js
+!container/agent-runner/dist/cli.js
+
+# Secrets
+*.keys.json
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+.next/
