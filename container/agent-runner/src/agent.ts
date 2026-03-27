@@ -20,11 +20,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import {
-  unstable_v2_createSession,
-  unstable_v2_resumeSession,
-} from '@anthropic-ai/claude-agent-sdk';
-import type { SDKSession, SDKSessionOptions } from '@anthropic-ai/claude-agent-sdk';
+import type { SDKSessionOptions } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import {
   ToolCallTracker,
@@ -37,11 +33,12 @@ import {
 } from './shared.js';
 import { UIStreamWriter, generateMessageId, isAiSdkEnabled } from './ui-stream.js';
 import type { MessageMetadata } from './ui-stream.js';
+import { SessionManager } from './session-manager.js';
+import type { ConversationContext } from './session-manager.js';
 
 // ─── Configuration ──────────────────────────────────────
 
 const WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace';
-const SESSION_ID_FILE = path.join(WORKSPACE_DIR, '.current-session-id');
 const MCP_CONFIG_FILE = path.join(WORKSPACE_DIR, '.mcp.json');
 const MODEL = process.env.CLAW_MODEL || 'claude-opus-4-6';
 
@@ -61,23 +58,7 @@ function getDefaultContextWindow(model: string): number {
   return 128_000;
 }
 
-// ─── Session Persistence ─────────────────────────────────
-
-function getPersistedSessionId(): string | undefined {
-  try {
-    if (fs.existsSync(SESSION_ID_FILE)) {
-      return fs.readFileSync(SESSION_ID_FILE, 'utf-8').trim() || undefined;
-    }
-  } catch { /* ignore */ }
-  return undefined;
-}
-
-function persistSessionId(sessionId: string): void {
-  try {
-    fs.mkdirSync(path.dirname(SESSION_ID_FILE), { recursive: true });
-    fs.writeFileSync(SESSION_ID_FILE, sessionId);
-  } catch { /* non-fatal */ }
-}
+// Session persistence is now handled by SessionManager.
 
 /**
  * Read .mcp.json to get customer MCP server names for allowedTools patterns.
@@ -133,17 +114,45 @@ export interface StreamEvent {
 }
 
 // ─── Persistent State ────────────────────────────────────
-// These survive across HTTP requests (sprite stays alive between requests).
-// On sleep/wake the process restarts — session resumes from disk via sessionId.
+// Global state shared across all conversations.
+// Per-conversation state (session, locks, trackers) lives in SessionManager.
 
-let session: SDKSession | null = null;
 let activityPoster: ActivityPoster | null = null;
-const loopTracker = new ToolCallTracker();
-const contextTracker = new ContextWindowTracker();
-contextTracker.contextWindow = getDefaultContextWindow(MODEL);
 
-// Serialize access to the V2 session (one send/stream cycle at a time)
-let messageLock: Promise<void> = Promise.resolve();
+// Session manager — handles multiple conversations per container
+const sessionManager = new SessionManager({
+  workspaceDir: WORKSPACE_DIR,
+  maxSessions: 5,
+  defaultContextWindow: getDefaultContextWindow(MODEL),
+  buildOptions: (loopTracker, contextTracker, assistantName) => {
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    return {
+      model: MODEL,
+      pathToClaudeCodeExecutable: path.join(__dirname, 'cli.js'),
+      env: { ...process.env },
+      allowedTools: [
+        'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+        'WebSearch', 'WebFetch',
+        'Task', 'TaskOutput', 'TaskStop',
+        'NotebookEdit',
+        ...getDynamicMcpToolPatterns(),
+      ],
+      permissionMode: 'acceptEdits',
+      includePartialMessages: true,
+      hooks: {
+        PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
+          { hooks: [createLoopDetectionHook(loopTracker, log)] },
+          { hooks: [createContextSafetyHook(contextTracker, activityPoster, log)] },
+        ],
+      },
+    };
+  },
+});
+
+// Migrate legacy single-session file on startup
+sessionManager.migrateFromLegacy();
 
 // ─── Session Lifecycle ───────────────────────────────────
 
@@ -159,51 +168,6 @@ function ensureActivityPoster(agentId: string): ActivityPoster {
   return activityPoster;
 }
 
-function buildSessionOptions(assistantName?: string): SDKSessionOptions {
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  return {
-    model: MODEL,
-    pathToClaudeCodeExecutable: path.join(__dirname, 'cli.js'),
-    env: { ...process.env },
-    allowedTools: [
-      'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
-      'WebSearch', 'WebFetch',
-      'Task', 'TaskOutput', 'TaskStop',
-      'NotebookEdit',
-      ...getDynamicMcpToolPatterns(),
-    ],
-    permissionMode: 'acceptEdits',
-    includePartialMessages: true,
-    hooks: {
-      PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
-      PreToolUse: [
-        { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
-        { hooks: [createLoopDetectionHook(loopTracker, log)] },
-        { hooks: [createContextSafetyHook(contextTracker, activityPoster, log)] },
-      ],
-    },
-  };
-}
-
-function getOrCreateSession(assistantName?: string): SDKSession {
-  if (session) return session;
-
-  fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
-
-  const persistedId = getPersistedSessionId();
-  const options = buildSessionOptions(assistantName);
-
-  if (persistedId) {
-    log(`Resuming V2 session: ${persistedId}`);
-    session = unstable_v2_resumeSession(persistedId, options);
-  } else {
-    log('Creating new V2 session');
-    session = unstable_v2_createSession(options);
-  }
-
-  return session;
-}
-
 // ─── Core Message Processing ─────────────────────────────
 
 export async function processMessage(
@@ -212,14 +176,17 @@ export async function processMessage(
   writer?: UIStreamWriter,
   cancelSignal?: { cancelled: boolean },
 ): Promise<MessageResult> {
-  // Serialize access — V2 session handles one send/stream cycle at a time
-  const prevLock = messageLock;
-  let releaseLock!: () => void;
-  messageLock = new Promise(resolve => { releaseLock = resolve; });
-  await prevLock;
+  const conversationId = params.sessionId || 'default';
+
+  // Get or create conversation context (session, trackers, etc.)
+  const ctx = sessionManager.getOrCreate(conversationId, params.assistantName);
+
+  // Per-conversation lock — serialize send/stream cycles for THIS conversation
+  // Other conversations can process in parallel
+  const releaseLock = await sessionManager.acquireLock(conversationId);
 
   try {
-    return await processMessageInner(params, onEvent, writer, cancelSignal);
+    return await processMessageInner(params, onEvent, writer, cancelSignal, ctx);
   } finally {
     releaseLock();
   }
@@ -230,8 +197,10 @@ async function processMessageInner(
   onEvent?: (event: StreamEvent) => void,
   writer?: UIStreamWriter,
   cancelSignal?: { cancelled: boolean },
+  ctx?: ConversationContext,
 ): Promise<MessageResult> {
   const { message, isScheduledTask, assistantName } = params;
+  const conversationId = params.sessionId || 'default';
   const useAiSdk = !!writer;
 
   // Initialize activity poster before session creation (hooks reference it)
@@ -252,7 +221,7 @@ async function processMessageInner(
   }
   prompt += message;
 
-  let currentSessionId = getPersistedSessionId() || '';
+  let currentSessionId = ctx?.sessionId || '';
   const resultTexts: string[] = [];
   let messageCount = 0;
   let streamEventCount = 0;
@@ -268,7 +237,9 @@ async function processMessageInner(
   }
 
   try {
-    const sess = getOrCreateSession(assistantName);
+    if (!ctx) throw new Error('No conversation context');
+    const sess = ctx.session;
+    sessionManager.touchSession(conversationId);
     await sess.send(prompt);
 
     for await (const msg of sess.stream()) {
@@ -337,8 +308,8 @@ async function processMessageInner(
       // ─── Assistant messages (complete) ─────────────
       if (msg.type === 'assistant') {
         const msgUsage = (msg as any).message?.usage;
-        if (msgUsage) {
-          contextTracker.update(
+        if (msgUsage && ctx) {
+          ctx.contextTracker.update(
             msgUsage.input_tokens ?? 0,
             msgUsage.output_tokens ?? 0,
           );
@@ -401,9 +372,9 @@ async function processMessageInner(
       // ─── System messages ──────────────────────────
       if (msg.type === 'system' && msg.subtype === 'init') {
         currentSessionId = msg.session_id;
-        log(`Session initialized: ${currentSessionId}`);
+        log(`Session initialized: ${currentSessionId} (conversation: ${conversationId})`);
         activityPoster!.post('status', `Session initialized: ${currentSessionId}`);
-        persistSessionId(currentSessionId);
+        sessionManager.persistSessionId(conversationId, currentSessionId);
       }
 
       if (msg.type === 'system' && (msg as { subtype?: string }).subtype === 'task_notification') {
@@ -430,8 +401,8 @@ async function processMessageInner(
 
         if (resultMsg.usage || resultMsg.modelUsage) {
           const modelEntries = resultMsg.modelUsage ? Object.values(resultMsg.modelUsage) : [];
-          const contextWindow = modelEntries[0]?.contextWindow ?? contextTracker.contextWindow;
-          if (contextWindow > 0) contextTracker.contextWindow = contextWindow;
+          const contextWindow = modelEntries[0]?.contextWindow ?? (ctx?.contextTracker.contextWindow ?? 200_000);
+          if (contextWindow > 0 && ctx) ctx.contextTracker.contextWindow = contextWindow;
           const inputTokens = resultMsg.usage?.input_tokens ?? 0;
           const outputTokens = resultMsg.usage?.output_tokens ?? 0;
           const contextPercentage = contextWindow > 0
@@ -483,12 +454,8 @@ async function processMessageInner(
       writer.done();
     }
 
-    // Session may have crashed — close and null it for recovery on next message
-    if (session) {
-      try { session.close(); } catch { /* ignore close errors */ }
-      session = null;
-      log('Session closed due to error — will recreate on next message');
-    }
+    // Session may have crashed — close for recovery on next message
+    sessionManager.handleError(conversationId);
 
     return {
       status: 'error',
@@ -499,10 +466,10 @@ async function processMessageInner(
   }
 
   // Capture sessionId from session object if we missed system/init
-  if (!currentSessionId && session) {
+  if (!currentSessionId && ctx?.session) {
     try {
-      currentSessionId = session.sessionId;
-      persistSessionId(currentSessionId);
+      currentSessionId = ctx.session.sessionId;
+      sessionManager.persistSessionId(conversationId, currentSessionId);
     } catch { /* sessionId may not be available yet */ }
   }
 
@@ -603,10 +570,7 @@ Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothi
  * Flush pending activity events and close session. Call on SIGTERM before exit.
  */
 export async function shutdown(): Promise<void> {
-  if (session) {
-    try { session.close(); } catch { /* ignore */ }
-    session = null;
-  }
+  sessionManager.closeAll();
   if (activityPoster) {
     activityPoster.post('status', 'Sprite shutting down');
     await activityPoster.stop();
@@ -627,12 +591,12 @@ export function getActivityMetrics(): { activityQueueSize: number; activityDropp
  * Get current agent status.
  */
 export function getStatus(): {
-  sessionId: string | undefined;
   workspaceDir: string;
   memoryFiles: string[];
   uptime: number;
+  activeConversations: number;
+  conversationIds: string[];
 } {
-  const sessionId = getPersistedSessionId();
   const memoryFiles: string[] = [];
 
   const memoryDir = path.join(WORKSPACE_DIR, 'memory');
@@ -647,9 +611,10 @@ export function getStatus(): {
   }
 
   return {
-    sessionId,
     workspaceDir: WORKSPACE_DIR,
     memoryFiles,
     uptime: process.uptime(),
+    activeConversations: sessionManager.activeCount,
+    conversationIds: sessionManager.getConversationIds(),
   };
 }

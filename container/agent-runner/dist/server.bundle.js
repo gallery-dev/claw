@@ -4,6 +4,584 @@
 import http from "http";
 
 // src/agent.ts
+import fs3 from "fs";
+import path3 from "path";
+import { fileURLToPath } from "url";
+
+// src/shared.ts
+import fs from "fs";
+import path from "path";
+function parseTranscript(content) {
+  const messages = [];
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry.type === "user" && entry.message?.content) {
+        const text = typeof entry.message.content === "string" ? entry.message.content : entry.message.content.map((c) => c.text || "").join("");
+        if (text) messages.push({ role: "user", content: text });
+      } else if (entry.type === "assistant" && entry.message?.content) {
+        const textParts = entry.message.content.filter((c) => c.type === "text").map((c) => c.text);
+        const text = textParts.join("");
+        if (text) messages.push({ role: "assistant", content: text });
+      }
+    } catch {
+    }
+  }
+  return messages;
+}
+function sanitizeFilename(summary) {
+  return summary.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
+}
+function generateFallbackName() {
+  const time = /* @__PURE__ */ new Date();
+  return `conversation-${time.getHours().toString().padStart(2, "0")}${time.getMinutes().toString().padStart(2, "0")}`;
+}
+function formatTranscriptMarkdown(messages, title, assistantName) {
+  const now = /* @__PURE__ */ new Date();
+  const formatDateTime = (d) => d.toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true
+  });
+  const lines = [];
+  lines.push(`# ${title || "Conversation"}`);
+  lines.push("");
+  lines.push(`Archived: ${formatDateTime(now)}`);
+  lines.push("");
+  lines.push("---");
+  lines.push("");
+  for (const msg of messages) {
+    const sender = msg.role === "user" ? "User" : assistantName || "Assistant";
+    const content = msg.content.length > 2e3 ? msg.content.slice(0, 2e3) + "..." : msg.content;
+    lines.push(`**${sender}**: ${content}`);
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+function getSessionSummary(sessionId, transcriptPath, log4) {
+  const projectDir = path.dirname(transcriptPath);
+  const indexPath = path.join(projectDir, "sessions-index.json");
+  if (!fs.existsSync(indexPath)) {
+    log4?.(`Sessions index not found at ${indexPath}`);
+    return null;
+  }
+  try {
+    const index = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
+    const entry = index.entries.find((e3) => e3.sessionId === sessionId);
+    if (entry?.summary) return entry.summary;
+  } catch (err) {
+    log4?.(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return null;
+}
+function createPreCompactHook(workspaceDir, assistantName, log4) {
+  return async (input, _toolUseId, _context) => {
+    const preCompact = input;
+    const transcriptPath = preCompact.transcript_path;
+    const sessionId = preCompact.session_id;
+    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
+      log4?.("No transcript found for archiving");
+      return {};
+    }
+    try {
+      const content = fs.readFileSync(transcriptPath, "utf-8");
+      const messages = parseTranscript(content);
+      if (messages.length === 0) {
+        log4?.("No messages to archive");
+        return {};
+      }
+      const summary = getSessionSummary(sessionId, transcriptPath, log4);
+      const name = summary ? sanitizeFilename(summary) : generateFallbackName();
+      const conversationsDir = path.join(workspaceDir, "conversations");
+      fs.mkdirSync(conversationsDir, { recursive: true });
+      const date = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+      const filename = `${date}-${name}.md`;
+      const filePath = path.join(conversationsDir, filename);
+      const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
+      fs.writeFileSync(filePath, markdown);
+      log4?.(`Archived conversation to ${filePath}`);
+      const memoryDir = path.join(workspaceDir, "memory");
+      fs.mkdirSync(memoryDir, { recursive: true });
+      const dailyFile = path.join(memoryDir, `${date}.md`);
+      const timestamp = (/* @__PURE__ */ new Date()).toISOString().split("T")[1].replace(/\.\d+Z$/, "");
+      const marker = `
+## Context compacted at ${timestamp}
+
+Conversation archived to \`conversations/${filename}\`${summary ? `
+Summary: ${summary}` : ""}
+`;
+      fs.appendFileSync(dailyFile, marker);
+      log4?.(`Wrote compaction marker to memory/${date}.md`);
+    } catch (err) {
+      log4?.(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return {};
+  };
+}
+var SECRET_ENV_VARS = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
+function createSanitizeBashHook() {
+  return async (input, _toolUseId, _context) => {
+    const preInput = input;
+    const command = preInput.tool_input?.command;
+    if (!command) return {};
+    const unsetPrefix = `unset ${SECRET_ENV_VARS.join(" ")} 2>/dev/null; `;
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        updatedInput: {
+          ...preInput.tool_input,
+          command: unsetPrefix + command
+        }
+      }
+    };
+  };
+}
+var LOOP_SAME_CALL_THRESHOLD = parseInt(process.env.LOOP_SAME_CALL_THRESHOLD || "3", 10);
+var LOOP_FORCE_STOP_THRESHOLD = parseInt(process.env.LOOP_FORCE_STOP_THRESHOLD || "6", 10);
+var LOOP_CYCLE_THRESHOLD = parseInt(process.env.LOOP_CYCLE_THRESHOLD || "3", 10);
+var LOOP_SAME_TOOL_THRESHOLD = parseInt(process.env.LOOP_SAME_TOOL_THRESHOLD || "5", 10);
+var SAME_TOOL_EXEMPT = /* @__PURE__ */ new Set(["Read", "Grep", "Glob", "WebSearch", "WebFetch", "ToolSearch"]);
+var LOOP_HISTORY_SIZE = 20;
+var ToolCallTracker = class {
+  history = [];
+  warningIssued = false;
+  hashInput(input) {
+    const str = JSON.stringify(input);
+    let hash = 5381;
+    for (let i3 = 0; i3 < str.length; i3++) {
+      hash = (hash << 5) + hash + str.charCodeAt(i3) | 0;
+    }
+    return (hash >>> 0).toString(36);
+  }
+  track(toolName, toolInput) {
+    this.history.push({ toolName, inputHash: this.hashInput(toolInput) });
+    if (this.history.length > LOOP_HISTORY_SIZE) {
+      this.history.shift();
+    }
+    const sameCallCount = this.countConsecutiveSame();
+    if (sameCallCount >= LOOP_FORCE_STOP_THRESHOLD) {
+      return { loopDetected: true, shouldStop: true };
+    }
+    if (sameCallCount >= LOOP_SAME_CALL_THRESHOLD) {
+      return { loopDetected: true, shouldStop: false };
+    }
+    const cycles2 = this.detectCycle(2);
+    const cycles3 = this.detectCycle(3);
+    if (cycles2 >= LOOP_CYCLE_THRESHOLD || cycles3 >= LOOP_CYCLE_THRESHOLD) {
+      const totalRepeats = Math.max(cycles2, cycles3);
+      return { loopDetected: true, shouldStop: totalRepeats >= LOOP_FORCE_STOP_THRESHOLD };
+    }
+    if (!SAME_TOOL_EXEMPT.has(toolName)) {
+      const sameToolCount = this.countConsecutiveSameTool();
+      if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD * 2) {
+        return { loopDetected: true, shouldStop: true };
+      }
+      if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD) {
+        return { loopDetected: true, shouldStop: false };
+      }
+    }
+    return { loopDetected: false, shouldStop: false };
+  }
+  countConsecutiveSame() {
+    if (this.history.length === 0) return 0;
+    const last = this.history[this.history.length - 1];
+    let count = 0;
+    for (let i3 = this.history.length - 1; i3 >= 0; i3--) {
+      if (this.history[i3].toolName === last.toolName && this.history[i3].inputHash === last.inputHash) {
+        count++;
+      } else {
+        break;
+      }
+    }
+    return count;
+  }
+  countConsecutiveSameTool() {
+    if (this.history.length === 0) return 0;
+    const last = this.history[this.history.length - 1];
+    let count = 0;
+    for (let i3 = this.history.length - 1; i3 >= 0; i3--) {
+      if (this.history[i3].toolName === last.toolName) {
+        count++;
+      } else {
+        break;
+      }
+    }
+    return count;
+  }
+  detectCycle(cycleLength) {
+    if (this.history.length < cycleLength * 2) return 0;
+    const recent = this.history.slice(-cycleLength);
+    let repetitions = 1;
+    for (let offset = cycleLength; offset <= this.history.length - cycleLength; offset += cycleLength) {
+      const segment = this.history.slice(-(offset + cycleLength), -offset);
+      if (segment.length !== cycleLength) break;
+      const matches = segment.every(
+        (rec, i3) => rec.toolName === recent[i3].toolName && rec.inputHash === recent[i3].inputHash
+      );
+      if (matches) repetitions++;
+      else break;
+    }
+    return repetitions;
+  }
+  resetWarning() {
+    this.warningIssued = false;
+  }
+  hasIssuedWarning() {
+    return this.warningIssued;
+  }
+  markWarningIssued() {
+    this.warningIssued = true;
+  }
+};
+function createLoopDetectionHook(tracker, log4) {
+  return async (input, _toolUseId, _context) => {
+    const preInput = input;
+    const toolName = preInput.tool_name || "unknown";
+    const toolInput = preInput.tool_input;
+    const { loopDetected, shouldStop } = tracker.track(toolName, toolInput);
+    if (shouldStop) {
+      log4?.(`[loop-detect] FORCE STOP: Tool ${toolName} in terminal loop`);
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          decision: "block",
+          message: "LOOP DETECTED: You have been calling the same tool with the same input repeatedly. This call is blocked. Try a completely different approach."
+        }
+      };
+    }
+    if (loopDetected && !tracker.hasIssuedWarning()) {
+      log4?.(`[loop-detect] WARNING: Repetitive tool use detected for ${toolName}`);
+      tracker.markWarningIssued();
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          message: "WARNING: You appear to be repeating the same tool calls. Consider trying a different approach before this call gets blocked."
+        }
+      };
+    }
+    if (!loopDetected) {
+      tracker.resetWarning();
+    }
+    return {};
+  };
+}
+var CONTEXT_WARN_THRESHOLD = parseFloat(process.env.CLAW_CONTEXT_WARN_THRESHOLD || "0.70");
+var CONTEXT_CHECKPOINT_THRESHOLD = parseFloat(process.env.CLAW_CONTEXT_CHECKPOINT_THRESHOLD || "0.80");
+var ContextWindowTracker = class {
+  /** Last known input_tokens from the most recent assistant message (cumulative per API) */
+  lastInputTokens = 0;
+  lastOutputTokens = 0;
+  contextWindow = 0;
+  warnedAt70 = false;
+  checkpointedAt80 = false;
+  update(inputTokens, outputTokens, contextWindow) {
+    this.lastInputTokens = inputTokens;
+    this.lastOutputTokens = outputTokens;
+    if (contextWindow && contextWindow > 0) this.contextWindow = contextWindow;
+  }
+  getPercentage() {
+    if (this.contextWindow <= 0) return 0;
+    return this.lastInputTokens / this.contextWindow;
+  }
+  shouldWarn() {
+    if (this.warnedAt70) return false;
+    if (this.getPercentage() >= CONTEXT_WARN_THRESHOLD) {
+      this.warnedAt70 = true;
+      return true;
+    }
+    return false;
+  }
+  shouldCheckpoint() {
+    if (this.checkpointedAt80) return false;
+    if (this.getPercentage() >= CONTEXT_CHECKPOINT_THRESHOLD) {
+      this.checkpointedAt80 = true;
+      return true;
+    }
+    return false;
+  }
+  reset() {
+    this.warnedAt70 = false;
+    this.checkpointedAt80 = false;
+  }
+};
+function createContextSafetyHook(tracker, activityPoster2, log4) {
+  return async (_input, _toolUseId, _context) => {
+    const pct = tracker.getPercentage();
+    if (tracker.shouldCheckpoint()) {
+      const pctStr = Math.round(pct * 100);
+      log4?.(`[context-safety] CHECKPOINT: Context at ${pctStr}% \u2014 advising agent to save progress`);
+      activityPoster2?.post("status", `Context window at ${pctStr}% \u2014 checkpoint recommended`, {
+        contextPercentage: pctStr,
+        inputTokens: tracker.lastInputTokens,
+        contextWindow: tracker.contextWindow
+      });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          message: `WARNING: Your context window is ${pctStr}% full (${tracker.lastInputTokens.toLocaleString()} / ${tracker.contextWindow.toLocaleString()} tokens). Save your progress now: write important findings to MEMORY.md or files before context compaction occurs. Summarize your current state and next steps.`
+        }
+      };
+    }
+    if (tracker.shouldWarn()) {
+      const pctStr = Math.round(pct * 100);
+      log4?.(`[context-safety] WARNING: Context at ${pctStr}%`);
+      activityPoster2?.post("status", `Context window at ${pctStr}%`, {
+        contextPercentage: pctStr,
+        inputTokens: tracker.lastInputTokens,
+        contextWindow: tracker.contextWindow
+      });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          message: `Note: Your context window is ${pctStr}% full. Be concise in your remaining tool calls and consider wrapping up soon.`
+        }
+      };
+    }
+    return {};
+  };
+}
+async function postConvexActivity(convexUrl, token, agentId, type, content, metadata) {
+  try {
+    await fetch(`${convexUrl}/api/mutation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: "agentActivity:push",
+        args: { token, agentId, type, content: content.slice(0, 4e3), metadata }
+      })
+    });
+  } catch {
+  }
+}
+var ActivityPoster = class _ActivityPoster {
+  static MAX_QUEUE = 100;
+  convexUrl;
+  token;
+  agentId;
+  queue = [];
+  timer = null;
+  droppedCount = 0;
+  constructor(convexUrl, token, agentId) {
+    this.convexUrl = convexUrl;
+    this.token = token;
+    this.agentId = agentId;
+    if (this.convexUrl && this.token) {
+      this.timer = setInterval(() => this.flush(), 2e3);
+    }
+  }
+  post(type, content, metadata) {
+    if (!this.convexUrl || !this.token) return;
+    this.queue.push({ type, content: content.slice(0, 4e3), metadata });
+    while (this.queue.length > _ActivityPoster.MAX_QUEUE) {
+      this.queue.shift();
+      this.droppedCount++;
+    }
+  }
+  getQueueSize() {
+    return this.queue.length;
+  }
+  getDroppedCount() {
+    return this.droppedCount;
+  }
+  async flush() {
+    if (this.queue.length === 0 || !this.convexUrl || !this.token) return;
+    const batch = this.queue.splice(0, 10);
+    for (const event of batch) {
+      await postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata);
+    }
+  }
+  async stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    while (this.queue.length > 0) {
+      await this.flush();
+    }
+  }
+};
+
+// src/ui-stream.ts
+import crypto from "crypto";
+var UIStreamWriter = class {
+  res;
+  ended = false;
+  textIdCounter = 0;
+  reasoningIdCounter = 0;
+  _currentTextId = null;
+  _currentReasoningId = null;
+  stepOpen = false;
+  constructor(res) {
+    this.res = res;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Vercel-AI-UI-Message-Stream": "v1",
+      "X-Accel-Buffering": "no"
+    });
+  }
+  // ─── Low-level ──────────────────────────────────────
+  write(chunk) {
+    if (this.ended || this.res.destroyed) return;
+    this.res.write(`data: ${JSON.stringify(chunk)}
+
+`);
+  }
+  // ─── Message Lifecycle ──────────────────────────────
+  start(messageId) {
+    this.write({
+      type: "start",
+      ...messageId ? { messageId } : {}
+    });
+  }
+  finish(finishReason = "stop", metadata) {
+    this.closeOpenBlocks();
+    if (this.stepOpen) {
+      this.finishStep();
+    }
+    this.write({
+      type: "finish",
+      finishReason,
+      ...metadata ? { messageMetadata: metadata } : {}
+    });
+  }
+  startStep() {
+    this.write({ type: "start-step" });
+    this.stepOpen = true;
+  }
+  finishStep() {
+    this.closeOpenBlocks();
+    this.write({ type: "finish-step" });
+    this.stepOpen = false;
+  }
+  // ─── Text Content ───────────────────────────────────
+  get currentTextId() {
+    return this._currentTextId;
+  }
+  textStart(id) {
+    const blockId = id ?? `text-${++this.textIdCounter}`;
+    this._currentTextId = blockId;
+    this.write({ type: "text-start", id: blockId });
+    return blockId;
+  }
+  textDelta(delta, id) {
+    if (!this._currentTextId) {
+      this.textStart(id);
+    }
+    this.write({ type: "text-delta", id: this._currentTextId, delta });
+  }
+  textEnd(id) {
+    const blockId = id ?? this._currentTextId;
+    if (!blockId) return;
+    this.write({ type: "text-end", id: blockId });
+    this._currentTextId = null;
+  }
+  // ─── Reasoning/Thinking ─────────────────────────────
+  get currentReasoningId() {
+    return this._currentReasoningId;
+  }
+  reasoningStart(id) {
+    const blockId = id ?? `reasoning-${++this.reasoningIdCounter}`;
+    this._currentReasoningId = blockId;
+    this.write({ type: "reasoning-start", id: blockId });
+    return blockId;
+  }
+  reasoningDelta(delta, id) {
+    if (!this._currentReasoningId) {
+      this.reasoningStart(id);
+    }
+    this.write({ type: "reasoning-delta", id: this._currentReasoningId, delta });
+  }
+  reasoningEnd(id) {
+    const blockId = id ?? this._currentReasoningId;
+    if (!blockId) return;
+    this.write({ type: "reasoning-end", id: blockId });
+    this._currentReasoningId = null;
+  }
+  // ─── Tool Calls ─────────────────────────────────────
+  toolInputStart(toolCallId, toolName) {
+    this.closeOpenBlocks();
+    this.write({ type: "tool-input-start", toolCallId, toolName });
+  }
+  toolInputAvailable(toolCallId, toolName, input) {
+    this.write({ type: "tool-input-available", toolCallId, toolName, input });
+  }
+  toolOutputAvailable(toolCallId, output) {
+    this.write({ type: "tool-output-available", toolCallId, output });
+  }
+  toolOutputError(toolCallId, errorText) {
+    this.write({ type: "tool-output-error", toolCallId, errorText });
+  }
+  // ─── Custom Gallery Data ────────────────────────────
+  galleryData(name, data) {
+    this.write({ type: `data-gallery-${name}`, data });
+  }
+  galleryStreamId(streamId) {
+    this.galleryData("stream-id", { streamId });
+  }
+  galleryProgress(data) {
+    this.galleryData("progress", data);
+  }
+  galleryCompacting(status) {
+    this.galleryData("compacting", { status });
+  }
+  galleryReview(data) {
+    this.galleryData("review", data);
+  }
+  // ─── Metadata ───────────────────────────────────────
+  messageMetadata(metadata) {
+    this.write({ type: "message-metadata", messageMetadata: metadata });
+  }
+  // ─── Error / Abort ──────────────────────────────────
+  error(errorText) {
+    this.closeOpenBlocks();
+    this.write({ type: "error", errorText });
+  }
+  abort(reason) {
+    this.closeOpenBlocks();
+    this.write({ type: "abort", ...reason ? { reason } : {} });
+  }
+  // ─── Stream Termination ─────────────────────────────
+  done() {
+    if (this.ended) return;
+    this.ended = true;
+    if (!this.res.destroyed) {
+      this.res.write("data: [DONE]\n\n");
+      this.res.end();
+    }
+  }
+  get isEnded() {
+    return this.ended;
+  }
+  // ─── Helpers ────────────────────────────────────────
+  /** Close any open text or reasoning blocks. */
+  closeOpenBlocks() {
+    if (this._currentTextId) this.textEnd();
+    if (this._currentReasoningId) this.reasoningEnd();
+  }
+  /** Whether a step boundary is needed before the next content. */
+  needsStepBoundary(lastEmittedToolOutput) {
+    return lastEmittedToolOutput && this.stepOpen;
+  }
+  /** Emit step boundary (finish current step, start new one). */
+  emitStepBoundary() {
+    this.finishStep();
+    this.startStep();
+  }
+};
+function generateMessageId() {
+  return `msg_${crypto.randomBytes(8).toString("hex")}`;
+}
+function generateStreamId() {
+  return `stream_${crypto.randomBytes(8).toString("hex")}`;
+}
+function isAiSdkEnabled() {
+  return process.env.SSE_FORMAT === "aisdk";
+}
+
+// src/session-manager.ts
 import fs2 from "fs";
 import path2 from "path";
 
@@ -15149,588 +15727,230 @@ function Pa($, X) {
   return PK($, X);
 }
 
-// src/agent.ts
-import { fileURLToPath } from "url";
-
-// src/shared.ts
-import fs from "fs";
-import path from "path";
-function parseTranscript(content) {
-  const messages = [];
-  for (const line of content.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === "user" && entry.message?.content) {
-        const text = typeof entry.message.content === "string" ? entry.message.content : entry.message.content.map((c) => c.text || "").join("");
-        if (text) messages.push({ role: "user", content: text });
-      } else if (entry.type === "assistant" && entry.message?.content) {
-        const textParts = entry.message.content.filter((c) => c.type === "text").map((c) => c.text);
-        const text = textParts.join("");
-        if (text) messages.push({ role: "assistant", content: text });
+// src/session-manager.ts
+var DEFAULT_CONVERSATION = "default";
+var SessionManager = class {
+  conversations = /* @__PURE__ */ new Map();
+  workspaceDir;
+  sessionsDir;
+  maxSessions;
+  defaultContextWindow;
+  buildOptions;
+  constructor(opts) {
+    this.workspaceDir = opts.workspaceDir;
+    this.sessionsDir = path2.join(opts.workspaceDir, ".sessions");
+    this.maxSessions = opts.maxSessions ?? 5;
+    this.defaultContextWindow = opts.defaultContextWindow;
+    this.buildOptions = opts.buildOptions;
+  }
+  // ─── Get or Create ──────────────────────────────────
+  /**
+   * Get or create a conversation context for the given ID.
+   * Creates a new V2 session or resumes from disk.
+   */
+  getOrCreate(conversationId, assistantName) {
+    const id = conversationId || DEFAULT_CONVERSATION;
+    const existing = this.conversations.get(id);
+    if (existing) {
+      existing.lastUsed = Date.now();
+      return existing;
+    }
+    if (this.conversations.size >= this.maxSessions) {
+      this.evictOldest();
+    }
+    const persisted = this.readPersistedSession(id);
+    const loopTracker = new ToolCallTracker();
+    const contextTracker = new ContextWindowTracker();
+    contextTracker.contextWindow = this.defaultContextWindow;
+    const options = this.buildOptions(loopTracker, contextTracker, assistantName);
+    let session;
+    if (persisted) {
+      try {
+        log(`[session-mgr] Resuming session for ${id}: ${persisted.sessionId}`);
+        session = Pa(persisted.sessionId, options);
+      } catch (err) {
+        log(`[session-mgr] Resume failed for ${id}, creating fresh: ${err}`);
+        this.deletePersistedSession(id);
+        session = ba(options);
       }
+    } else {
+      log(`[session-mgr] Creating new session for ${id}`);
+      session = ba(options);
+    }
+    const ctx = {
+      session,
+      sessionId: session.sessionId ?? persisted?.sessionId ?? "",
+      loopTracker,
+      contextTracker,
+      lastUsed: Date.now(),
+      lockPromise: Promise.resolve(),
+      lockRelease: null
+    };
+    this.conversations.set(id, ctx);
+    return ctx;
+  }
+  // ─── Per-Conversation Lock ──────────────────────────
+  /**
+   * Acquire the message lock for a conversation.
+   * Returns a release function that MUST be called when done.
+   */
+  async acquireLock(conversationId) {
+    const id = conversationId || DEFAULT_CONVERSATION;
+    const ctx = this.conversations.get(id);
+    if (!ctx) throw new Error(`No conversation context for ${id}`);
+    await ctx.lockPromise;
+    let release;
+    ctx.lockPromise = new Promise((resolve) => {
+      release = resolve;
+    });
+    return release;
+  }
+  // ─── Session ID Persistence ─────────────────────────
+  /**
+   * Persist the session ID for a conversation after session init.
+   * Called when we get session_id from the SDK's system/init message.
+   */
+  persistSessionId(conversationId, sessionId) {
+    const id = conversationId || DEFAULT_CONVERSATION;
+    const ctx = this.conversations.get(id);
+    if (ctx) ctx.sessionId = sessionId;
+    const data = {
+      sessionId,
+      createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+      lastMessageAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    try {
+      fs2.mkdirSync(this.sessionsDir, { recursive: true });
+      fs2.writeFileSync(
+        path2.join(this.sessionsDir, `${id}.json`),
+        JSON.stringify(data, null, 2)
+      );
     } catch {
     }
   }
-  return messages;
-}
-function sanitizeFilename(summary) {
-  return summary.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50);
-}
-function generateFallbackName() {
-  const time = /* @__PURE__ */ new Date();
-  return `conversation-${time.getHours().toString().padStart(2, "0")}${time.getMinutes().toString().padStart(2, "0")}`;
-}
-function formatTranscriptMarkdown(messages, title, assistantName) {
-  const now = /* @__PURE__ */ new Date();
-  const formatDateTime = (d) => d.toLocaleString("en-US", {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true
-  });
-  const lines = [];
-  lines.push(`# ${title || "Conversation"}`);
-  lines.push("");
-  lines.push(`Archived: ${formatDateTime(now)}`);
-  lines.push("");
-  lines.push("---");
-  lines.push("");
-  for (const msg of messages) {
-    const sender = msg.role === "user" ? "User" : assistantName || "Assistant";
-    const content = msg.content.length > 2e3 ? msg.content.slice(0, 2e3) + "..." : msg.content;
-    lines.push(`**${sender}**: ${content}`);
-    lines.push("");
-  }
-  return lines.join("\n");
-}
-function getSessionSummary(sessionId, transcriptPath, log3) {
-  const projectDir = path.dirname(transcriptPath);
-  const indexPath = path.join(projectDir, "sessions-index.json");
-  if (!fs.existsSync(indexPath)) {
-    log3?.(`Sessions index not found at ${indexPath}`);
-    return null;
-  }
-  try {
-    const index = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
-    const entry = index.entries.find((e3) => e3.sessionId === sessionId);
-    if (entry?.summary) return entry.summary;
-  } catch (err) {
-    log3?.(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return null;
-}
-function createPreCompactHook(workspaceDir, assistantName, log3) {
-  return async (input, _toolUseId, _context) => {
-    const preCompact = input;
-    const transcriptPath = preCompact.transcript_path;
-    const sessionId = preCompact.session_id;
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      log3?.("No transcript found for archiving");
-      return {};
-    }
+  /**
+   * Update lastMessageAt timestamp for a conversation.
+   */
+  touchSession(conversationId) {
+    const id = conversationId || DEFAULT_CONVERSATION;
+    const filePath = path2.join(this.sessionsDir, `${id}.json`);
     try {
-      const content = fs.readFileSync(transcriptPath, "utf-8");
-      const messages = parseTranscript(content);
-      if (messages.length === 0) {
-        log3?.("No messages to archive");
-        return {};
-      }
-      const summary = getSessionSummary(sessionId, transcriptPath, log3);
-      const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-      const conversationsDir = path.join(workspaceDir, "conversations");
-      fs.mkdirSync(conversationsDir, { recursive: true });
-      const date = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
-      const filename = `${date}-${name}.md`;
-      const filePath = path.join(conversationsDir, filename);
-      const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
-      fs.writeFileSync(filePath, markdown);
-      log3?.(`Archived conversation to ${filePath}`);
-      const memoryDir = path.join(workspaceDir, "memory");
-      fs.mkdirSync(memoryDir, { recursive: true });
-      const dailyFile = path.join(memoryDir, `${date}.md`);
-      const timestamp = (/* @__PURE__ */ new Date()).toISOString().split("T")[1].replace(/\.\d+Z$/, "");
-      const marker = `
-## Context compacted at ${timestamp}
-
-Conversation archived to \`conversations/${filename}\`${summary ? `
-Summary: ${summary}` : ""}
-`;
-      fs.appendFileSync(dailyFile, marker);
-      log3?.(`Wrote compaction marker to memory/${date}.md`);
-    } catch (err) {
-      log3?.(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
+      if (!fs2.existsSync(filePath)) return;
+      const data = JSON.parse(fs2.readFileSync(filePath, "utf-8"));
+      data.lastMessageAt = (/* @__PURE__ */ new Date()).toISOString();
+      fs2.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    } catch {
     }
-    return {};
-  };
-}
-var SECRET_ENV_VARS = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
-function createSanitizeBashHook() {
-  return async (input, _toolUseId, _context) => {
-    const preInput = input;
-    const command = preInput.tool_input?.command;
-    if (!command) return {};
-    const unsetPrefix = `unset ${SECRET_ENV_VARS.join(" ")} 2>/dev/null; `;
-    return {
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        updatedInput: {
-          ...preInput.tool_input,
-          command: unsetPrefix + command
-        }
-      }
-    };
-  };
-}
-var LOOP_SAME_CALL_THRESHOLD = parseInt(process.env.LOOP_SAME_CALL_THRESHOLD || "3", 10);
-var LOOP_FORCE_STOP_THRESHOLD = parseInt(process.env.LOOP_FORCE_STOP_THRESHOLD || "6", 10);
-var LOOP_CYCLE_THRESHOLD = parseInt(process.env.LOOP_CYCLE_THRESHOLD || "3", 10);
-var LOOP_SAME_TOOL_THRESHOLD = parseInt(process.env.LOOP_SAME_TOOL_THRESHOLD || "5", 10);
-var SAME_TOOL_EXEMPT = /* @__PURE__ */ new Set(["Read", "Grep", "Glob", "WebSearch", "WebFetch", "ToolSearch"]);
-var LOOP_HISTORY_SIZE = 20;
-var ToolCallTracker = class {
-  history = [];
-  warningIssued = false;
-  hashInput(input) {
-    const str = JSON.stringify(input);
-    let hash = 5381;
-    for (let i3 = 0; i3 < str.length; i3++) {
-      hash = (hash << 5) + hash + str.charCodeAt(i3) | 0;
-    }
-    return (hash >>> 0).toString(36);
   }
-  track(toolName, toolInput) {
-    this.history.push({ toolName, inputHash: this.hashInput(toolInput) });
-    if (this.history.length > LOOP_HISTORY_SIZE) {
-      this.history.shift();
-    }
-    const sameCallCount = this.countConsecutiveSame();
-    if (sameCallCount >= LOOP_FORCE_STOP_THRESHOLD) {
-      return { loopDetected: true, shouldStop: true };
-    }
-    if (sameCallCount >= LOOP_SAME_CALL_THRESHOLD) {
-      return { loopDetected: true, shouldStop: false };
-    }
-    const cycles2 = this.detectCycle(2);
-    const cycles3 = this.detectCycle(3);
-    if (cycles2 >= LOOP_CYCLE_THRESHOLD || cycles3 >= LOOP_CYCLE_THRESHOLD) {
-      const totalRepeats = Math.max(cycles2, cycles3);
-      return { loopDetected: true, shouldStop: totalRepeats >= LOOP_FORCE_STOP_THRESHOLD };
-    }
-    if (!SAME_TOOL_EXEMPT.has(toolName)) {
-      const sameToolCount = this.countConsecutiveSameTool();
-      if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD * 2) {
-        return { loopDetected: true, shouldStop: true };
-      }
-      if (sameToolCount >= LOOP_SAME_TOOL_THRESHOLD) {
-        return { loopDetected: true, shouldStop: false };
+  // ─── LRU Eviction ──────────────────────────────────
+  evictOldest() {
+    let oldestId = null;
+    let oldestTime = Infinity;
+    for (const [id, ctx] of this.conversations) {
+      if (ctx.lastUsed < oldestTime) {
+        oldestTime = ctx.lastUsed;
+        oldestId = id;
       }
     }
-    return { loopDetected: false, shouldStop: false };
+    if (oldestId) {
+      this.closeConversation(oldestId);
+      log(`[session-mgr] Evicted conversation ${oldestId} (LRU)`);
+    }
   }
-  countConsecutiveSame() {
-    if (this.history.length === 0) return 0;
-    const last = this.history[this.history.length - 1];
-    let count = 0;
-    for (let i3 = this.history.length - 1; i3 >= 0; i3--) {
-      if (this.history[i3].toolName === last.toolName && this.history[i3].inputHash === last.inputHash) {
-        count++;
-      } else {
-        break;
+  // ─── Cleanup ────────────────────────────────────────
+  /**
+   * Close a specific conversation's session (frees subprocess memory).
+   * The session can be resumed later from disk.
+   */
+  closeConversation(conversationId) {
+    const ctx = this.conversations.get(conversationId);
+    if (!ctx) return;
+    try {
+      ctx.session.close();
+    } catch {
+    }
+    this.conversations.delete(conversationId);
+  }
+  /**
+   * Close all sessions. Called on SIGTERM before exit.
+   */
+  closeAll() {
+    for (const [id, ctx] of this.conversations) {
+      try {
+        ctx.session.close();
+      } catch {
       }
+      log(`[session-mgr] Closed session for ${id}`);
     }
-    return count;
+    this.conversations.clear();
   }
-  countConsecutiveSameTool() {
-    if (this.history.length === 0) return 0;
-    const last = this.history[this.history.length - 1];
-    let count = 0;
-    for (let i3 = this.history.length - 1; i3 >= 0; i3--) {
-      if (this.history[i3].toolName === last.toolName) {
-        count++;
-      } else {
-        break;
-      }
+  /**
+   * Handle session error — close and remove so next message creates fresh.
+   */
+  handleError(conversationId) {
+    const id = conversationId || DEFAULT_CONVERSATION;
+    const ctx = this.conversations.get(id);
+    if (!ctx) return;
+    try {
+      ctx.session.close();
+    } catch {
     }
-    return count;
+    this.conversations.delete(id);
+    log(`[session-mgr] Session closed due to error for ${id}`);
   }
-  detectCycle(cycleLength) {
-    if (this.history.length < cycleLength * 2) return 0;
-    const recent = this.history.slice(-cycleLength);
-    let repetitions = 1;
-    for (let offset = cycleLength; offset <= this.history.length - cycleLength; offset += cycleLength) {
-      const segment = this.history.slice(-(offset + cycleLength), -offset);
-      if (segment.length !== cycleLength) break;
-      const matches = segment.every(
-        (rec, i3) => rec.toolName === recent[i3].toolName && rec.inputHash === recent[i3].inputHash
-      );
-      if (matches) repetitions++;
-      else break;
+  // ─── Migration ──────────────────────────────────────
+  /**
+   * Migrate old single-session file to multi-session format.
+   * Called once on first use.
+   */
+  migrateFromLegacy() {
+    const legacyFile = path2.join(this.workspaceDir, ".current-session-id");
+    try {
+      if (!fs2.existsSync(legacyFile)) return;
+      if (fs2.existsSync(this.sessionsDir)) return;
+      const sessionId = fs2.readFileSync(legacyFile, "utf-8").trim();
+      if (!sessionId) return;
+      log(`[session-mgr] Migrating legacy session ${sessionId} \u2192 .sessions/default.json`);
+      this.persistSessionId(DEFAULT_CONVERSATION, sessionId);
+      fs2.unlinkSync(legacyFile);
+    } catch {
+      log(`[session-mgr] Legacy migration failed (non-fatal)`);
     }
-    return repetitions;
   }
-  resetWarning() {
-    this.warningIssued = false;
+  // ─── Internal ───────────────────────────────────────
+  readPersistedSession(conversationId) {
+    try {
+      const filePath = path2.join(this.sessionsDir, `${conversationId}.json`);
+      if (!fs2.existsSync(filePath)) return null;
+      return JSON.parse(fs2.readFileSync(filePath, "utf-8"));
+    } catch {
+      return null;
+    }
   }
-  hasIssuedWarning() {
-    return this.warningIssued;
+  deletePersistedSession(conversationId) {
+    try {
+      const filePath = path2.join(this.sessionsDir, `${conversationId}.json`);
+      if (fs2.existsSync(filePath)) fs2.unlinkSync(filePath);
+    } catch {
+    }
   }
-  markWarningIssued() {
-    this.warningIssued = true;
+  // ─── Stats ──────────────────────────────────────────
+  get activeCount() {
+    return this.conversations.size;
+  }
+  getConversationIds() {
+    return Array.from(this.conversations.keys());
   }
 };
-function createLoopDetectionHook(tracker, log3) {
-  return async (input, _toolUseId, _context) => {
-    const preInput = input;
-    const toolName = preInput.tool_name || "unknown";
-    const toolInput = preInput.tool_input;
-    const { loopDetected, shouldStop } = tracker.track(toolName, toolInput);
-    if (shouldStop) {
-      log3?.(`[loop-detect] FORCE STOP: Tool ${toolName} in terminal loop`);
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          decision: "block",
-          message: "LOOP DETECTED: You have been calling the same tool with the same input repeatedly. This call is blocked. Try a completely different approach."
-        }
-      };
-    }
-    if (loopDetected && !tracker.hasIssuedWarning()) {
-      log3?.(`[loop-detect] WARNING: Repetitive tool use detected for ${toolName}`);
-      tracker.markWarningIssued();
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          message: "WARNING: You appear to be repeating the same tool calls. Consider trying a different approach before this call gets blocked."
-        }
-      };
-    }
-    if (!loopDetected) {
-      tracker.resetWarning();
-    }
-    return {};
-  };
-}
-var CONTEXT_WARN_THRESHOLD = parseFloat(process.env.CLAW_CONTEXT_WARN_THRESHOLD || "0.70");
-var CONTEXT_CHECKPOINT_THRESHOLD = parseFloat(process.env.CLAW_CONTEXT_CHECKPOINT_THRESHOLD || "0.80");
-var ContextWindowTracker = class {
-  /** Last known input_tokens from the most recent assistant message (cumulative per API) */
-  lastInputTokens = 0;
-  lastOutputTokens = 0;
-  contextWindow = 0;
-  warnedAt70 = false;
-  checkpointedAt80 = false;
-  update(inputTokens, outputTokens, contextWindow) {
-    this.lastInputTokens = inputTokens;
-    this.lastOutputTokens = outputTokens;
-    if (contextWindow && contextWindow > 0) this.contextWindow = contextWindow;
-  }
-  getPercentage() {
-    if (this.contextWindow <= 0) return 0;
-    return this.lastInputTokens / this.contextWindow;
-  }
-  shouldWarn() {
-    if (this.warnedAt70) return false;
-    if (this.getPercentage() >= CONTEXT_WARN_THRESHOLD) {
-      this.warnedAt70 = true;
-      return true;
-    }
-    return false;
-  }
-  shouldCheckpoint() {
-    if (this.checkpointedAt80) return false;
-    if (this.getPercentage() >= CONTEXT_CHECKPOINT_THRESHOLD) {
-      this.checkpointedAt80 = true;
-      return true;
-    }
-    return false;
-  }
-  reset() {
-    this.warnedAt70 = false;
-    this.checkpointedAt80 = false;
-  }
-};
-function createContextSafetyHook(tracker, activityPoster2, log3) {
-  return async (_input, _toolUseId, _context) => {
-    const pct = tracker.getPercentage();
-    if (tracker.shouldCheckpoint()) {
-      const pctStr = Math.round(pct * 100);
-      log3?.(`[context-safety] CHECKPOINT: Context at ${pctStr}% \u2014 advising agent to save progress`);
-      activityPoster2?.post("status", `Context window at ${pctStr}% \u2014 checkpoint recommended`, {
-        contextPercentage: pctStr,
-        inputTokens: tracker.lastInputTokens,
-        contextWindow: tracker.contextWindow
-      });
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          message: `WARNING: Your context window is ${pctStr}% full (${tracker.lastInputTokens.toLocaleString()} / ${tracker.contextWindow.toLocaleString()} tokens). Save your progress now: write important findings to MEMORY.md or files before context compaction occurs. Summarize your current state and next steps.`
-        }
-      };
-    }
-    if (tracker.shouldWarn()) {
-      const pctStr = Math.round(pct * 100);
-      log3?.(`[context-safety] WARNING: Context at ${pctStr}%`);
-      activityPoster2?.post("status", `Context window at ${pctStr}%`, {
-        contextPercentage: pctStr,
-        inputTokens: tracker.lastInputTokens,
-        contextWindow: tracker.contextWindow
-      });
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          message: `Note: Your context window is ${pctStr}% full. Be concise in your remaining tool calls and consider wrapping up soon.`
-        }
-      };
-    }
-    return {};
-  };
-}
-async function postConvexActivity(convexUrl, token, agentId, type, content, metadata) {
-  try {
-    await fetch(`${convexUrl}/api/mutation`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        path: "agentActivity:push",
-        args: { token, agentId, type, content: content.slice(0, 4e3), metadata }
-      })
-    });
-  } catch {
-  }
-}
-var ActivityPoster = class _ActivityPoster {
-  static MAX_QUEUE = 100;
-  convexUrl;
-  token;
-  agentId;
-  queue = [];
-  timer = null;
-  droppedCount = 0;
-  constructor(convexUrl, token, agentId) {
-    this.convexUrl = convexUrl;
-    this.token = token;
-    this.agentId = agentId;
-    if (this.convexUrl && this.token) {
-      this.timer = setInterval(() => this.flush(), 2e3);
-    }
-  }
-  post(type, content, metadata) {
-    if (!this.convexUrl || !this.token) return;
-    this.queue.push({ type, content: content.slice(0, 4e3), metadata });
-    while (this.queue.length > _ActivityPoster.MAX_QUEUE) {
-      this.queue.shift();
-      this.droppedCount++;
-    }
-  }
-  getQueueSize() {
-    return this.queue.length;
-  }
-  getDroppedCount() {
-    return this.droppedCount;
-  }
-  async flush() {
-    if (this.queue.length === 0 || !this.convexUrl || !this.token) return;
-    const batch = this.queue.splice(0, 10);
-    for (const event of batch) {
-      await postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata);
-    }
-  }
-  async stop() {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-    while (this.queue.length > 0) {
-      await this.flush();
-    }
-  }
-};
-
-// src/ui-stream.ts
-import crypto from "crypto";
-var UIStreamWriter = class {
-  res;
-  ended = false;
-  textIdCounter = 0;
-  reasoningIdCounter = 0;
-  _currentTextId = null;
-  _currentReasoningId = null;
-  stepOpen = false;
-  constructor(res) {
-    this.res = res;
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      "X-Vercel-AI-UI-Message-Stream": "v1",
-      "X-Accel-Buffering": "no"
-    });
-  }
-  // ─── Low-level ──────────────────────────────────────
-  write(chunk) {
-    if (this.ended || this.res.destroyed) return;
-    this.res.write(`data: ${JSON.stringify(chunk)}
-
-`);
-  }
-  // ─── Message Lifecycle ──────────────────────────────
-  start(messageId) {
-    this.write({
-      type: "start",
-      ...messageId ? { messageId } : {}
-    });
-  }
-  finish(finishReason = "stop", metadata) {
-    this.closeOpenBlocks();
-    if (this.stepOpen) {
-      this.finishStep();
-    }
-    this.write({
-      type: "finish",
-      finishReason,
-      ...metadata ? { messageMetadata: metadata } : {}
-    });
-  }
-  startStep() {
-    this.write({ type: "start-step" });
-    this.stepOpen = true;
-  }
-  finishStep() {
-    this.closeOpenBlocks();
-    this.write({ type: "finish-step" });
-    this.stepOpen = false;
-  }
-  // ─── Text Content ───────────────────────────────────
-  get currentTextId() {
-    return this._currentTextId;
-  }
-  textStart(id) {
-    const blockId = id ?? `text-${++this.textIdCounter}`;
-    this._currentTextId = blockId;
-    this.write({ type: "text-start", id: blockId });
-    return blockId;
-  }
-  textDelta(delta, id) {
-    if (!this._currentTextId) {
-      this.textStart(id);
-    }
-    this.write({ type: "text-delta", id: this._currentTextId, delta });
-  }
-  textEnd(id) {
-    const blockId = id ?? this._currentTextId;
-    if (!blockId) return;
-    this.write({ type: "text-end", id: blockId });
-    this._currentTextId = null;
-  }
-  // ─── Reasoning/Thinking ─────────────────────────────
-  get currentReasoningId() {
-    return this._currentReasoningId;
-  }
-  reasoningStart(id) {
-    const blockId = id ?? `reasoning-${++this.reasoningIdCounter}`;
-    this._currentReasoningId = blockId;
-    this.write({ type: "reasoning-start", id: blockId });
-    return blockId;
-  }
-  reasoningDelta(delta, id) {
-    if (!this._currentReasoningId) {
-      this.reasoningStart(id);
-    }
-    this.write({ type: "reasoning-delta", id: this._currentReasoningId, delta });
-  }
-  reasoningEnd(id) {
-    const blockId = id ?? this._currentReasoningId;
-    if (!blockId) return;
-    this.write({ type: "reasoning-end", id: blockId });
-    this._currentReasoningId = null;
-  }
-  // ─── Tool Calls ─────────────────────────────────────
-  toolInputStart(toolCallId, toolName) {
-    this.closeOpenBlocks();
-    this.write({ type: "tool-input-start", toolCallId, toolName });
-  }
-  toolInputAvailable(toolCallId, toolName, input) {
-    this.write({ type: "tool-input-available", toolCallId, toolName, input });
-  }
-  toolOutputAvailable(toolCallId, output) {
-    this.write({ type: "tool-output-available", toolCallId, output });
-  }
-  toolOutputError(toolCallId, errorText) {
-    this.write({ type: "tool-output-error", toolCallId, errorText });
-  }
-  // ─── Custom Gallery Data ────────────────────────────
-  galleryData(name, data) {
-    this.write({ type: `data-gallery-${name}`, data });
-  }
-  galleryStreamId(streamId) {
-    this.galleryData("stream-id", { streamId });
-  }
-  galleryProgress(data) {
-    this.galleryData("progress", data);
-  }
-  galleryCompacting(status) {
-    this.galleryData("compacting", { status });
-  }
-  galleryReview(data) {
-    this.galleryData("review", data);
-  }
-  // ─── Metadata ───────────────────────────────────────
-  messageMetadata(metadata) {
-    this.write({ type: "message-metadata", messageMetadata: metadata });
-  }
-  // ─── Error / Abort ──────────────────────────────────
-  error(errorText) {
-    this.closeOpenBlocks();
-    this.write({ type: "error", errorText });
-  }
-  abort(reason) {
-    this.closeOpenBlocks();
-    this.write({ type: "abort", ...reason ? { reason } : {} });
-  }
-  // ─── Stream Termination ─────────────────────────────
-  done() {
-    if (this.ended) return;
-    this.ended = true;
-    if (!this.res.destroyed) {
-      this.res.write("data: [DONE]\n\n");
-      this.res.end();
-    }
-  }
-  get isEnded() {
-    return this.ended;
-  }
-  // ─── Helpers ────────────────────────────────────────
-  /** Close any open text or reasoning blocks. */
-  closeOpenBlocks() {
-    if (this._currentTextId) this.textEnd();
-    if (this._currentReasoningId) this.reasoningEnd();
-  }
-  /** Whether a step boundary is needed before the next content. */
-  needsStepBoundary(lastEmittedToolOutput) {
-    return lastEmittedToolOutput && this.stepOpen;
-  }
-  /** Emit step boundary (finish current step, start new one). */
-  emitStepBoundary() {
-    this.finishStep();
-    this.startStep();
-  }
-};
-function generateMessageId() {
-  return `msg_${crypto.randomBytes(8).toString("hex")}`;
-}
-function generateStreamId() {
-  return `stream_${crypto.randomBytes(8).toString("hex")}`;
-}
-function isAiSdkEnabled() {
-  return process.env.SSE_FORMAT === "aisdk";
+function log(message) {
+  console.error(message);
 }
 
 // src/agent.ts
 var WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || "/home/sprite/workspace";
-var SESSION_ID_FILE = path2.join(WORKSPACE_DIR, ".current-session-id");
-var MCP_CONFIG_FILE = path2.join(WORKSPACE_DIR, ".mcp.json");
+var MCP_CONFIG_FILE = path3.join(WORKSPACE_DIR, ".mcp.json");
 var MODEL = process.env.CLAW_MODEL || "claude-opus-4-6";
-function log(message) {
+function log2(message) {
   console.error(`[claw] ${message}`);
 }
 function getDefaultContextWindow(model) {
@@ -15743,42 +15963,60 @@ function getDefaultContextWindow(model) {
   if (m3.includes("deepseek")) return 128e3;
   return 128e3;
 }
-function getPersistedSessionId() {
-  try {
-    if (fs2.existsSync(SESSION_ID_FILE)) {
-      return fs2.readFileSync(SESSION_ID_FILE, "utf-8").trim() || void 0;
-    }
-  } catch {
-  }
-  return void 0;
-}
-function persistSessionId(sessionId) {
-  try {
-    fs2.mkdirSync(path2.dirname(SESSION_ID_FILE), { recursive: true });
-    fs2.writeFileSync(SESSION_ID_FILE, sessionId);
-  } catch {
-  }
-}
 function getDynamicMcpToolPatterns() {
   try {
-    if (!fs2.existsSync(MCP_CONFIG_FILE)) return [];
-    const config = JSON.parse(fs2.readFileSync(MCP_CONFIG_FILE, "utf-8"));
+    if (!fs3.existsSync(MCP_CONFIG_FILE)) return [];
+    const config = JSON.parse(fs3.readFileSync(MCP_CONFIG_FILE, "utf-8"));
     const servers = config.mcpServers || {};
     const names = Object.keys(servers);
     if (names.length > 0) {
-      log(`[mcp] Found ${names.length} customer MCP servers: ${names.join(", ")}`);
+      log2(`[mcp] Found ${names.length} customer MCP servers: ${names.join(", ")}`);
     }
     return names.map((name) => `mcp__${name}__*`);
   } catch {
     return [];
   }
 }
-var session = null;
 var activityPoster = null;
-var loopTracker = new ToolCallTracker();
-var contextTracker = new ContextWindowTracker();
-contextTracker.contextWindow = getDefaultContextWindow(MODEL);
-var messageLock = Promise.resolve();
+var sessionManager = new SessionManager({
+  workspaceDir: WORKSPACE_DIR,
+  maxSessions: 5,
+  defaultContextWindow: getDefaultContextWindow(MODEL),
+  buildOptions: (loopTracker, contextTracker, assistantName) => {
+    const __dirname = path3.dirname(fileURLToPath(import.meta.url));
+    return {
+      model: MODEL,
+      pathToClaudeCodeExecutable: path3.join(__dirname, "cli.js"),
+      env: { ...process.env },
+      allowedTools: [
+        "Bash",
+        "Read",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "WebSearch",
+        "WebFetch",
+        "Task",
+        "TaskOutput",
+        "TaskStop",
+        "NotebookEdit",
+        ...getDynamicMcpToolPatterns()
+      ],
+      permissionMode: "acceptEdits",
+      includePartialMessages: true,
+      hooks: {
+        PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log2)] }],
+        PreToolUse: [
+          { matcher: "Bash", hooks: [createSanitizeBashHook()] },
+          { hooks: [createLoopDetectionHook(loopTracker, log2)] },
+          { hooks: [createContextSafetyHook(contextTracker, activityPoster, log2)] }
+        ]
+      }
+    };
+  }
+});
+sessionManager.migrateFromLegacy();
 function ensureActivityPoster(agentId) {
   if (!activityPoster) {
     activityPoster = new ActivityPoster(
@@ -15786,72 +16024,23 @@ function ensureActivityPoster(agentId) {
       process.env.GALLERY_GATEWAY_TOKEN || process.env.GALLERY_TOKEN || null,
       agentId
     );
-    log("[activity] Gallery activity posting enabled");
+    log2("[activity] Gallery activity posting enabled");
   }
   return activityPoster;
 }
-function buildSessionOptions(assistantName) {
-  const __dirname = path2.dirname(fileURLToPath(import.meta.url));
-  return {
-    model: MODEL,
-    pathToClaudeCodeExecutable: path2.join(__dirname, "cli.js"),
-    env: { ...process.env },
-    allowedTools: [
-      "Bash",
-      "Read",
-      "Write",
-      "Edit",
-      "Glob",
-      "Grep",
-      "WebSearch",
-      "WebFetch",
-      "Task",
-      "TaskOutput",
-      "TaskStop",
-      "NotebookEdit",
-      ...getDynamicMcpToolPatterns()
-    ],
-    permissionMode: "acceptEdits",
-    includePartialMessages: true,
-    hooks: {
-      PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
-      PreToolUse: [
-        { matcher: "Bash", hooks: [createSanitizeBashHook()] },
-        { hooks: [createLoopDetectionHook(loopTracker, log)] },
-        { hooks: [createContextSafetyHook(contextTracker, activityPoster, log)] }
-      ]
-    }
-  };
-}
-function getOrCreateSession(assistantName) {
-  if (session) return session;
-  fs2.mkdirSync(WORKSPACE_DIR, { recursive: true });
-  const persistedId = getPersistedSessionId();
-  const options = buildSessionOptions(assistantName);
-  if (persistedId) {
-    log(`Resuming V2 session: ${persistedId}`);
-    session = Pa(persistedId, options);
-  } else {
-    log("Creating new V2 session");
-    session = ba(options);
-  }
-  return session;
-}
 async function processMessage(params, onEvent, writer, cancelSignal) {
-  const prevLock = messageLock;
-  let releaseLock;
-  messageLock = new Promise((resolve) => {
-    releaseLock = resolve;
-  });
-  await prevLock;
+  const conversationId = params.sessionId || "default";
+  const ctx = sessionManager.getOrCreate(conversationId, params.assistantName);
+  const releaseLock = await sessionManager.acquireLock(conversationId);
   try {
-    return await processMessageInner(params, onEvent, writer, cancelSignal);
+    return await processMessageInner(params, onEvent, writer, cancelSignal, ctx);
   } finally {
     releaseLock();
   }
 }
-async function processMessageInner(params, onEvent, writer, cancelSignal) {
+async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
   const { message, isScheduledTask, assistantName } = params;
+  const conversationId = params.sessionId || "default";
   const useAiSdk = !!writer;
   const agentId = process.env.AGENT_ID || assistantName || "unknown";
   ensureActivityPoster(agentId);
@@ -15876,7 +16065,7 @@ async function processMessageInner(params, onEvent, writer, cancelSignal) {
 `;
   }
   prompt += message;
-  let currentSessionId = getPersistedSessionId() || "";
+  let currentSessionId = ctx?.sessionId || "";
   const resultTexts = [];
   let messageCount = 0;
   let streamEventCount = 0;
@@ -15887,11 +16076,13 @@ async function processMessageInner(params, onEvent, writer, cancelSignal) {
     writer.startStep();
   }
   try {
-    const sess = getOrCreateSession(assistantName);
+    if (!ctx) throw new Error("No conversation context");
+    const sess = ctx.session;
+    sessionManager.touchSession(conversationId);
     await sess.send(prompt);
     for await (const msg of sess.stream()) {
       if (cancelSignal?.cancelled) {
-        log("[cancel] Stream cancelled by user");
+        log2("[cancel] Stream cancelled by user");
         if (useAiSdk) {
           writer.abort("User cancelled");
           writer.done();
@@ -15900,7 +16091,7 @@ async function processMessageInner(params, onEvent, writer, cancelSignal) {
       }
       messageCount++;
       const msgType = msg.type === "system" ? `system/${msg.subtype}` : msg.type;
-      if (msgType !== "stream_event") log(`[msg #${messageCount}] type=${msgType}`);
+      if (msgType !== "stream_event") log2(`[msg #${messageCount}] type=${msgType}`);
       if (msg.type === "stream_event") {
         streamEventCount++;
         const event = msg.event;
@@ -15947,8 +16138,8 @@ async function processMessageInner(params, onEvent, writer, cancelSignal) {
       }
       if (msg.type === "assistant") {
         const msgUsage = msg.message?.usage;
-        if (msgUsage) {
-          contextTracker.update(
+        if (msgUsage && ctx) {
+          ctx.contextTracker.update(
             msgUsage.input_tokens ?? 0,
             msgUsage.output_tokens ?? 0
           );
@@ -16004,25 +16195,25 @@ async function processMessageInner(params, onEvent, writer, cancelSignal) {
       }
       if (msg.type === "system" && msg.subtype === "init") {
         currentSessionId = msg.session_id;
-        log(`Session initialized: ${currentSessionId}`);
+        log2(`Session initialized: ${currentSessionId} (conversation: ${conversationId})`);
         activityPoster.post("status", `Session initialized: ${currentSessionId}`);
-        persistSessionId(currentSessionId);
+        sessionManager.persistSessionId(conversationId, currentSessionId);
       }
       if (msg.type === "system" && msg.subtype === "task_notification") {
         const tn = msg;
-        log(`Task notification: task=${tn.task_id} status=${tn.status}`);
+        log2(`Task notification: task=${tn.task_id} status=${tn.status}`);
         activityPoster.post("status", `Task ${tn.status}: ${tn.summary}`);
       }
       if (msg.type === "result") {
         const textResult = "result" in msg ? msg.result : null;
-        log(`Result #${resultTexts.length + 1}: ${textResult ? textResult.slice(0, 200) : "(no text)"}`);
+        log2(`Result #${resultTexts.length + 1}: ${textResult ? textResult.slice(0, 200) : "(no text)"}`);
         activityPoster.post("output", textResult ? textResult.slice(0, 500) : "Query completed");
         if (textResult) resultTexts.push(textResult);
         const resultMsg = msg;
         if (resultMsg.usage || resultMsg.modelUsage) {
           const modelEntries = resultMsg.modelUsage ? Object.values(resultMsg.modelUsage) : [];
-          const contextWindow = modelEntries[0]?.contextWindow ?? contextTracker.contextWindow;
-          if (contextWindow > 0) contextTracker.contextWindow = contextWindow;
+          const contextWindow = modelEntries[0]?.contextWindow ?? (ctx?.contextTracker.contextWindow ?? 2e5);
+          if (contextWindow > 0 && ctx) ctx.contextTracker.contextWindow = contextWindow;
           const inputTokens = resultMsg.usage?.input_tokens ?? 0;
           const outputTokens = resultMsg.usage?.output_tokens ?? 0;
           const contextPercentage = contextWindow > 0 ? Math.round((inputTokens + outputTokens) / contextWindow * 100) : 0;
@@ -16037,7 +16228,7 @@ async function processMessageInner(params, onEvent, writer, cancelSignal) {
             contextWindow,
             contextPercentage
           };
-          log(`[usage] ${inputTokens} in / ${outputTokens} out | context: ${contextPercentage}% of ${contextWindow}`);
+          log2(`[usage] ${inputTokens} in / ${outputTokens} out | context: ${contextPercentage}% of ${contextWindow}`);
           activityPoster.post("status", `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, { usage: usageInfo });
           if (useAiSdk) {
             writer.messageMetadata({
@@ -16060,20 +16251,13 @@ async function processMessageInner(params, onEvent, writer, cancelSignal) {
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
-    log(`Agent error: ${errorMessage}`);
+    log2(`Agent error: ${errorMessage}`);
     activityPoster.post("error", errorMessage);
     if (useAiSdk) {
       writer.error(errorMessage);
       writer.done();
     }
-    if (session) {
-      try {
-        session.close();
-      } catch {
-      }
-      session = null;
-      log("Session closed due to error \u2014 will recreate on next message");
-    }
+    sessionManager.handleError(conversationId);
     return {
       status: "error",
       result: null,
@@ -16081,15 +16265,15 @@ async function processMessageInner(params, onEvent, writer, cancelSignal) {
       error: errorMessage
     };
   }
-  if (!currentSessionId && session) {
+  if (!currentSessionId && ctx?.session) {
     try {
-      currentSessionId = session.sessionId;
-      persistSessionId(currentSessionId);
+      currentSessionId = ctx.session.sessionId;
+      sessionManager.persistSessionId(conversationId, currentSessionId);
     } catch {
     }
   }
   const resultText = resultTexts.length > 0 ? resultTexts.join("\n\n") : null;
-  log(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${currentSessionId}`);
+  log2(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${currentSessionId}`);
   activityPoster.post("status", "Message processed");
   if (resultText && process.env.CLAW_AUTO_MEMORY !== "false") {
     extractMemory(message, resultText).catch(() => {
@@ -16103,8 +16287,8 @@ async function processMessageInner(params, onEvent, writer, cancelSignal) {
   };
 }
 async function extractMemory(userMessage, assistantResult) {
-  const memoryFile = path2.join(WORKSPACE_DIR, "MEMORY.md");
-  const existing = fs2.existsSync(memoryFile) ? fs2.readFileSync(memoryFile, "utf-8") : "";
+  const memoryFile = path3.join(WORKSPACE_DIR, "MEMORY.md");
+  const existing = fs3.existsSync(memoryFile) ? fs3.readFileSync(memoryFile, "utf-8") : "";
   if (userMessage.length < 20 && assistantResult.length < 100) return;
   const baseUrl = process.env.ANTHROPIC_BASE_URL;
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -16139,7 +16323,7 @@ Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothi
       })
     });
     if (!response.ok) {
-      log(`[memory] API returned ${response.status}`);
+      log2(`[memory] API returned ${response.status}`);
       return;
     }
     const data = await response.json();
@@ -16148,31 +16332,25 @@ Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothi
     const date = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
     const header = `## Auto-extracted (${date})`;
     if (existing.includes(header)) {
-      fs2.appendFileSync(memoryFile, `
+      fs3.appendFileSync(memoryFile, `
 ${text}
 `);
     } else {
-      fs2.appendFileSync(memoryFile, `
+      fs3.appendFileSync(memoryFile, `
 
 ${header}
 ${text}
 `);
     }
-    log(`[memory] Extracted ${text.split("\n").length} facts to MEMORY.md`);
+    log2(`[memory] Extracted ${text.split("\n").length} facts to MEMORY.md`);
   } catch (err) {
-    log(`[memory] Extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    log2(`[memory] Extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
   } finally {
     clearTimeout(timeout);
   }
 }
 async function shutdown() {
-  if (session) {
-    try {
-      session.close();
-    } catch {
-    }
-    session = null;
-  }
+  sessionManager.closeAll();
   if (activityPoster) {
     activityPoster.post("status", "Sprite shutting down");
     await activityPoster.stop();
@@ -16185,24 +16363,24 @@ function getActivityMetrics() {
   };
 }
 function getStatus() {
-  const sessionId = getPersistedSessionId();
   const memoryFiles = [];
-  const memoryDir = path2.join(WORKSPACE_DIR, "memory");
-  if (fs2.existsSync(path2.join(WORKSPACE_DIR, "MEMORY.md"))) {
+  const memoryDir = path3.join(WORKSPACE_DIR, "memory");
+  if (fs3.existsSync(path3.join(WORKSPACE_DIR, "MEMORY.md"))) {
     memoryFiles.push("MEMORY.md");
   }
-  if (fs2.existsSync(memoryDir)) {
+  if (fs3.existsSync(memoryDir)) {
     try {
-      const files = fs2.readdirSync(memoryDir).filter((f) => !f.startsWith("."));
+      const files = fs3.readdirSync(memoryDir).filter((f) => !f.startsWith("."));
       memoryFiles.push(...files.map((f) => `memory/${f}`));
     } catch {
     }
   }
   return {
-    sessionId,
     workspaceDir: WORKSPACE_DIR,
     memoryFiles,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    activeConversations: sessionManager.activeCount,
+    conversationIds: sessionManager.getConversationIds()
   };
 }
 
@@ -16212,7 +16390,7 @@ var MAX_QUEUE_SIZE = parseInt(process.env.CLAW_MAX_QUEUE_SIZE || "50", 10);
 var REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || "600000", 10);
 var AUTH_TOKEN = process.env.CLAW_AUTH_TOKEN || process.env.GALLERY_GATEWAY_TOKEN || "";
 var activeStreams = /* @__PURE__ */ new Map();
-function log2(message) {
+function log3(message) {
   console.error(`[claw-server] ${message}`);
 }
 function requireAuth(req, res) {
@@ -16224,7 +16402,7 @@ function requireAuth(req, res) {
   }
   const token = authHeader.slice(7);
   if (token !== AUTH_TOKEN) {
-    log2(`Auth failed: invalid token from ${req.socket.remoteAddress}`);
+    log3(`Auth failed: invalid token from ${req.socket.remoteAddress}`);
     sendJson(res, 401, { error: "Invalid token" });
     return false;
   }
@@ -16263,7 +16441,7 @@ async function processQueue() {
       isScheduledTask: isTask,
       assistantName: first.params.assistantName
     };
-    log2(`Batched ${items.length} queued ${isTask ? "tasks" : "messages"} into single prompt`);
+    log3(`Batched ${items.length} queued ${isTask ? "tasks" : "messages"} into single prompt`);
   }
   let timer;
   try {
@@ -16314,7 +16492,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-27T05:53:06.230Z" : "";
+var buildTime = true ? "2026-03-27T13:55:34.685Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
@@ -16349,7 +16527,7 @@ async function handleMessage(req, res) {
   };
   const wantSSE = (req.headers["accept"] || "").includes("text/event-stream");
   const useAiSdk = isAiSdkEnabled();
-  log2(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE}, aisdk: ${useAiSdk})`);
+  log3(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE}, aisdk: ${useAiSdk})`);
   if (wantSSE && useAiSdk) {
     const writer = new UIStreamWriter(res);
     const streamId = generateStreamId();
@@ -16365,7 +16543,7 @@ async function handleMessage(req, res) {
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log2(`Error processing message (AI SDK): ${errMsg}`);
+      log3(`Error processing message (AI SDK): ${errMsg}`);
       if (!writer.isEnded && !res.destroyed) {
         writer.error(errMsg);
         writer.done();
@@ -16398,7 +16576,7 @@ async function handleMessage(req, res) {
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log2(`Error processing message (SSE): ${errMsg}`);
+      log3(`Error processing message (SSE): ${errMsg}`);
       if (!res.destroyed) {
         res.write(`data: ${JSON.stringify({ type: "error", data: { error: errMsg } })}
 
@@ -16414,7 +16592,7 @@ async function handleMessage(req, res) {
       sendJson(res, 200, result);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log2(`Error processing message: ${errMsg}`);
+      log3(`Error processing message: ${errMsg}`);
       sendJson(res, errorStatus(errMsg), {
         status: "error",
         result: null,
@@ -16439,7 +16617,7 @@ function handleCancel(req, res) {
   }
   stream.cancelled = true;
   activeStreams.delete(streamId);
-  log2(`Stream ${streamId} cancelled`);
+  log3(`Stream ${streamId} cancelled`);
   res.writeHead(204);
   res.end();
 }
@@ -16462,13 +16640,13 @@ async function handleTask(req, res) {
     isScheduledTask: true,
     assistantName: parsed.assistantName
   };
-  log2(`POST /task (${params.message.length} chars, queue: ${requestQueue.length})`);
+  log3(`POST /task (${params.message.length} chars, queue: ${requestQueue.length})`);
   try {
     const result = await enqueueMessage(params);
     sendJson(res, 200, result);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    log2(`Error processing task: ${errMsg}`);
+    log3(`Error processing task: ${errMsg}`);
     sendJson(res, errorStatus(errMsg), {
       status: "error",
       result: null,
@@ -16508,12 +16686,12 @@ function handleStatus(_req, res) {
 }
 var WORKSPACE_DIR2 = process.env.CLAW_WORKSPACE_DIR || "/home/sprite/workspace";
 try {
-  const fs3 = await import("fs");
-  fs3.mkdirSync(WORKSPACE_DIR2, { recursive: true });
+  const fs4 = await import("fs");
+  fs4.mkdirSync(WORKSPACE_DIR2, { recursive: true });
   process.chdir(WORKSPACE_DIR2);
-  log2(`Working directory set to ${WORKSPACE_DIR2}`);
+  log3(`Working directory set to ${WORKSPACE_DIR2}`);
 } catch (err) {
-  log2(`Warning: Could not chdir to ${WORKSPACE_DIR2}: ${err instanceof Error ? err.message : String(err)}`);
+  log3(`Warning: Could not chdir to ${WORKSPACE_DIR2}: ${err instanceof Error ? err.message : String(err)}`);
 }
 var server = http.createServer(async (req, res) => {
   const method = req.method || "GET";
@@ -16538,17 +16716,17 @@ var server = http.createServer(async (req, res) => {
       sendJson(res, 404, { error: "Not found" });
     }
   } catch (err) {
-    log2(`Unhandled error: ${err instanceof Error ? err.message : String(err)}`);
+    log3(`Unhandled error: ${err instanceof Error ? err.message : String(err)}`);
     if (!res.headersSent) {
       sendJson(res, 500, { error: "Internal server error" });
     }
   }
 });
 server.listen(PORT, "0.0.0.0", () => {
-  log2(`Claw agent service running on 0.0.0.0:${PORT}`);
+  log3(`Claw agent service running on 0.0.0.0:${PORT}`);
 });
 process.on("SIGTERM", async () => {
-  log2("SIGTERM received, shutting down...");
+  log3("SIGTERM received, shutting down...");
   server.close();
   await shutdown();
   process.exit(0);
