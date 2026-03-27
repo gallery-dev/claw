@@ -30,6 +30,8 @@ export interface ConversationContext {
   loopTracker: ToolCallTracker;
   contextTracker: ContextWindowTracker;
   lastUsed: number;
+  mode: 'agent' | 'plan';
+  model: string;
   /** Per-conversation message lock — serialize send/stream cycles. */
   lockPromise: Promise<void>;
   lockRelease: (() => void) | null;
@@ -51,18 +53,21 @@ export class SessionManager {
   private sessionsDir: string;
   private maxSessions: number;
   private defaultContextWindow: number;
-  private buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string) => SDKSessionOptions;
+  private defaultModel: string;
+  private buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string, mode?: 'agent' | 'plan', model?: string) => SDKSessionOptions;
 
   constructor(opts: {
     workspaceDir: string;
     maxSessions?: number;
     defaultContextWindow: number;
-    buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string) => SDKSessionOptions;
+    defaultModel: string;
+    buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string, mode?: 'agent' | 'plan', model?: string) => SDKSessionOptions;
   }) {
     this.workspaceDir = opts.workspaceDir;
     this.sessionsDir = path.join(opts.workspaceDir, '.sessions');
     this.maxSessions = opts.maxSessions ?? 5;
     this.defaultContextWindow = opts.defaultContextWindow;
+    this.defaultModel = opts.defaultModel;
     this.buildOptions = opts.buildOptions;
   }
 
@@ -72,14 +77,24 @@ export class SessionManager {
    * Get or create a conversation context for the given ID.
    * Creates a new V2 session or resumes from disk.
    */
-  getOrCreate(conversationId?: string, assistantName?: string): ConversationContext {
+  getOrCreate(conversationId?: string, assistantName?: string, mode?: 'agent' | 'plan', model?: string): ConversationContext {
     const id = conversationId || DEFAULT_CONVERSATION;
+    const effectiveMode = mode || 'agent';
+    const effectiveModel = model || this.defaultModel;
 
-    // Return existing active context
+    // Return existing active context — but check for mode/model changes
     const existing = this.conversations.get(id);
     if (existing) {
-      existing.lastUsed = Date.now();
-      return existing;
+      if (existing.mode !== effectiveMode || existing.model !== effectiveModel) {
+        // Mode or model changed — close old session, create new one
+        log(`[session-mgr] Mode/model changed for ${id} (${existing.mode}/${existing.model} → ${effectiveMode}/${effectiveModel}), recreating session`);
+        try { existing.session.close(); } catch { /* ignore */ }
+        this.conversations.delete(id);
+        // Fall through to create new session
+      } else {
+        existing.lastUsed = Date.now();
+        return existing;
+      }
     }
 
     // Evict if at capacity
@@ -92,10 +107,12 @@ export class SessionManager {
     const loopTracker = new ToolCallTracker();
     const contextTracker = new ContextWindowTracker();
     contextTracker.contextWindow = this.defaultContextWindow;
-    const options = this.buildOptions(loopTracker, contextTracker, assistantName);
+    const options = this.buildOptions(loopTracker, contextTracker, assistantName, effectiveMode, effectiveModel);
 
+    const modeModelChanged = existing !== undefined; // if existing was set, we deleted it above due to change
     let session: SDKSession;
-    if (persisted) {
+    if (persisted && !modeModelChanged) {
+      // Resume from disk — but not if we just closed due to mode/model change
       try {
         log(`[session-mgr] Resuming session for ${id}: ${persisted.sessionId}`);
         session = unstable_v2_resumeSession(persisted.sessionId, options);
@@ -105,7 +122,7 @@ export class SessionManager {
         session = unstable_v2_createSession(options);
       }
     } else {
-      log(`[session-mgr] Creating new session for ${id}`);
+      log(`[session-mgr] Creating new session for ${id} (mode=${effectiveMode}, model=${effectiveModel})`);
       session = unstable_v2_createSession(options);
     }
 
@@ -115,6 +132,8 @@ export class SessionManager {
       loopTracker,
       contextTracker,
       lastUsed: Date.now(),
+      mode: effectiveMode,
+      model: effectiveModel,
       lockPromise: Promise.resolve(),
       lockRelease: null,
     };

@@ -204,6 +204,8 @@ async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse
     assistantName: parsed.assistantName,
     maxTurns: typeof parsed.maxTurns === 'number' ? parsed.maxTurns : undefined,
     maxBudgetUsd: typeof parsed.maxBudgetUsd === 'number' ? parsed.maxBudgetUsd : undefined,
+    mode: parsed.mode === 'plan' ? 'plan' : undefined,
+    model: typeof parsed.model === 'string' ? parsed.model : undefined,
   };
 
   const wantSSE = (req.headers['accept'] || '').includes('text/event-stream');

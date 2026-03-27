@@ -103,6 +103,8 @@ export interface MessageParams {
   assistantName?: string;
   maxTurns?: number;
   maxBudgetUsd?: number;
+  mode?: 'agent' | 'plan';
+  model?: string;
 }
 
 export interface UsageInfo {
@@ -142,10 +144,11 @@ const sessionManager = new SessionManager({
   workspaceDir: WORKSPACE_DIR,
   maxSessions: 5,
   defaultContextWindow: getDefaultContextWindow(MODEL),
-  buildOptions: (loopTracker, contextTracker, assistantName) => {
+  defaultModel: MODEL,
+  buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
     return {
-      model: MODEL,
+      model: model || MODEL,
       pathToClaudeCodeExecutable: path.join(__dirname, 'cli.js'),
       env: { ...process.env },
       allowedTools: [
@@ -155,7 +158,7 @@ const sessionManager = new SessionManager({
         'NotebookEdit',
         ...getDynamicMcpToolPatterns(),
       ],
-      permissionMode: 'acceptEdits',
+      permissionMode: mode === 'plan' ? 'plan' : 'acceptEdits',
       includePartialMessages: true,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
@@ -197,7 +200,7 @@ export async function processMessage(
   const conversationId = params.sessionId || 'default';
 
   // Get or create conversation context (session, trackers, etc.)
-  const ctx = sessionManager.getOrCreate(conversationId, params.assistantName);
+  const ctx = sessionManager.getOrCreate(conversationId, params.assistantName, params.mode, params.model);
 
   // Per-conversation lock — serialize send/stream cycles for THIS conversation
   // Other conversations can process in parallel

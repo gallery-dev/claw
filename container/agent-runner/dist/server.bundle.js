@@ -15735,12 +15735,14 @@ var SessionManager = class {
   sessionsDir;
   maxSessions;
   defaultContextWindow;
+  defaultModel;
   buildOptions;
   constructor(opts) {
     this.workspaceDir = opts.workspaceDir;
     this.sessionsDir = path2.join(opts.workspaceDir, ".sessions");
     this.maxSessions = opts.maxSessions ?? 5;
     this.defaultContextWindow = opts.defaultContextWindow;
+    this.defaultModel = opts.defaultModel;
     this.buildOptions = opts.buildOptions;
   }
   // ─── Get or Create ──────────────────────────────────
@@ -15748,12 +15750,23 @@ var SessionManager = class {
    * Get or create a conversation context for the given ID.
    * Creates a new V2 session or resumes from disk.
    */
-  getOrCreate(conversationId, assistantName) {
+  getOrCreate(conversationId, assistantName, mode, model) {
     const id = conversationId || DEFAULT_CONVERSATION;
+    const effectiveMode = mode || "agent";
+    const effectiveModel = model || this.defaultModel;
     const existing = this.conversations.get(id);
     if (existing) {
-      existing.lastUsed = Date.now();
-      return existing;
+      if (existing.mode !== effectiveMode || existing.model !== effectiveModel) {
+        log(`[session-mgr] Mode/model changed for ${id} (${existing.mode}/${existing.model} \u2192 ${effectiveMode}/${effectiveModel}), recreating session`);
+        try {
+          existing.session.close();
+        } catch {
+        }
+        this.conversations.delete(id);
+      } else {
+        existing.lastUsed = Date.now();
+        return existing;
+      }
     }
     if (this.conversations.size >= this.maxSessions) {
       this.evictOldest();
@@ -15762,9 +15775,10 @@ var SessionManager = class {
     const loopTracker = new ToolCallTracker();
     const contextTracker = new ContextWindowTracker();
     contextTracker.contextWindow = this.defaultContextWindow;
-    const options = this.buildOptions(loopTracker, contextTracker, assistantName);
+    const options = this.buildOptions(loopTracker, contextTracker, assistantName, effectiveMode, effectiveModel);
+    const modeModelChanged = existing !== void 0;
     let session;
-    if (persisted) {
+    if (persisted && !modeModelChanged) {
       try {
         log(`[session-mgr] Resuming session for ${id}: ${persisted.sessionId}`);
         session = Pa(persisted.sessionId, options);
@@ -15774,7 +15788,7 @@ var SessionManager = class {
         session = ba(options);
       }
     } else {
-      log(`[session-mgr] Creating new session for ${id}`);
+      log(`[session-mgr] Creating new session for ${id} (mode=${effectiveMode}, model=${effectiveModel})`);
       session = ba(options);
     }
     const ctx = {
@@ -15783,6 +15797,8 @@ var SessionManager = class {
       loopTracker,
       contextTracker,
       lastUsed: Date.now(),
+      mode: effectiveMode,
+      model: effectiveModel,
       lockPromise: Promise.resolve(),
       lockRelease: null
     };
@@ -15998,10 +16014,11 @@ var sessionManager = new SessionManager({
   workspaceDir: WORKSPACE_DIR,
   maxSessions: 5,
   defaultContextWindow: getDefaultContextWindow(MODEL),
-  buildOptions: (loopTracker, contextTracker, assistantName) => {
+  defaultModel: MODEL,
+  buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
     const __dirname = path3.dirname(fileURLToPath(import.meta.url));
     return {
-      model: MODEL,
+      model: model || MODEL,
       pathToClaudeCodeExecutable: path3.join(__dirname, "cli.js"),
       env: { ...process.env },
       allowedTools: [
@@ -16019,7 +16036,7 @@ var sessionManager = new SessionManager({
         "NotebookEdit",
         ...getDynamicMcpToolPatterns()
       ],
-      permissionMode: "acceptEdits",
+      permissionMode: mode === "plan" ? "plan" : "acceptEdits",
       includePartialMessages: true,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log2)] }],
@@ -16046,7 +16063,7 @@ function ensureActivityPoster(agentId) {
 }
 async function processMessage(params, onEvent, writer, cancelSignal) {
   const conversationId = params.sessionId || "default";
-  const ctx = sessionManager.getOrCreate(conversationId, params.assistantName);
+  const ctx = sessionManager.getOrCreate(conversationId, params.assistantName, params.mode, params.model);
   const releaseLock = await sessionManager.acquireLock(conversationId);
   try {
     return await processMessageInner(params, onEvent, writer, cancelSignal, ctx);
@@ -16555,7 +16572,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-27T14:06:40.561Z" : "";
+var buildTime = true ? "2026-03-27T14:17:13.023Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
@@ -16588,7 +16605,9 @@ async function handleMessage(req, res) {
     isScheduledTask: false,
     assistantName: parsed.assistantName,
     maxTurns: typeof parsed.maxTurns === "number" ? parsed.maxTurns : void 0,
-    maxBudgetUsd: typeof parsed.maxBudgetUsd === "number" ? parsed.maxBudgetUsd : void 0
+    maxBudgetUsd: typeof parsed.maxBudgetUsd === "number" ? parsed.maxBudgetUsd : void 0,
+    mode: parsed.mode === "plan" ? "plan" : void 0,
+    model: typeof parsed.model === "string" ? parsed.model : void 0
   };
   const wantSSE = (req.headers["accept"] || "").includes("text/event-stream");
   const useAiSdk = isAiSdkEnabled();
