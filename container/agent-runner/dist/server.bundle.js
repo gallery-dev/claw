@@ -15953,6 +15953,22 @@ var MODEL = process.env.CLAW_MODEL || "claude-opus-4-6";
 function log2(message) {
   console.error(`[claw] ${message}`);
 }
+function estimateCostUsd(inputTokens, outputTokens, model) {
+  const m3 = (model || MODEL).toLowerCase();
+  let inputRate;
+  let outputRate;
+  if (m3.includes("haiku")) {
+    inputRate = 0.8;
+    outputRate = 4;
+  } else if (m3.includes("sonnet")) {
+    inputRate = 3;
+    outputRate = 15;
+  } else {
+    inputRate = 15;
+    outputRate = 75;
+  }
+  return (inputTokens * inputRate + outputTokens * outputRate) / 1e6;
+}
 function getDefaultContextWindow(model) {
   const m3 = model.toLowerCase();
   if (m3.includes("opus-4-6") || m3.includes("opus-4.6") || m3.includes("sonnet-4-6") || m3.includes("sonnet-4.6")) return 1e6;
@@ -16071,6 +16087,11 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
   let streamEventCount = 0;
   let usageInfo;
   let lastEmittedToolOutput = false;
+  const maxTurns = params.maxTurns ?? 50;
+  const maxBudgetUsd = params.maxBudgetUsd ?? 2;
+  let turnCount = 0;
+  let accumulatedCostUsd = 0;
+  let limitHit = false;
   if (useAiSdk) {
     writer.start(generateMessageId());
     writer.startStep();
@@ -16191,6 +16212,36 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
               }
             }
           }
+          const hasToolUse = content.some((b) => b.type === "tool_use");
+          if (hasToolUse) turnCount++;
+          if (msgUsage) {
+            accumulatedCostUsd += estimateCostUsd(
+              msgUsage.input_tokens ?? 0,
+              msgUsage.output_tokens ?? 0
+            );
+          }
+          if (turnCount >= maxTurns) {
+            log2(`[limits] Turn limit hit: ${turnCount}/${maxTurns}`);
+            if (useAiSdk) {
+              writer.finish("max_turns");
+              writer.done();
+            } else {
+              onEvent?.({ type: "done", data: { result: "", sessionId: currentSessionId, finishReason: "max_turns" } });
+            }
+            limitHit = true;
+            break;
+          }
+          if (accumulatedCostUsd >= maxBudgetUsd) {
+            log2(`[limits] Budget limit hit: $${accumulatedCostUsd.toFixed(4)} >= $${maxBudgetUsd}`);
+            if (useAiSdk) {
+              writer.finish("budget_exceeded");
+              writer.done();
+            } else {
+              onEvent?.({ type: "done", data: { result: "", sessionId: currentSessionId, finishReason: "budget_exceeded" } });
+            }
+            limitHit = true;
+            break;
+          }
         }
       }
       if (msg.type === "system" && msg.subtype === "init") {
@@ -16273,17 +16324,29 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
     }
   }
   const resultText = resultTexts.length > 0 ? resultTexts.join("\n\n") : null;
-  log2(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${currentSessionId}`);
-  activityPoster.post("status", "Message processed");
+  const statusMsg = limitHit ? `Query stopped (limit hit after ${turnCount} turns, $${accumulatedCostUsd.toFixed(4)})` : `Query done. Messages: ${messageCount}, results: ${resultTexts.length}`;
+  log2(`${statusMsg}, sessionId: ${currentSessionId}`);
+  activityPoster.post("status", limitHit ? statusMsg : "Message processed");
   if (resultText && process.env.CLAW_AUTO_MEMORY !== "false") {
     extractMemory(message, resultText).catch(() => {
     });
   }
   return {
-    status: "success",
+    status: limitHit ? "error" : "success",
     result: resultText,
     sessionId: currentSessionId,
-    usage: usageInfo
+    error: limitHit ? turnCount >= maxTurns ? "max_turns" : "budget_exceeded" : void 0,
+    usage: usageInfo ?? (limitHit ? {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      totalCostUsd: accumulatedCostUsd,
+      numTurns: turnCount,
+      durationMs: 0,
+      contextWindow: ctx?.contextTracker.contextWindow ?? 2e5,
+      contextPercentage: 0
+    } : void 0)
   };
 }
 async function extractMemory(userMessage, assistantResult) {
@@ -16492,7 +16555,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-27T13:55:34.685Z" : "";
+var buildTime = true ? "2026-03-27T14:06:40.561Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
@@ -16523,7 +16586,9 @@ async function handleMessage(req, res) {
     message: parsed.message,
     sessionId: parsed.sessionId,
     isScheduledTask: false,
-    assistantName: parsed.assistantName
+    assistantName: parsed.assistantName,
+    maxTurns: typeof parsed.maxTurns === "number" ? parsed.maxTurns : void 0,
+    maxBudgetUsd: typeof parsed.maxBudgetUsd === "number" ? parsed.maxBudgetUsd : void 0
   };
   const wantSSE = (req.headers["accept"] || "").includes("text/event-stream");
   const useAiSdk = isAiSdkEnabled();

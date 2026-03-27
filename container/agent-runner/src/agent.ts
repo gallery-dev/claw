@@ -46,6 +46,22 @@ function log(message: string): void {
   console.error(`[claw] ${message}`);
 }
 
+/** Estimate cost in USD from token counts. Conservative (uses Opus rates as default). */
+function estimateCostUsd(inputTokens: number, outputTokens: number, model?: string): number {
+  const m = (model || MODEL).toLowerCase();
+  let inputRate: number; // $ per million tokens
+  let outputRate: number;
+  if (m.includes('haiku')) {
+    inputRate = 0.80; outputRate = 4;
+  } else if (m.includes('sonnet')) {
+    inputRate = 3; outputRate = 15;
+  } else {
+    // Opus or unknown — use Opus rates (conservative)
+    inputRate = 15; outputRate = 75;
+  }
+  return (inputTokens * inputRate + outputTokens * outputRate) / 1_000_000;
+}
+
 /** Default context window sizes by model family. */
 function getDefaultContextWindow(model: string): number {
   const m = model.toLowerCase();
@@ -85,6 +101,8 @@ export interface MessageParams {
   sessionId?: string;
   isScheduledTask?: boolean;
   assistantName?: string;
+  maxTurns?: number;
+  maxBudgetUsd?: number;
 }
 
 export interface UsageInfo {
@@ -230,6 +248,13 @@ async function processMessageInner(
   // AI SDK state tracking
   let lastEmittedToolOutput = false;
 
+  // Budget/turn limit tracking
+  const maxTurns = params.maxTurns ?? 50;
+  const maxBudgetUsd = params.maxBudgetUsd ?? 2.00;
+  let turnCount = 0;
+  let accumulatedCostUsd = 0;
+  let limitHit = false;
+
   // Emit AI SDK message start
   if (useAiSdk) {
     writer.start(generateMessageId());
@@ -366,6 +391,44 @@ async function processMessageInner(
               }
             }
           }
+
+          // ─── Budget/turn limit enforcement ───────────
+          const hasToolUse = content.some((b: any) => b.type === 'tool_use');
+          if (hasToolUse) turnCount++;
+
+          // Accumulate cost from this turn's usage
+          if (msgUsage) {
+            accumulatedCostUsd += estimateCostUsd(
+              msgUsage.input_tokens ?? 0,
+              msgUsage.output_tokens ?? 0,
+            );
+          }
+
+          // Check turn limit
+          if (turnCount >= maxTurns) {
+            log(`[limits] Turn limit hit: ${turnCount}/${maxTurns}`);
+            if (useAiSdk) {
+              writer.finish('max_turns');
+              writer.done();
+            } else {
+              onEvent?.({ type: 'done', data: { result: '', sessionId: currentSessionId, finishReason: 'max_turns' } });
+            }
+            limitHit = true;
+            break;
+          }
+
+          // Check budget limit
+          if (accumulatedCostUsd >= maxBudgetUsd) {
+            log(`[limits] Budget limit hit: $${accumulatedCostUsd.toFixed(4)} >= $${maxBudgetUsd}`);
+            if (useAiSdk) {
+              writer.finish('budget_exceeded');
+              writer.done();
+            } else {
+              onEvent?.({ type: 'done', data: { result: '', sessionId: currentSessionId, finishReason: 'budget_exceeded' } });
+            }
+            limitHit = true;
+            break;
+          }
         }
       }
 
@@ -474,8 +537,11 @@ async function processMessageInner(
   }
 
   const resultText = resultTexts.length > 0 ? resultTexts.join('\n\n') : null;
-  log(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${currentSessionId}`);
-  activityPoster!.post('status', 'Message processed');
+  const statusMsg = limitHit
+    ? `Query stopped (limit hit after ${turnCount} turns, $${accumulatedCostUsd.toFixed(4)})`
+    : `Query done. Messages: ${messageCount}, results: ${resultTexts.length}`;
+  log(`${statusMsg}, sessionId: ${currentSessionId}`);
+  activityPoster!.post('status', limitHit ? statusMsg : 'Message processed');
 
   // Fire-and-forget memory extraction — don't block the response
   if (resultText && process.env.CLAW_AUTO_MEMORY !== 'false') {
@@ -483,10 +549,18 @@ async function processMessageInner(
   }
 
   return {
-    status: 'success',
+    status: limitHit ? 'error' : 'success',
     result: resultText,
     sessionId: currentSessionId,
-    usage: usageInfo,
+    error: limitHit ? (turnCount >= maxTurns ? 'max_turns' : 'budget_exceeded') : undefined,
+    usage: usageInfo ?? (limitHit ? {
+      inputTokens: 0, outputTokens: 0,
+      cacheReadTokens: 0, cacheCreationTokens: 0,
+      totalCostUsd: accumulatedCostUsd,
+      numTurns: turnCount, durationMs: 0,
+      contextWindow: ctx?.contextTracker.contextWindow ?? 200_000,
+      contextPercentage: 0,
+    } : undefined),
   };
 }
 
