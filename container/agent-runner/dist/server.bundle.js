@@ -15546,6 +15546,185 @@ var ActivityPoster = class _ActivityPoster {
   }
 };
 
+// src/ui-stream.ts
+import crypto from "crypto";
+var UIStreamWriter = class {
+  res;
+  ended = false;
+  textIdCounter = 0;
+  reasoningIdCounter = 0;
+  _currentTextId = null;
+  _currentReasoningId = null;
+  stepOpen = false;
+  constructor(res) {
+    this.res = res;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Vercel-AI-UI-Message-Stream": "v1",
+      "X-Accel-Buffering": "no"
+    });
+  }
+  // ─── Low-level ──────────────────────────────────────
+  write(chunk) {
+    if (this.ended || this.res.destroyed) return;
+    this.res.write(`data: ${JSON.stringify(chunk)}
+
+`);
+  }
+  // ─── Message Lifecycle ──────────────────────────────
+  start(messageId) {
+    this.write({
+      type: "start",
+      ...messageId ? { messageId } : {}
+    });
+  }
+  finish(finishReason = "stop", metadata) {
+    this.closeOpenBlocks();
+    if (this.stepOpen) {
+      this.finishStep();
+    }
+    this.write({
+      type: "finish",
+      finishReason,
+      ...metadata ? { messageMetadata: metadata } : {}
+    });
+  }
+  startStep() {
+    this.write({ type: "start-step" });
+    this.stepOpen = true;
+  }
+  finishStep() {
+    this.closeOpenBlocks();
+    this.write({ type: "finish-step" });
+    this.stepOpen = false;
+  }
+  // ─── Text Content ───────────────────────────────────
+  get currentTextId() {
+    return this._currentTextId;
+  }
+  textStart(id) {
+    const blockId = id ?? `text-${++this.textIdCounter}`;
+    this._currentTextId = blockId;
+    this.write({ type: "text-start", id: blockId });
+    return blockId;
+  }
+  textDelta(delta, id) {
+    if (!this._currentTextId) {
+      this.textStart(id);
+    }
+    this.write({ type: "text-delta", id: this._currentTextId, delta });
+  }
+  textEnd(id) {
+    const blockId = id ?? this._currentTextId;
+    if (!blockId) return;
+    this.write({ type: "text-end", id: blockId });
+    this._currentTextId = null;
+  }
+  // ─── Reasoning/Thinking ─────────────────────────────
+  get currentReasoningId() {
+    return this._currentReasoningId;
+  }
+  reasoningStart(id) {
+    const blockId = id ?? `reasoning-${++this.reasoningIdCounter}`;
+    this._currentReasoningId = blockId;
+    this.write({ type: "reasoning-start", id: blockId });
+    return blockId;
+  }
+  reasoningDelta(delta, id) {
+    if (!this._currentReasoningId) {
+      this.reasoningStart(id);
+    }
+    this.write({ type: "reasoning-delta", id: this._currentReasoningId, delta });
+  }
+  reasoningEnd(id) {
+    const blockId = id ?? this._currentReasoningId;
+    if (!blockId) return;
+    this.write({ type: "reasoning-end", id: blockId });
+    this._currentReasoningId = null;
+  }
+  // ─── Tool Calls ─────────────────────────────────────
+  toolInputStart(toolCallId, toolName) {
+    this.closeOpenBlocks();
+    this.write({ type: "tool-input-start", toolCallId, toolName });
+  }
+  toolInputAvailable(toolCallId, toolName, input) {
+    this.write({ type: "tool-input-available", toolCallId, toolName, input });
+  }
+  toolOutputAvailable(toolCallId, output) {
+    this.write({ type: "tool-output-available", toolCallId, output });
+  }
+  toolOutputError(toolCallId, errorText) {
+    this.write({ type: "tool-output-error", toolCallId, errorText });
+  }
+  // ─── Custom Gallery Data ────────────────────────────
+  galleryData(name, data) {
+    this.write({ type: `data-gallery-${name}`, data });
+  }
+  galleryStreamId(streamId) {
+    this.galleryData("stream-id", { streamId });
+  }
+  galleryProgress(data) {
+    this.galleryData("progress", data);
+  }
+  galleryCompacting(status) {
+    this.galleryData("compacting", { status });
+  }
+  galleryReview(data) {
+    this.galleryData("review", data);
+  }
+  // ─── Metadata ───────────────────────────────────────
+  messageMetadata(metadata) {
+    this.write({ type: "message-metadata", messageMetadata: metadata });
+  }
+  // ─── Error / Abort ──────────────────────────────────
+  error(errorText) {
+    this.closeOpenBlocks();
+    this.write({ type: "error", errorText });
+  }
+  abort(reason) {
+    this.closeOpenBlocks();
+    this.write({ type: "abort", ...reason ? { reason } : {} });
+  }
+  // ─── Stream Termination ─────────────────────────────
+  done() {
+    if (this.ended) return;
+    this.ended = true;
+    if (!this.res.destroyed) {
+      this.res.write("data: [DONE]\n\n");
+      this.res.end();
+    }
+  }
+  get isEnded() {
+    return this.ended;
+  }
+  // ─── Helpers ────────────────────────────────────────
+  /** Close any open text or reasoning blocks. */
+  closeOpenBlocks() {
+    if (this._currentTextId) this.textEnd();
+    if (this._currentReasoningId) this.reasoningEnd();
+  }
+  /** Whether a step boundary is needed before the next content. */
+  needsStepBoundary(lastEmittedToolOutput) {
+    return lastEmittedToolOutput && this.stepOpen;
+  }
+  /** Emit step boundary (finish current step, start new one). */
+  emitStepBoundary() {
+    this.finishStep();
+    this.startStep();
+  }
+};
+function generateMessageId() {
+  return `msg_${crypto.randomBytes(8).toString("hex")}`;
+}
+function generateStreamId() {
+  return `stream_${crypto.randomBytes(8).toString("hex")}`;
+}
+function isAiSdkEnabled() {
+  return process.env.SSE_FORMAT === "aisdk";
+}
+
 // src/agent.ts
 var WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || "/home/sprite/workspace";
 var SESSION_ID_FILE = path2.join(WORKSPACE_DIR, ".current-session-id");
@@ -15658,7 +15837,7 @@ function getOrCreateSession(assistantName) {
   }
   return session;
 }
-async function processMessage(params, onEvent) {
+async function processMessage(params, onEvent, writer, cancelSignal) {
   const prevLock = messageLock;
   let releaseLock;
   messageLock = new Promise((resolve) => {
@@ -15666,13 +15845,14 @@ async function processMessage(params, onEvent) {
   });
   await prevLock;
   try {
-    return await processMessageInner(params, onEvent);
+    return await processMessageInner(params, onEvent, writer, cancelSignal);
   } finally {
     releaseLock();
   }
 }
-async function processMessageInner(params, onEvent) {
+async function processMessageInner(params, onEvent, writer, cancelSignal) {
   const { message, isScheduledTask, assistantName } = params;
+  const useAiSdk = !!writer;
   const agentId = process.env.AGENT_ID || assistantName || "unknown";
   ensureActivityPoster(agentId);
   activityPoster.post("status", "Processing message");
@@ -15701,10 +15881,23 @@ async function processMessageInner(params, onEvent) {
   let messageCount = 0;
   let streamEventCount = 0;
   let usageInfo;
+  let lastEmittedToolOutput = false;
+  if (useAiSdk) {
+    writer.start(generateMessageId());
+    writer.startStep();
+  }
   try {
     const sess = getOrCreateSession(assistantName);
     await sess.send(prompt);
     for await (const msg of sess.stream()) {
+      if (cancelSignal?.cancelled) {
+        log("[cancel] Stream cancelled by user");
+        if (useAiSdk) {
+          writer.abort("User cancelled");
+          writer.done();
+        }
+        break;
+      }
       messageCount++;
       const msgType = msg.type === "system" ? `system/${msg.subtype}` : msg.type;
       if (msgType !== "stream_event") log(`[msg #${messageCount}] type=${msgType}`);
@@ -15714,17 +15907,41 @@ async function processMessageInner(params, onEvent) {
         if (event?.type === "content_block_delta") {
           const delta = event.delta;
           if (delta?.type === "text_delta" && delta.text) {
-            onEvent?.({ type: "text", data: { content: delta.text } });
+            if (useAiSdk) {
+              if (lastEmittedToolOutput) {
+                writer.emitStepBoundary();
+                lastEmittedToolOutput = false;
+              }
+              writer.textDelta(delta.text);
+            } else {
+              onEvent?.({ type: "text", data: { content: delta.text } });
+            }
           } else if (delta?.type === "thinking_delta" && delta.thinking) {
-            onEvent?.({ type: "thinking", data: { content: delta.thinking } });
+            if (useAiSdk) {
+              if (lastEmittedToolOutput) {
+                writer.emitStepBoundary();
+                lastEmittedToolOutput = false;
+              }
+              writer.reasoningDelta(delta.thinking);
+            } else {
+              onEvent?.({ type: "thinking", data: { content: delta.thinking } });
+            }
           } else if (delta?.type === "input_json_delta") {
           }
         } else if (event?.type === "content_block_start") {
           const block = event.content_block;
           if (block?.type === "tool_use") {
-            onEvent?.({ type: "tool_call_start", data: { id: block.id, name: block.name, input: {} } });
+            if (useAiSdk) {
+              writer.closeOpenBlocks();
+              writer.toolInputStart(block.id, block.name);
+            } else {
+              onEvent?.({ type: "tool_call_start", data: { id: block.id, name: block.name, input: {} } });
+            }
           }
         } else if (event?.type === "content_block_stop") {
+          if (useAiSdk) {
+            writer.closeOpenBlocks();
+          }
         }
         continue;
       }
@@ -15742,15 +15959,45 @@ async function processMessageInner(params, onEvent) {
           for (const block of content) {
             if (block.type === "text" && block.text) {
               activityPoster.post("output", block.text);
-              if (!hadStreamEvents) onEvent?.({ type: "text", data: { content: block.text } });
+              if (!hadStreamEvents) {
+                if (useAiSdk) {
+                  writer.textStart();
+                  writer.textDelta(block.text);
+                  writer.textEnd();
+                } else {
+                  onEvent?.({ type: "text", data: { content: block.text } });
+                }
+              }
             } else if (block.type === "tool_use") {
               activityPoster.post("tool_use", `${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
-              onEvent?.({ type: "tool_call_start", data: { id: block.id, name: block.name, input: block.input } });
+              if (useAiSdk) {
+                writer.toolInputAvailable(block.id, block.name, block.input);
+              } else {
+                onEvent?.({ type: "tool_call_start", data: { id: block.id, name: block.name, input: block.input } });
+              }
             } else if (block.type === "tool_result") {
-              onEvent?.({ type: "tool_call_end", data: { id: block.tool_use_id, status: block.is_error ? "error" : "completed", result: typeof block.content === "string" ? block.content : JSON.stringify(block.content) } });
+              if (useAiSdk) {
+                const resultContent = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+                if (block.is_error) {
+                  writer.toolOutputError(block.tool_use_id, resultContent);
+                } else {
+                  writer.toolOutputAvailable(block.tool_use_id, resultContent);
+                }
+                lastEmittedToolOutput = true;
+              } else {
+                onEvent?.({ type: "tool_call_end", data: { id: block.tool_use_id, status: block.is_error ? "error" : "completed", result: typeof block.content === "string" ? block.content : JSON.stringify(block.content) } });
+              }
             } else if (block.type === "thinking" && block.thinking) {
               activityPoster.post("thinking", block.thinking.slice(0, 500));
-              if (!hadStreamEvents) onEvent?.({ type: "thinking", data: { content: block.thinking } });
+              if (!hadStreamEvents) {
+                if (useAiSdk) {
+                  writer.reasoningStart();
+                  writer.reasoningDelta(block.thinking);
+                  writer.reasoningEnd();
+                } else {
+                  onEvent?.({ type: "thinking", data: { content: block.thinking } });
+                }
+              }
             }
           }
         }
@@ -15792,15 +16039,33 @@ async function processMessageInner(params, onEvent) {
           };
           log(`[usage] ${inputTokens} in / ${outputTokens} out | context: ${contextPercentage}% of ${contextWindow}`);
           activityPoster.post("status", `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, { usage: usageInfo });
-          onEvent?.({ type: "context_usage", data: { promptTokens: inputTokens, completionTokens: outputTokens, model: MODEL, contextWindow, contextPercentage } });
+          if (useAiSdk) {
+            writer.messageMetadata({
+              usage: { promptTokens: inputTokens, completionTokens: outputTokens, cacheReadTokens: usageInfo.cacheReadTokens, cacheCreationTokens: usageInfo.cacheCreationTokens },
+              cost: { usd: usageInfo.totalCostUsd },
+              model: MODEL,
+              sessionId: currentSessionId
+            });
+          } else {
+            onEvent?.({ type: "context_usage", data: { promptTokens: inputTokens, completionTokens: outputTokens, model: MODEL, contextWindow, contextPercentage } });
+          }
         }
-        onEvent?.({ type: "done", data: { result: textResult ?? "", sessionId: currentSessionId } });
+        if (useAiSdk) {
+          writer.finish("stop");
+          writer.done();
+        } else {
+          onEvent?.({ type: "done", data: { result: textResult ?? "", sessionId: currentSessionId } });
+        }
       }
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
     activityPoster.post("error", errorMessage);
+    if (useAiSdk) {
+      writer.error(errorMessage);
+      writer.done();
+    }
     if (session) {
       try {
         session.close();
@@ -15946,6 +16211,7 @@ var PORT = parseInt(process.env.PORT || "8080", 10);
 var MAX_QUEUE_SIZE = parseInt(process.env.CLAW_MAX_QUEUE_SIZE || "50", 10);
 var REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || "600000", 10);
 var AUTH_TOKEN = process.env.CLAW_AUTH_TOKEN || process.env.GALLERY_GATEWAY_TOKEN || "";
+var activeStreams = /* @__PURE__ */ new Map();
 function log2(message) {
   console.error(`[claw-server] ${message}`);
 }
@@ -16048,7 +16314,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-27T03:54:02.541Z" : "";
+var buildTime = true ? "2026-03-27T05:53:06.230Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
@@ -16082,8 +16348,32 @@ async function handleMessage(req, res) {
     assistantName: parsed.assistantName
   };
   const wantSSE = (req.headers["accept"] || "").includes("text/event-stream");
-  log2(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE})`);
-  if (wantSSE) {
+  const useAiSdk = isAiSdkEnabled();
+  log2(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE}, aisdk: ${useAiSdk})`);
+  if (wantSSE && useAiSdk) {
+    const writer = new UIStreamWriter(res);
+    const streamId = generateStreamId();
+    const streamState = { cancelled: false };
+    activeStreams.set(streamId, streamState);
+    writer.galleryStreamId(streamId);
+    try {
+      const result = await processMessage(params, void 0, writer, streamState);
+      markReady();
+      if (!writer.isEnded && !res.destroyed) {
+        writer.finish("stop");
+        writer.done();
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log2(`Error processing message (AI SDK): ${errMsg}`);
+      if (!writer.isEnded && !res.destroyed) {
+        writer.error(errMsg);
+        writer.done();
+      }
+    } finally {
+      activeStreams.delete(streamId);
+    }
+  } else if (wantSSE) {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -16133,6 +16423,25 @@ async function handleMessage(req, res) {
       });
     }
   }
+}
+function handleCancel(req, res) {
+  const url = req.url || "";
+  const match = url.match(/^\/message\/(stream_[a-f0-9]+)$/);
+  if (!match) {
+    sendJson(res, 400, { error: "Invalid stream ID format" });
+    return;
+  }
+  const streamId = match[1];
+  const stream = activeStreams.get(streamId);
+  if (!stream) {
+    sendJson(res, 404, { error: "Stream not found or already completed" });
+    return;
+  }
+  stream.cancelled = true;
+  activeStreams.delete(streamId);
+  log2(`Stream ${streamId} cancelled`);
+  res.writeHead(204);
+  res.end();
 }
 async function handleTask(req, res) {
   const body = await readBody(req);
@@ -16213,6 +16522,9 @@ var server = http.createServer(async (req, res) => {
     if (method === "POST" && url === "/message") {
       if (!requireAuth(req, res)) return;
       await handleMessage(req, res);
+    } else if (method === "DELETE" && url.startsWith("/message/")) {
+      if (!requireAuth(req, res)) return;
+      handleCancel(req, res);
     } else if (method === "POST" && url === "/task") {
       if (!requireAuth(req, res)) return;
       await handleTask(req, res);

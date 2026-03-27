@@ -35,6 +35,8 @@ import {
   createLoopDetectionHook,
   createContextSafetyHook,
 } from './shared.js';
+import { UIStreamWriter, generateMessageId, isAiSdkEnabled } from './ui-stream.js';
+import type { MessageMetadata } from './ui-stream.js';
 
 // ─── Configuration ──────────────────────────────────────
 
@@ -204,7 +206,12 @@ function getOrCreateSession(assistantName?: string): SDKSession {
 
 // ─── Core Message Processing ─────────────────────────────
 
-export async function processMessage(params: MessageParams, onEvent?: (event: StreamEvent) => void): Promise<MessageResult> {
+export async function processMessage(
+  params: MessageParams,
+  onEvent?: (event: StreamEvent) => void,
+  writer?: UIStreamWriter,
+  cancelSignal?: { cancelled: boolean },
+): Promise<MessageResult> {
   // Serialize access — V2 session handles one send/stream cycle at a time
   const prevLock = messageLock;
   let releaseLock!: () => void;
@@ -212,14 +219,20 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
   await prevLock;
 
   try {
-    return await processMessageInner(params, onEvent);
+    return await processMessageInner(params, onEvent, writer, cancelSignal);
   } finally {
     releaseLock();
   }
 }
 
-async function processMessageInner(params: MessageParams, onEvent?: (event: StreamEvent) => void): Promise<MessageResult> {
+async function processMessageInner(
+  params: MessageParams,
+  onEvent?: (event: StreamEvent) => void,
+  writer?: UIStreamWriter,
+  cancelSignal?: { cancelled: boolean },
+): Promise<MessageResult> {
   const { message, isScheduledTask, assistantName } = params;
+  const useAiSdk = !!writer;
 
   // Initialize activity poster before session creation (hooks reference it)
   const agentId = process.env.AGENT_ID || assistantName || 'unknown';
@@ -245,11 +258,30 @@ async function processMessageInner(params: MessageParams, onEvent?: (event: Stre
   let streamEventCount = 0;
   let usageInfo: UsageInfo | undefined;
 
+  // AI SDK state tracking
+  let lastEmittedToolOutput = false;
+
+  // Emit AI SDK message start
+  if (useAiSdk) {
+    writer.start(generateMessageId());
+    writer.startStep();
+  }
+
   try {
     const sess = getOrCreateSession(assistantName);
     await sess.send(prompt);
 
     for await (const msg of sess.stream()) {
+      // Check for cancel
+      if (cancelSignal?.cancelled) {
+        log('[cancel] Stream cancelled by user');
+        if (useAiSdk) {
+          writer.abort('User cancelled');
+          writer.done();
+        }
+        break;
+      }
+
       messageCount++;
       const msgType = msg.type === 'system' ? `system/${(msg as { subtype?: string }).subtype}` : msg.type;
       if (msgType !== 'stream_event') log(`[msg #${messageCount}] type=${msgType}`);
@@ -261,19 +293,43 @@ async function processMessageInner(params: MessageParams, onEvent?: (event: Stre
         if (event?.type === 'content_block_delta') {
           const delta = event.delta;
           if (delta?.type === 'text_delta' && delta.text) {
-            onEvent?.({ type: 'text', data: { content: delta.text } });
+            if (useAiSdk) {
+              // New step boundary if coming after a tool output
+              if (lastEmittedToolOutput) {
+                writer.emitStepBoundary();
+                lastEmittedToolOutput = false;
+              }
+              writer.textDelta(delta.text); // auto-opens text block on first call
+            } else {
+              onEvent?.({ type: 'text', data: { content: delta.text } });
+            }
           } else if (delta?.type === 'thinking_delta' && delta.thinking) {
-            onEvent?.({ type: 'thinking', data: { content: delta.thinking } });
+            if (useAiSdk) {
+              if (lastEmittedToolOutput) {
+                writer.emitStepBoundary();
+                lastEmittedToolOutput = false;
+              }
+              writer.reasoningDelta(delta.thinking); // auto-opens reasoning block
+            } else {
+              onEvent?.({ type: 'thinking', data: { content: delta.thinking } });
+            }
           } else if (delta?.type === 'input_json_delta') {
-            // tool input streaming — ignore, we emit tool_call_start on the complete message
+            // tool input streaming — ignore, we emit full input on the complete message
           }
         } else if (event?.type === 'content_block_start') {
           const block = event.content_block;
           if (block?.type === 'tool_use') {
-            onEvent?.({ type: 'tool_call_start', data: { id: block.id, name: block.name, input: {} } });
+            if (useAiSdk) {
+              writer.closeOpenBlocks(); // close text/reasoning before tool
+              writer.toolInputStart(block.id, block.name);
+            } else {
+              onEvent?.({ type: 'tool_call_start', data: { id: block.id, name: block.name, input: {} } });
+            }
           }
         } else if (event?.type === 'content_block_stop') {
-          // handled by complete assistant message below
+          if (useAiSdk) {
+            writer.closeOpenBlocks(); // close text-end / reasoning-end
+          }
         }
         continue;
       }
@@ -297,16 +353,46 @@ async function processMessageInner(params: MessageParams, onEvent?: (event: Stre
           for (const block of content) {
             if (block.type === 'text' && block.text) {
               activityPoster!.post('output', block.text);
-              if (!hadStreamEvents) onEvent?.({ type: 'text', data: { content: block.text } });
+              if (!hadStreamEvents) {
+                if (useAiSdk) {
+                  writer.textStart();
+                  writer.textDelta(block.text);
+                  writer.textEnd();
+                } else {
+                  onEvent?.({ type: 'text', data: { content: block.text } });
+                }
+              }
             } else if (block.type === 'tool_use') {
               activityPoster!.post('tool_use', `${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
-              // Emit full tool_call_start with complete input (stream_event only had empty input)
-              onEvent?.({ type: 'tool_call_start', data: { id: block.id, name: block.name, input: block.input } });
+              if (useAiSdk) {
+                // Emit full tool input (stream_event only had empty input via toolInputStart)
+                writer.toolInputAvailable(block.id, block.name, block.input);
+              } else {
+                onEvent?.({ type: 'tool_call_start', data: { id: block.id, name: block.name, input: block.input } });
+              }
             } else if (block.type === 'tool_result') {
-              onEvent?.({ type: 'tool_call_end', data: { id: block.tool_use_id, status: block.is_error ? 'error' : 'completed', result: typeof block.content === 'string' ? block.content : JSON.stringify(block.content) } });
+              if (useAiSdk) {
+                const resultContent = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+                if (block.is_error) {
+                  writer.toolOutputError(block.tool_use_id, resultContent);
+                } else {
+                  writer.toolOutputAvailable(block.tool_use_id, resultContent);
+                }
+                lastEmittedToolOutput = true;
+              } else {
+                onEvent?.({ type: 'tool_call_end', data: { id: block.tool_use_id, status: block.is_error ? 'error' : 'completed', result: typeof block.content === 'string' ? block.content : JSON.stringify(block.content) } });
+              }
             } else if (block.type === 'thinking' && block.thinking) {
               activityPoster!.post('thinking', block.thinking.slice(0, 500));
-              if (!hadStreamEvents) onEvent?.({ type: 'thinking', data: { content: block.thinking } });
+              if (!hadStreamEvents) {
+                if (useAiSdk) {
+                  writer.reasoningStart();
+                  writer.reasoningDelta(block.thinking);
+                  writer.reasoningEnd();
+                } else {
+                  onEvent?.({ type: 'thinking', data: { content: block.thinking } });
+                }
+              }
             }
           }
         }
@@ -366,16 +452,36 @@ async function processMessageInner(params: MessageParams, onEvent?: (event: Stre
 
           log(`[usage] ${inputTokens} in / ${outputTokens} out | context: ${contextPercentage}% of ${contextWindow}`);
           activityPoster!.post('status', `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, { usage: usageInfo });
-          onEvent?.({ type: 'context_usage', data: { promptTokens: inputTokens, completionTokens: outputTokens, model: MODEL, contextWindow, contextPercentage } });
+
+          if (useAiSdk) {
+            writer.messageMetadata({
+              usage: { promptTokens: inputTokens, completionTokens: outputTokens, cacheReadTokens: usageInfo.cacheReadTokens, cacheCreationTokens: usageInfo.cacheCreationTokens },
+              cost: { usd: usageInfo.totalCostUsd },
+              model: MODEL,
+              sessionId: currentSessionId,
+            });
+          } else {
+            onEvent?.({ type: 'context_usage', data: { promptTokens: inputTokens, completionTokens: outputTokens, model: MODEL, contextWindow, contextPercentage } });
+          }
         }
 
-        onEvent?.({ type: 'done', data: { result: textResult ?? '', sessionId: currentSessionId } });
+        if (useAiSdk) {
+          writer.finish('stop');
+          writer.done();
+        } else {
+          onEvent?.({ type: 'done', data: { result: textResult ?? '', sessionId: currentSessionId } });
+        }
       }
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
     activityPoster!.post('error', errorMessage);
+
+    if (useAiSdk) {
+      writer.error(errorMessage);
+      writer.done();
+    }
 
     // Session may have crashed — close and null it for recovery on next message
     if (session) {

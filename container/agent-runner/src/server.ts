@@ -11,11 +11,15 @@
 
 import http from 'http';
 import { processMessage, getStatus, getActivityMetrics, shutdown, type MessageParams, type StreamEvent } from './agent.js';
+import { UIStreamWriter, generateStreamId, isAiSdkEnabled } from './ui-stream.js';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const MAX_QUEUE_SIZE = parseInt(process.env.CLAW_MAX_QUEUE_SIZE || '50', 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || '600000', 10);
 const AUTH_TOKEN = process.env.CLAW_AUTH_TOKEN || process.env.GALLERY_GATEWAY_TOKEN || '';
+
+// Active SSE streams — keyed by streamId for cancel support
+const activeStreams = new Map<string, { cancelled: boolean }>();
 
 function log(message: string): void {
   console.error(`[claw-server] ${message}`);
@@ -201,10 +205,40 @@ async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse
   };
 
   const wantSSE = (req.headers['accept'] || '').includes('text/event-stream');
-  log(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE})`);
+  const useAiSdk = isAiSdkEnabled();
+  log(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE}, aisdk: ${useAiSdk})`);
 
-  if (wantSSE) {
-    // SSE streaming mode — stream events as they arrive
+  if (wantSSE && useAiSdk) {
+    // ─── AI SDK UI Message Stream Protocol v1 ──────
+    const writer = new UIStreamWriter(res);
+    const streamId = generateStreamId();
+    const streamState = { cancelled: false };
+    activeStreams.set(streamId, streamState);
+
+    // Emit stream ID so frontend can cancel
+    writer.galleryStreamId(streamId);
+
+    try {
+      const result = await processMessage(params, undefined, writer, streamState);
+      markReady();
+      // writer.finish() + writer.done() are called inside processMessage when it sees 'result'
+      // If processMessage returned without emitting done (edge case), ensure stream ends
+      if (!writer.isEnded && !res.destroyed) {
+        writer.finish('stop');
+        writer.done();
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log(`Error processing message (AI SDK): ${errMsg}`);
+      if (!writer.isEnded && !res.destroyed) {
+        writer.error(errMsg);
+        writer.done();
+      }
+    } finally {
+      activeStreams.delete(streamId);
+    }
+  } else if (wantSSE) {
+    // ─── Legacy SSE format ──────────────────────────
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -220,7 +254,6 @@ async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse
     try {
       const result = await processMessage(params, onEvent);
       markReady();
-      // Send final result as a JSON event for clients that want the full response
       if (!res.destroyed) {
         res.write(`data: ${JSON.stringify({ type: 'result', data: result })}\n\n`);
         res.write('data: [DONE]\n\n');
@@ -236,7 +269,7 @@ async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse
       }
     }
   } else {
-    // JSON mode — queue and wait for full result
+    // ─── JSON mode — queue and wait for full result ─
     try {
       const result = await enqueueMessage(params);
       markReady();
@@ -252,6 +285,30 @@ async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse
       });
     }
   }
+}
+
+// ─── Stream Cancel ──────────────────────────────────────
+
+function handleCancel(req: http.IncomingMessage, res: http.ServerResponse): void {
+  const url = req.url || '';
+  const match = url.match(/^\/message\/(stream_[a-f0-9]+)$/);
+  if (!match) {
+    sendJson(res, 400, { error: 'Invalid stream ID format' });
+    return;
+  }
+
+  const streamId = match[1];
+  const stream = activeStreams.get(streamId);
+  if (!stream) {
+    sendJson(res, 404, { error: 'Stream not found or already completed' });
+    return;
+  }
+
+  stream.cancelled = true;
+  activeStreams.delete(streamId);
+  log(`Stream ${streamId} cancelled`);
+  res.writeHead(204);
+  res.end();
 }
 
 async function handleTask(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -348,6 +405,9 @@ const server = http.createServer(async (req, res) => {
     if (method === 'POST' && url === '/message') {
       if (!requireAuth(req, res)) return;
       await handleMessage(req, res);
+    } else if (method === 'DELETE' && url.startsWith('/message/')) {
+      if (!requireAuth(req, res)) return;
+      handleCancel(req, res);
     } else if (method === 'POST' && url === '/task') {
       if (!requireAuth(req, res)) return;
       await handleTask(req, res);
