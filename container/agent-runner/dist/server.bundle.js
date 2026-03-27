@@ -7538,6 +7538,62 @@ var cX = class {
     });
   }
 };
+var UI = 5e3;
+var yz = class {
+  closed = false;
+  inputStream;
+  query;
+  queryIterator = null;
+  abortController;
+  _sessionId = null;
+  get sessionId() {
+    if (this._sessionId === null) throw Error("Session ID not available until after receiving messages");
+    return this._sessionId;
+  }
+  constructor($) {
+    if ($.resume) this._sessionId = $.resume;
+    this.inputStream = new H1();
+    let X = $.pathToClaudeCodeExecutable;
+    if (!X) {
+      let Y = GI(import.meta.url), z = bK(Y, "..");
+      X = bK(z, "cli.js");
+    }
+    let J = { ...$.env ?? process.env };
+    if (!J.CLAUDE_CODE_ENTRYPOINT) J.CLAUDE_CODE_ENTRYPOINT = "sdk-ts";
+    this.abortController = g1();
+    let Q = new lX({ abortController: this.abortController, pathToClaudeCodeExecutable: X, env: J, executable: $.executable ?? (f1() ? "bun" : "node"), executableArgs: $.executableArgs ?? [], extraArgs: {}, thinkingConfig: void 0, maxTurns: void 0, maxBudgetUsd: void 0, model: $.model, fallbackModel: void 0, permissionMode: $.permissionMode ?? "default", allowDangerouslySkipPermissions: false, continueConversation: false, resume: $.resume, settingSources: [], allowedTools: $.allowedTools ?? [], disallowedTools: $.disallowedTools ?? [], mcpServers: {}, strictMcpConfig: false, canUseTool: !!$.canUseTool, hooks: !!$.hooks, includePartialMessages: false, forkSession: false, resumeSessionAt: void 0 });
+    this.query = new cX(Q, false, $.canUseTool, $.hooks, this.abortController, /* @__PURE__ */ new Map()), this.query.streamInput(this.inputStream);
+  }
+  async send($) {
+    if (this.closed) throw Error("Cannot send to closed session");
+    let X = typeof $ === "string" ? { type: "user", session_id: "", message: { role: "user", content: [{ type: "text", text: $ }] }, parent_tool_use_id: null } : $;
+    this.inputStream.enqueue(X);
+  }
+  async *stream() {
+    if (!this.queryIterator) this.queryIterator = this.query[Symbol.asyncIterator]();
+    while (true) {
+      let { value: $, done: X } = await this.queryIterator.next();
+      if (X) return;
+      if ($.type === "system" && $.subtype === "init") this._sessionId = $.session_id;
+      if (yield $, $.type === "result") return;
+    }
+  }
+  close() {
+    if (this.closed) return;
+    this.closed = true, this.inputStream.done(), setTimeout(() => {
+      if (!this.abortController.signal.aborted) this.abortController.abort();
+    }, UI).unref();
+  }
+  async [Symbol.asyncDispose]() {
+    this.close();
+  }
+};
+function gz($) {
+  return new yz($);
+}
+function PK($, X) {
+  return new yz({ ...X, resume: $ });
+}
 var NI = KI(HI);
 var ZJ = Buffer.from('{"type":"attribution-snapshot"');
 var II = Buffer.from('{"type":"system"');
@@ -15086,44 +15142,11 @@ function rD($) {
   return () => X ??= $();
 }
 var jx = rD(() => h4.object({ session_id: h4.string(), ws_url: h4.string(), work_dir: h4.string().optional(), session_key: h4.string().optional() }));
-function Aa({ prompt: $, options: X }) {
-  let { systemPrompt: J, settings: Q, settingSources: Y, sandbox: z, ...W } = X ?? {}, G, U;
-  if (J === void 0) G = "";
-  else if (typeof J === "string") G = J;
-  else if (J.type === "preset") U = J.append;
-  let H = W.pathToClaudeCodeExecutable;
-  if (!H) {
-    let T1 = Mx(import.meta.url), y1 = sD(T1, "..");
-    H = sD(y1, "cli.js");
-  }
-  process.env.CLAUDE_AGENT_SDK_VERSION = "0.2.84";
-  let { abortController: K = g1(), additionalDirectories: V = [], agent: O, agents: N, allowedTools: w = [], betas: B, canUseTool: L, continue: j, cwd: M, debug: b, debugFile: x, disallowedTools: h = [], tools: B$, env: x$, executable: Q6 = f1() ? "bun" : "node", executableArgs: r6 = [], extraArgs: g6 = {}, fallbackModel: t4, enableFileCheckpointing: k1, toolConfig: o6, forkSession: r0, hooks: p, includePartialMessages: p9, onElicitation: t7, persistSession: o0, thinking: a4, effort: t0, maxThinkingTokens: _1, maxTurns: n9, maxBudgetUsd: i$, taskBudget: L4, mcpServers: x1, model: eD, outputFormat: RU, permissionMode: $L = "default", allowDangerouslySkipPermissions: XL = false, permissionPromptToolName: JL, plugins: YL, workload: SU, resume: QL, resumeSessionAt: zL, sessionId: WL, stderr: GL, strictMcpConfig: UL } = W, vU = RU?.type === "json_schema" ? RU.schema : void 0, s4 = x$;
-  if (!s4) s4 = { ...process.env };
-  if (!s4.CLAUDE_CODE_ENTRYPOINT) s4.CLAUDE_CODE_ENTRYPOINT = "sdk-ts";
-  if (k1) s4.CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING = "true";
-  if (o6?.askUserQuestion?.previewFormat) s4.CLAUDE_CODE_QUESTION_PREVIEW_FORMAT = o6.askUserQuestion.previewFormat;
-  if (!H) throw Error("pathToClaudeCodeExecutable is required");
-  let a7 = {}, CU = /* @__PURE__ */ new Map();
-  if (x1) for (let [T1, y1] of Object.entries(x1)) if (y1.type === "sdk" && "instance" in y1) CU.set(T1, y1.instance), a7[T1] = { type: "sdk", name: T1 };
-  else a7[T1] = y1;
-  let HL = typeof $ === "string", a0;
-  if (a4) switch (a4.type) {
-    case "adaptive":
-      a0 = { type: "adaptive" };
-      break;
-    case "enabled":
-      a0 = { type: "enabled", budgetTokens: a4.budgetTokens };
-      break;
-    case "disabled":
-      a0 = { type: "disabled" };
-      break;
-  }
-  else if (_1 !== void 0) a0 = _1 === 0 ? { type: "disabled" } : { type: "enabled", budgetTokens: _1 };
-  let kU = new lX({ abortController: K, additionalDirectories: V, agent: O, betas: B, cwd: M, debug: b, debugFile: x, executable: Q6, executableArgs: r6, extraArgs: SU ? { ...g6, workload: SU } : g6, pathToClaudeCodeExecutable: H, env: s4, forkSession: r0, stderr: GL, thinkingConfig: a0, effort: t0, maxTurns: n9, maxBudgetUsd: i$, taskBudget: L4, model: eD, fallbackModel: t4, jsonSchema: vU, permissionMode: $L, allowDangerouslySkipPermissions: XL, permissionPromptToolName: JL, continueConversation: j, resume: QL, resumeSessionAt: zL, sessionId: WL, settings: typeof Q === "object" ? q$(Q) : Q, settingSources: Y ?? [], allowedTools: w, disallowedTools: h, tools: B$, mcpServers: a7, strictMcpConfig: UL, canUseTool: !!L, hooks: !!p, includePartialMessages: p9, persistSession: o0, plugins: YL, sandbox: z, spawnClaudeCodeProcess: W.spawnClaudeCodeProcess }), KL = { systemPrompt: G, appendSystemPrompt: U, agents: N, promptSuggestions: W.promptSuggestions, agentProgressSummaries: W.agentProgressSummaries }, _U = new cX(kU, HL, L, p, K, CU, vU, KL, t7);
-  if (typeof $ === "string") kU.write(q$({ type: "user", session_id: "", message: { role: "user", content: [{ type: "text", text: $ }] }, parent_tool_use_id: null }) + `
-`);
-  else _U.streamInput($);
-  return _U;
+function ba($) {
+  return gz($);
+}
+function Pa($, X) {
+  return PK($, X);
 }
 
 // src/agent.ts
@@ -15526,7 +15549,8 @@ var ActivityPoster = class _ActivityPoster {
 // src/agent.ts
 var WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || "/home/sprite/workspace";
 var SESSION_ID_FILE = path2.join(WORKSPACE_DIR, ".current-session-id");
-var RESUME_AT_FILE = path2.join(WORKSPACE_DIR, ".resume-at");
+var MCP_CONFIG_FILE = path2.join(WORKSPACE_DIR, ".mcp.json");
+var MODEL = process.env.CLAW_MODEL || "claude-opus-4-6";
 function log(message) {
   console.error(`[claw] ${message}`);
 }
@@ -15556,50 +15580,27 @@ function persistSessionId(sessionId) {
   } catch {
   }
 }
-function getPersistedResumeAt() {
+function getDynamicMcpToolPatterns() {
   try {
-    if (fs2.existsSync(RESUME_AT_FILE)) {
-      return fs2.readFileSync(RESUME_AT_FILE, "utf-8").trim() || void 0;
+    if (!fs2.existsSync(MCP_CONFIG_FILE)) return [];
+    const config = JSON.parse(fs2.readFileSync(MCP_CONFIG_FILE, "utf-8"));
+    const servers = config.mcpServers || {};
+    const names = Object.keys(servers);
+    if (names.length > 0) {
+      log(`[mcp] Found ${names.length} customer MCP servers: ${names.join(", ")}`);
     }
+    return names.map((name) => `mcp__${name}__*`);
   } catch {
-  }
-  return void 0;
-}
-function persistResumeAt(resumeAt) {
-  try {
-    fs2.writeFileSync(RESUME_AT_FILE, resumeAt);
-  } catch {
+    return [];
   }
 }
-function loadDynamicMcpServers() {
-  const configPath = path2.join(WORKSPACE_DIR, ".mcp-servers.json");
-  const servers = {};
-  try {
-    if (!fs2.existsSync(configPath)) return servers;
-    const raw = fs2.readFileSync(configPath, "utf-8");
-    const configs = JSON.parse(raw);
-    for (const cfg of configs) {
-      if (!cfg.name || !cfg.url) continue;
-      servers[cfg.name] = {
-        type: "http",
-        url: cfg.url,
-        ...cfg.authHeader ? { headers: { Authorization: cfg.authHeader } } : {}
-      };
-    }
-    if (Object.keys(servers).length > 0) {
-      log(`[mcp] Loaded ${Object.keys(servers).length} dynamic MCP servers: ${Object.keys(servers).join(", ")}`);
-    }
-  } catch (err) {
-    log(`[mcp] Failed to load .mcp-servers.json (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return servers;
-}
+var session = null;
 var activityPoster = null;
-var lastResumeAt = getPersistedResumeAt();
-async function processMessage(params, onEvent) {
-  const { message, isScheduledTask, assistantName } = params;
-  let sessionId = getPersistedSessionId();
-  const agentId = process.env.AGENT_ID || assistantName || "unknown";
+var loopTracker = new ToolCallTracker();
+var contextTracker = new ContextWindowTracker();
+contextTracker.contextWindow = getDefaultContextWindow(MODEL);
+var messageLock = Promise.resolve();
+function ensureActivityPoster(agentId) {
   if (!activityPoster) {
     activityPoster = new ActivityPoster(
       process.env.GALLERY_CONVEX_URL || null,
@@ -15608,12 +15609,72 @@ async function processMessage(params, onEvent) {
     );
     log("[activity] Gallery activity posting enabled");
   }
-  activityPoster.post("status", "Processing message");
+  return activityPoster;
+}
+function buildSessionOptions(assistantName) {
   const __dirname = path2.dirname(fileURLToPath(import.meta.url));
-  const mcpBundlePath = path2.join(__dirname, "mcp-tools.bundle.js");
-  const mcpTscPath = path2.join(__dirname, "mcp-tools.js");
-  const mcpToolsPath = fs2.existsSync(mcpBundlePath) ? mcpBundlePath : mcpTscPath;
+  return {
+    model: MODEL,
+    pathToClaudeCodeExecutable: path2.join(__dirname, "cli.js"),
+    env: { ...process.env },
+    allowedTools: [
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "WebSearch",
+      "WebFetch",
+      "Task",
+      "TaskOutput",
+      "TaskStop",
+      "NotebookEdit",
+      ...getDynamicMcpToolPatterns()
+    ],
+    permissionMode: "acceptEdits",
+    hooks: {
+      PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
+      PreToolUse: [
+        { matcher: "Bash", hooks: [createSanitizeBashHook()] },
+        { hooks: [createLoopDetectionHook(loopTracker, log)] },
+        { hooks: [createContextSafetyHook(contextTracker, activityPoster, log)] }
+      ]
+    }
+  };
+}
+function getOrCreateSession(assistantName) {
+  if (session) return session;
   fs2.mkdirSync(WORKSPACE_DIR, { recursive: true });
+  const persistedId = getPersistedSessionId();
+  const options = buildSessionOptions(assistantName);
+  if (persistedId) {
+    log(`Resuming V2 session: ${persistedId}`);
+    session = Pa(persistedId, options);
+  } else {
+    log("Creating new V2 session");
+    session = ba(options);
+  }
+  return session;
+}
+async function processMessage(params, onEvent) {
+  const prevLock = messageLock;
+  let releaseLock;
+  messageLock = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
+  await prevLock;
+  try {
+    return await processMessageInner(params, onEvent);
+  } finally {
+    releaseLock();
+  }
+}
+async function processMessageInner(params, onEvent) {
+  const { message, isScheduledTask, assistantName } = params;
+  const agentId = process.env.AGENT_ID || assistantName || "unknown";
+  ensureActivityPoster(agentId);
+  activityPoster.post("status", "Processing message");
   const tz2 = process.env.AGENT_TIMEZONE || "UTC";
   const localTime = (/* @__PURE__ */ new Date()).toLocaleString("en-US", {
     timeZone: tz2,
@@ -15634,106 +15695,18 @@ async function processMessage(params, onEvent) {
 `;
   }
   prompt += message;
-  const sdkEnv = { ...process.env };
-  const loopTracker = new ToolCallTracker();
-  const contextTracker = new ContextWindowTracker();
-  const model = process.env.CLAW_MODEL || "claude-opus-4-6";
-  const isClaude = model.includes("claude") || model.startsWith("anthropic/");
-  contextTracker.contextWindow = getDefaultContextWindow(model);
-  let newSessionId;
-  let lastAssistantUuid;
+  let currentSessionId = getPersistedSessionId() || "";
   const resultTexts = [];
   let messageCount = 0;
   let usageInfo;
-  const dynamicMcpServers = loadDynamicMcpServers();
-  const dynamicToolPatterns = Object.keys(dynamicMcpServers).map((name) => `mcp__${name}__*`);
   try {
-    for await (const msg of Aa({
-      prompt,
-      options: {
-        pathToClaudeCodeExecutable: path2.join(path2.dirname(fileURLToPath(import.meta.url)), "cli.js"),
-        stderr: (data) => {
-          console.error(`[cli-stderr] ${data}`);
-        },
-        cwd: WORKSPACE_DIR,
-        model: process.env.CLAW_MODEL || "claude-opus-4-6",
-        // thinking + effort are Claude-only — omit for non-Claude models
-        ...isClaude ? {
-          thinking: { type: "adaptive" },
-          effort: process.env.CLAW_EFFORT || "high"
-        } : {},
-        maxTurns: parseInt(process.env.CLAW_MAX_TURNS || "50", 10),
-        bare: true,
-        resume: sessionId,
-        resumeSessionAt: lastResumeAt,
-        allowedTools: [
-          "Bash",
-          "Read",
-          "Write",
-          "Edit",
-          "Glob",
-          "Grep",
-          "WebSearch",
-          "WebFetch",
-          "Task",
-          "TaskOutput",
-          "TaskStop",
-          "TeamCreate",
-          "TeamDelete",
-          "SendMessage",
-          "TodoWrite",
-          "ToolSearch",
-          "Skill",
-          "NotebookEdit",
-          "mcp__claw__*",
-          "mcp__gallery__*",
-          ...dynamicToolPatterns
-        ],
-        env: sdkEnv,
-        permissionMode: "acceptEdits",
-        settingSources: ["project", "user"],
-        mcpServers: {
-          claw: {
-            command: "node",
-            args: [mcpToolsPath],
-            env: {
-              GALLERY_API_URL: process.env.GALLERY_API_URL || "",
-              GALLERY_WORKER_URL: process.env.GALLERY_WORKER_URL || "",
-              GALLERY_TOKEN: process.env.GALLERY_TOKEN || "",
-              AGENT_ID: process.env.AGENT_ID || "",
-              ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || "",
-              ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",
-              CLAW_WORKSPACE_DIR: process.env.CLAW_WORKSPACE_DIR || "/home/sprite/workspace",
-              GALLERY_CONVEX_URL: process.env.GALLERY_CONVEX_URL || "",
-              GALLERY_GATEWAY_TOKEN: process.env.GALLERY_GATEWAY_TOKEN || process.env.GALLERY_TOKEN || ""
-            }
-          },
-          ...process.env.GALLERY_MCP_URL && process.env.GALLERY_TOKEN ? {
-            gallery: {
-              type: "http",
-              url: process.env.GALLERY_MCP_URL,
-              headers: { Authorization: `Bearer ${process.env.GALLERY_TOKEN}` }
-            }
-          } : {},
-          ...dynamicMcpServers
-        },
-        hooks: {
-          PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
-          PreToolUse: [
-            { matcher: "Bash", hooks: [createSanitizeBashHook()] },
-            { hooks: [createLoopDetectionHook(loopTracker, log)] },
-            { hooks: [createContextSafetyHook(contextTracker, activityPoster, log)] }
-          ]
-        }
-      }
-    })) {
+    const sess = getOrCreateSession(assistantName);
+    await sess.send(prompt);
+    for await (const msg of sess.stream()) {
       messageCount++;
       const msgType = msg.type === "system" ? `system/${msg.subtype}` : msg.type;
       log(`[msg #${messageCount}] type=${msgType}`);
-      if (msg.type === "assistant" && "uuid" in msg) {
-        lastAssistantUuid = msg.uuid;
-        lastResumeAt = lastAssistantUuid;
-        persistResumeAt(lastAssistantUuid);
+      if (msg.type === "assistant") {
         const msgUsage = msg.message?.usage;
         if (msgUsage) {
           contextTracker.update(
@@ -15760,10 +15733,10 @@ async function processMessage(params, onEvent) {
         }
       }
       if (msg.type === "system" && msg.subtype === "init") {
-        newSessionId = msg.session_id;
-        log(`Session initialized: ${newSessionId}`);
-        activityPoster.post("status", `Session initialized: ${newSessionId}`);
-        persistSessionId(newSessionId);
+        currentSessionId = msg.session_id;
+        log(`Session initialized: ${currentSessionId}`);
+        activityPoster.post("status", `Session initialized: ${currentSessionId}`);
+        persistSessionId(currentSessionId);
       }
       if (msg.type === "system" && msg.subtype === "task_notification") {
         const tn = msg;
@@ -15795,28 +15768,40 @@ async function processMessage(params, onEvent) {
             contextPercentage
           };
           log(`[usage] ${inputTokens} in / ${outputTokens} out | context: ${contextPercentage}% of ${contextWindow}`);
-          activityPoster.post("status", `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, {
-            usage: usageInfo
-          });
-          onEvent?.({ type: "context_usage", data: { promptTokens: inputTokens, completionTokens: outputTokens, model, contextWindow, contextPercentage } });
+          activityPoster.post("status", `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, { usage: usageInfo });
+          onEvent?.({ type: "context_usage", data: { promptTokens: inputTokens, completionTokens: outputTokens, model: MODEL, contextWindow, contextPercentage } });
         }
-        onEvent?.({ type: "done", data: { result: textResult ?? "", sessionId: newSessionId || sessionId || "" } });
+        onEvent?.({ type: "done", data: { result: textResult ?? "", sessionId: currentSessionId } });
       }
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
     activityPoster.post("error", errorMessage);
+    if (session) {
+      try {
+        session.close();
+      } catch {
+      }
+      session = null;
+      log("Session closed due to error \u2014 will recreate on next message");
+    }
     return {
       status: "error",
       result: null,
-      sessionId: sessionId || "",
+      sessionId: currentSessionId,
       error: errorMessage
     };
   }
-  const finalSessionId = newSessionId || sessionId || "";
+  if (!currentSessionId && session) {
+    try {
+      currentSessionId = session.sessionId;
+      persistSessionId(currentSessionId);
+    } catch {
+    }
+  }
   const resultText = resultTexts.length > 0 ? resultTexts.join("\n\n") : null;
-  log(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${finalSessionId}`);
+  log(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${currentSessionId}`);
   activityPoster.post("status", "Message processed");
   if (resultText && process.env.CLAW_AUTO_MEMORY !== "false") {
     extractMemory(message, resultText).catch(() => {
@@ -15825,7 +15810,7 @@ async function processMessage(params, onEvent) {
   return {
     status: "success",
     result: resultText,
-    sessionId: finalSessionId,
+    sessionId: currentSessionId,
     usage: usageInfo
   };
 }
@@ -15893,6 +15878,13 @@ ${text}
   }
 }
 async function shutdown() {
+  if (session) {
+    try {
+      session.close();
+    } catch {
+    }
+    session = null;
+  }
   if (activityPoster) {
     activityPoster.post("status", "Sprite shutting down");
     await activityPoster.stop();
@@ -16033,7 +16025,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-26T22:46:47.532Z" : "";
+var buildTime = true ? "2026-03-27T02:35:46.249Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
@@ -16181,6 +16173,15 @@ function handleStatus(_req, res) {
     queueLength: requestQueue.length,
     processing
   });
+}
+var WORKSPACE_DIR2 = process.env.CLAW_WORKSPACE_DIR || "/home/sprite/workspace";
+try {
+  const fs3 = await import("fs");
+  fs3.mkdirSync(WORKSPACE_DIR2, { recursive: true });
+  process.chdir(WORKSPACE_DIR2);
+  log2(`Working directory set to ${WORKSPACE_DIR2}`);
+} catch (err) {
+  log2(`Warning: Could not chdir to ${WORKSPACE_DIR2}: ${err instanceof Error ? err.message : String(err)}`);
 }
 var server = http.createServer(async (req, res) => {
   const method = req.method || "GET";

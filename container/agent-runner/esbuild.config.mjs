@@ -3,7 +3,7 @@
  *
  * Produces two bundles in dist/:
  *   server.bundle.js    — main HTTP service (server.ts + agent.ts)
- *   mcp-tools.bundle.js — MCP stdio server (spawned as child process by SDK)
+ *   gallery-cli.bundle.js — Gallery CLI tools (agent calls via Bash)
  *
  * All npm dependencies are inlined. No node_modules needed on the sprite.
  * Node built-ins (fs, path, http, etc.) are kept as external imports.
@@ -54,11 +54,11 @@ async function run() {
     outdir: undefined,
   });
 
-  // Bundle 2: MCP tools (separate process, spawned by claude-agent-sdk)
+  // Bundle 2: Gallery CLI (replaces MCP tools — agent calls via Bash)
   await build({
     ...shared,
-    entryPoints: ['src/mcp-tools.ts'],
-    outfile: 'dist/mcp-tools.bundle.js',
+    entryPoints: ['src/gallery-cli.ts'],
+    outfile: 'dist/gallery-cli.bundle.js',
     outdir: undefined,
   });
 
@@ -69,7 +69,7 @@ async function run() {
   mkdirSync('dist', { recursive: true });
   copyFileSync(sdkCliPath, 'dist/cli.js');
 
-  console.log('✓ Bundled server.bundle.js + mcp-tools.bundle.js + cli.js');
+  console.log('✓ Bundled server.bundle.js + gallery-cli.bundle.js + cli.js');
 }
 
 run().catch((err) => {

@@ -328,6 +328,18 @@ function handleStatus(_req: http.IncomingMessage, res: http.ServerResponse): voi
 
 // ─── Server ──────────────────────────────────────────────
 
+// Set working directory so V2 session inherits correct cwd
+// (V2 SDKSessionOptions doesn't have a cwd option — it uses process.cwd())
+const WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace';
+try {
+  const fs = await import('fs');
+  fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+  process.chdir(WORKSPACE_DIR);
+  log(`Working directory set to ${WORKSPACE_DIR}`);
+} catch (err) {
+  log(`Warning: Could not chdir to ${WORKSPACE_DIR}: ${err instanceof Error ? err.message : String(err)}`);
+}
+
 const server = http.createServer(async (req, res) => {
   const method = req.method || 'GET';
   const url = req.url || '/';

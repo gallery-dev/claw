@@ -1,21 +1,17 @@
 /**
- * Claw Agent — Core query logic for Sprites
- * Extracted from index.ts, adapted for HTTP service model.
+ * Claw Agent — V2 Session-based query logic for Sprites
  *
- * Differences from Docker (index.ts):
- * - No stdin/stdout protocol — called directly via processMessage()
- * - No IPC file polling — each HTTP request is one message
- * - Secrets from process.env, not stdin
- * - Working directory: /home/sprite/workspace (not /workspace/group)
+ * Uses persistent V2 sessions (send/stream) instead of spawning a new CLI
+ * subprocess per message via query(). This eliminates ~10-15s of subprocess
+ * spawn + session replay overhead, reducing response time from 14-20s to 2-5s.
  *
  * Required environment variables (set during sprite provisioning):
  *   ANTHROPIC_BASE_URL     — Gallery AI proxy URL (e.g., https://gallery.dev/api/ai)
  *   ANTHROPIC_API_KEY      — Workspace gateway token (= GALLERY_GATEWAY_TOKEN)
  *   GALLERY_GATEWAY_TOKEN  — Auth token for Gallery API (activity posting, auth)
  *   GALLERY_CONVEX_URL     — Convex deployment URL (activity posting)
- *   GALLERY_MCP_URL        — Gallery MCP server URL
- *   GALLERY_TOKEN          — Gallery MCP auth token
- *   GALLERY_API_URL        — Gallery API base URL (for claw MCP tools)
+ *   GALLERY_TOKEN          — Gallery auth token
+ *   GALLERY_API_URL        — Gallery API base URL (for gallery CLI tools)
  *   AGENT_ID               — This agent's Convex document ID
  *
  * Note: Claude API calls go through Gallery's AI proxy (/api/ai) for billing.
@@ -24,7 +20,11 @@
 
 import fs from 'fs';
 import path from 'path';
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import {
+  unstable_v2_createSession,
+  unstable_v2_resumeSession,
+} from '@anthropic-ai/claude-agent-sdk';
+import type { SDKSession, SDKSessionOptions } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import {
   ToolCallTracker,
@@ -40,30 +40,26 @@ import {
 
 const WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace';
 const SESSION_ID_FILE = path.join(WORKSPACE_DIR, '.current-session-id');
-const RESUME_AT_FILE = path.join(WORKSPACE_DIR, '.resume-at');
+const MCP_CONFIG_FILE = path.join(WORKSPACE_DIR, '.mcp.json');
+const MODEL = process.env.CLAW_MODEL || 'claude-opus-4-6';
 
 function log(message: string): void {
   console.error(`[claw] ${message}`);
 }
 
-/** Default context window sizes by model family. Refined at runtime from modelUsage. */
+/** Default context window sizes by model family. */
 function getDefaultContextWindow(model: string): number {
   const m = model.toLowerCase();
-  // Anthropic — Opus 4.6 and Sonnet 4.6 have 1M context (GA), older models 200k
   if (m.includes('opus-4-6') || m.includes('opus-4.6') || m.includes('sonnet-4-6') || m.includes('sonnet-4.6')) return 1_000_000;
   if (m.includes('claude') || m.startsWith('anthropic/')) return 200_000;
-  // OpenAI
   if (m.includes('gpt-5')) return 256_000;
   if (m.includes('gpt-4')) return 128_000;
-  // Google
   if (m.includes('gemini-3') || m.includes('gemini-2.5')) return 1_000_000;
-  // DeepSeek
   if (m.includes('deepseek')) return 128_000;
-  // Safe default
   return 128_000;
 }
 
-// ─── Session Management ──────────────────────────────────
+// ─── Session Persistence ─────────────────────────────────
 
 function getPersistedSessionId(): string | undefined {
   try {
@@ -81,22 +77,25 @@ function persistSessionId(sessionId: string): void {
   } catch { /* non-fatal */ }
 }
 
-function getPersistedResumeAt(): string | undefined {
+/**
+ * Read .mcp.json to get customer MCP server names for allowedTools patterns.
+ * The SDK auto-loads .mcp.json from cwd for server configuration;
+ * we just need the names to add mcp__<name>__* to allowedTools.
+ */
+function getDynamicMcpToolPatterns(): string[] {
   try {
-    if (fs.existsSync(RESUME_AT_FILE)) {
-      return fs.readFileSync(RESUME_AT_FILE, 'utf-8').trim() || undefined;
+    if (!fs.existsSync(MCP_CONFIG_FILE)) return [];
+    const config = JSON.parse(fs.readFileSync(MCP_CONFIG_FILE, 'utf-8'));
+    const servers = config.mcpServers || {};
+    const names = Object.keys(servers);
+    if (names.length > 0) {
+      log(`[mcp] Found ${names.length} customer MCP servers: ${names.join(', ')}`);
     }
-  } catch { /* ignore */ }
-  return undefined;
+    return names.map(name => `mcp__${name}__*`);
+  } catch { return []; }
 }
 
-function persistResumeAt(resumeAt: string): void {
-  try {
-    fs.writeFileSync(RESUME_AT_FILE, resumeAt);
-  } catch { /* non-fatal */ }
-}
-
-// ─── Core Query Execution ────────────────────────────────
+// ─── Public Interfaces ───────────────────────────────────
 
 export interface MessageParams {
   message: string;
@@ -113,9 +112,7 @@ export interface UsageInfo {
   totalCostUsd: number;
   numTurns: number;
   durationMs: number;
-  /** Context window size for the model used */
   contextWindow: number;
-  /** Approximate percentage of context window used: (input + output) / contextWindow */
   contextPercentage: number;
 }
 
@@ -133,62 +130,22 @@ export interface StreamEvent {
   data: Record<string, unknown>;
 }
 
-// ─── Dynamic MCP Server Loading ──────────────────────────
+// ─── Persistent State ────────────────────────────────────
+// These survive across HTTP requests (sprite stays alive between requests).
+// On sleep/wake the process restarts — session resumes from disk via sessionId.
 
-interface McpServerConfig {
-  name: string;
-  url: string;
-  authHeader?: string;
-}
-
-/**
- * Load customer-provided MCP servers from .mcp-servers.json.
- * Written by Gallery during provisioning (from Convex mcpServers table).
- * Returns SDK-compatible mcpServers entries keyed by name.
- */
-function loadDynamicMcpServers(): Record<string, { type: 'http'; url: string; headers?: Record<string, string> }> {
-  const configPath = path.join(WORKSPACE_DIR, '.mcp-servers.json');
-  const servers: Record<string, { type: 'http'; url: string; headers?: Record<string, string> }> = {};
-
-  try {
-    if (!fs.existsSync(configPath)) return servers;
-    const raw = fs.readFileSync(configPath, 'utf-8');
-    const configs: McpServerConfig[] = JSON.parse(raw);
-
-    for (const cfg of configs) {
-      if (!cfg.name || !cfg.url) continue;
-      servers[cfg.name] = {
-        type: 'http' as const,
-        url: cfg.url,
-        ...(cfg.authHeader ? { headers: { Authorization: cfg.authHeader } } : {}),
-      };
-    }
-
-    if (Object.keys(servers).length > 0) {
-      log(`[mcp] Loaded ${Object.keys(servers).length} dynamic MCP servers: ${Object.keys(servers).join(', ')}`);
-    }
-  } catch (err) {
-    log(`[mcp] Failed to load .mcp-servers.json (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  return servers;
-}
-
-// Persistent state across requests (sprite stays alive between requests)
-// On sleep/wake, the process restarts — read from disk to survive hibernation
+let session: SDKSession | null = null;
 let activityPoster: ActivityPoster | null = null;
-let lastResumeAt: string | undefined = getPersistedResumeAt();
+const loopTracker = new ToolCallTracker();
+const contextTracker = new ContextWindowTracker();
+contextTracker.contextWindow = getDefaultContextWindow(MODEL);
 
-export async function processMessage(params: MessageParams, onEvent?: (event: StreamEvent) => void): Promise<MessageResult> {
-  const { message, isScheduledTask, assistantName } = params;
+// Serialize access to the V2 session (one send/stream cycle at a time)
+let messageLock: Promise<void> = Promise.resolve();
 
-  // Use persisted SDK session ID (UUID) for resume — NOT the conversation ID from params.
-  // params.sessionId is a Convex conversation ID (e.g. "chat_xxx") which is NOT a valid
-  // SDK session ID. The SDK generates its own UUID on the first call.
-  let sessionId = getPersistedSessionId();
+// ─── Session Lifecycle ───────────────────────────────────
 
-  // Initialize activity poster on first call
-  const agentId = process.env.AGENT_ID || assistantName || 'unknown';
+function ensureActivityPoster(agentId: string): ActivityPoster {
   if (!activityPoster) {
     activityPoster = new ActivityPoster(
       process.env.GALLERY_CONVEX_URL || null,
@@ -197,16 +154,76 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
     );
     log('[activity] Gallery activity posting enabled');
   }
-  activityPoster.post('status', 'Processing message');
+  return activityPoster;
+}
 
+function buildSessionOptions(assistantName?: string): SDKSessionOptions {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  // Try bundled file first, fall back to tsc output
-  const mcpBundlePath = path.join(__dirname, 'mcp-tools.bundle.js');
-  const mcpTscPath = path.join(__dirname, 'mcp-tools.js');
-  const mcpToolsPath = fs.existsSync(mcpBundlePath) ? mcpBundlePath : mcpTscPath;
+  return {
+    model: MODEL,
+    pathToClaudeCodeExecutable: path.join(__dirname, 'cli.js'),
+    env: { ...process.env },
+    allowedTools: [
+      'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+      'WebSearch', 'WebFetch',
+      'Task', 'TaskOutput', 'TaskStop',
+      'NotebookEdit',
+      ...getDynamicMcpToolPatterns(),
+    ],
+    permissionMode: 'acceptEdits',
+    hooks: {
+      PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
+      PreToolUse: [
+        { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
+        { hooks: [createLoopDetectionHook(loopTracker, log)] },
+        { hooks: [createContextSafetyHook(contextTracker, activityPoster, log)] },
+      ],
+    },
+  };
+}
 
-  // Ensure workspace exists
+function getOrCreateSession(assistantName?: string): SDKSession {
+  if (session) return session;
+
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+
+  const persistedId = getPersistedSessionId();
+  const options = buildSessionOptions(assistantName);
+
+  if (persistedId) {
+    log(`Resuming V2 session: ${persistedId}`);
+    session = unstable_v2_resumeSession(persistedId, options);
+  } else {
+    log('Creating new V2 session');
+    session = unstable_v2_createSession(options);
+  }
+
+  return session;
+}
+
+// ─── Core Message Processing ─────────────────────────────
+
+export async function processMessage(params: MessageParams, onEvent?: (event: StreamEvent) => void): Promise<MessageResult> {
+  // Serialize access — V2 session handles one send/stream cycle at a time
+  const prevLock = messageLock;
+  let releaseLock!: () => void;
+  messageLock = new Promise(resolve => { releaseLock = resolve; });
+  await prevLock;
+
+  try {
+    return await processMessageInner(params, onEvent);
+  } finally {
+    releaseLock();
+  }
+}
+
+async function processMessageInner(params: MessageParams, onEvent?: (event: StreamEvent) => void): Promise<MessageResult> {
+  const { message, isScheduledTask, assistantName } = params;
+
+  // Initialize activity poster before session creation (hooks reference it)
+  const agentId = process.env.AGENT_ID || assistantName || 'unknown';
+  ensureActivityPoster(agentId);
+  activityPoster!.post('status', 'Processing message');
 
   // Build prompt with timezone context
   const tz = process.env.AGENT_TIMEZONE || 'UTC';
@@ -216,110 +233,27 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
     hour: 'numeric', minute: '2-digit', hour12: true,
   });
   let prompt = `<context timezone="${tz}" localTime="${localTime}" />\n\n`;
-
   if (isScheduledTask) {
     prompt += `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user.]\n\n`;
   }
   prompt += message;
 
-  // Build SDK env from process.env
-  const sdkEnv: Record<string, string | undefined> = { ...process.env };
-
-  const loopTracker = new ToolCallTracker();
-  const contextTracker = new ContextWindowTracker();
-  // Set a default context window based on model — will be refined from modelUsage in result
-  const model = process.env.CLAW_MODEL || 'claude-opus-4-6';
-  const isClaude = model.includes('claude') || model.startsWith('anthropic/');
-  contextTracker.contextWindow = getDefaultContextWindow(model);
-  let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
+  let currentSessionId = getPersistedSessionId() || '';
   const resultTexts: string[] = [];
   let messageCount = 0;
   let usageInfo: UsageInfo | undefined;
 
-  // Load customer-provided MCP servers (re-read on each message in case config was updated)
-  const dynamicMcpServers = loadDynamicMcpServers();
-  const dynamicToolPatterns = Object.keys(dynamicMcpServers).map(name => `mcp__${name}__*`);
-
   try {
-    for await (const msg of query({
-      prompt,
-      options: {
-        pathToClaudeCodeExecutable: path.join(path.dirname(fileURLToPath(import.meta.url)), 'cli.js'),
-        stderr: (data: string) => { console.error(`[cli-stderr] ${data}`); },
-        cwd: WORKSPACE_DIR,
-        model: process.env.CLAW_MODEL || 'claude-opus-4-6',
-        // thinking + effort are Claude-only — omit for non-Claude models
-        ...(isClaude ? {
-          thinking: { type: 'adaptive' as const },
-          effort: (process.env.CLAW_EFFORT || 'high') as 'low' | 'medium' | 'high' | 'max',
-        } : {}),
-        maxTurns: parseInt(process.env.CLAW_MAX_TURNS || '50', 10),
-        bare: true,
-        resume: sessionId,
-        resumeSessionAt: lastResumeAt,
-        allowedTools: [
-          'Bash',
-          'Read', 'Write', 'Edit', 'Glob', 'Grep',
-          'WebSearch', 'WebFetch',
-          'Task', 'TaskOutput', 'TaskStop',
-          'TeamCreate', 'TeamDelete', 'SendMessage',
-          'TodoWrite', 'ToolSearch', 'Skill',
-          'NotebookEdit',
-          'mcp__claw__*',
-          'mcp__gallery__*',
-          ...dynamicToolPatterns,
-        ],
-        env: sdkEnv,
-        permissionMode: 'acceptEdits',
-        settingSources: ['project', 'user'],
-        mcpServers: {
-          claw: {
-            command: 'node',
-            args: [mcpToolsPath],
-            env: {
-              GALLERY_API_URL: process.env.GALLERY_API_URL || '',
-              GALLERY_WORKER_URL: process.env.GALLERY_WORKER_URL || '',
-              GALLERY_TOKEN: process.env.GALLERY_TOKEN || '',
-              AGENT_ID: process.env.AGENT_ID || '',
-              ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || '',
-              ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
-              CLAW_WORKSPACE_DIR: process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace',
-              GALLERY_CONVEX_URL: process.env.GALLERY_CONVEX_URL || '',
-              GALLERY_GATEWAY_TOKEN: process.env.GALLERY_GATEWAY_TOKEN || process.env.GALLERY_TOKEN || '',
-            },
-          },
-          ...(process.env.GALLERY_MCP_URL && process.env.GALLERY_TOKEN ? {
-            gallery: {
-              type: 'http' as const,
-              url: process.env.GALLERY_MCP_URL,
-              headers: { Authorization: `Bearer ${process.env.GALLERY_TOKEN}` },
-            },
-          } : {}),
-          ...dynamicMcpServers,
-        },
-        hooks: {
-          PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
-          PreToolUse: [
-            { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
-            { hooks: [createLoopDetectionHook(loopTracker, log)] },
-            { hooks: [createContextSafetyHook(contextTracker, activityPoster, log)] },
-          ],
-        },
-      }
-    })) {
+    const sess = getOrCreateSession(assistantName);
+    await sess.send(prompt);
+
+    for await (const msg of sess.stream()) {
       messageCount++;
       const msgType = msg.type === 'system' ? `system/${(msg as { subtype?: string }).subtype}` : msg.type;
       log(`[msg #${messageCount}] type=${msgType}`);
 
-      if (msg.type === 'assistant' && 'uuid' in msg) {
-        lastAssistantUuid = (msg as { uuid: string }).uuid;
-        // Persist resume point immediately — if sprite crashes mid-query,
-        // next request resumes from this point instead of starting over
-        lastResumeAt = lastAssistantUuid;
-        persistResumeAt(lastAssistantUuid);
-
-        // Track context window usage from the API response
+      // ─── Assistant messages ───────────────────────
+      if (msg.type === 'assistant') {
         const msgUsage = (msg as any).message?.usage;
         if (msgUsage) {
           contextTracker.update(
@@ -332,38 +266,40 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === 'text' && block.text) {
-              activityPoster.post('output', block.text);
+              activityPoster!.post('output', block.text);
               onEvent?.({ type: 'text', data: { content: block.text } });
             } else if (block.type === 'tool_use') {
-              activityPoster.post('tool_use', `${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
+              activityPoster!.post('tool_use', `${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
               onEvent?.({ type: 'tool_call_start', data: { id: block.id, name: block.name, input: block.input } });
             } else if (block.type === 'tool_result') {
               onEvent?.({ type: 'tool_call_end', data: { id: block.tool_use_id, status: block.is_error ? 'error' : 'completed', result: typeof block.content === 'string' ? block.content : JSON.stringify(block.content) } });
             } else if (block.type === 'thinking' && block.thinking) {
-              activityPoster.post('thinking', block.thinking.slice(0, 500));
+              activityPoster!.post('thinking', block.thinking.slice(0, 500));
               onEvent?.({ type: 'thinking', data: { content: block.thinking } });
             }
           }
         }
       }
 
+      // ─── System messages ──────────────────────────
       if (msg.type === 'system' && msg.subtype === 'init') {
-        newSessionId = msg.session_id;
-        log(`Session initialized: ${newSessionId}`);
-        activityPoster.post('status', `Session initialized: ${newSessionId}`);
-        persistSessionId(newSessionId);
+        currentSessionId = msg.session_id;
+        log(`Session initialized: ${currentSessionId}`);
+        activityPoster!.post('status', `Session initialized: ${currentSessionId}`);
+        persistSessionId(currentSessionId);
       }
 
       if (msg.type === 'system' && (msg as { subtype?: string }).subtype === 'task_notification') {
         const tn = msg as { task_id: string; status: string; summary: string };
         log(`Task notification: task=${tn.task_id} status=${tn.status}`);
-        activityPoster.post('status', `Task ${tn.status}: ${tn.summary}`);
+        activityPoster!.post('status', `Task ${tn.status}: ${tn.summary}`);
       }
 
+      // ─── Result message ───────────────────────────
       if (msg.type === 'result') {
         const textResult = 'result' in msg ? (msg as { result?: string }).result : null;
         log(`Result #${resultTexts.length + 1}: ${textResult ? textResult.slice(0, 200) : '(no text)'}`);
-        activityPoster.post('output', textResult ? textResult.slice(0, 500) : 'Query completed');
+        activityPoster!.post('output', textResult ? textResult.slice(0, 500) : 'Query completed');
         if (textResult) resultTexts.push(textResult);
 
         // Extract usage data from the result message
@@ -376,10 +312,8 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
         };
 
         if (resultMsg.usage || resultMsg.modelUsage) {
-          // Get context window from modelUsage (first model entry)
           const modelEntries = resultMsg.modelUsage ? Object.values(resultMsg.modelUsage) : [];
           const contextWindow = modelEntries[0]?.contextWindow ?? contextTracker.contextWindow;
-          // Update tracker with authoritative context window from API
           if (contextWindow > 0) contextTracker.contextWindow = contextWindow;
           const inputTokens = resultMsg.usage?.input_tokens ?? 0;
           const outputTokens = resultMsg.usage?.output_tokens ?? 0;
@@ -400,32 +334,44 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
           };
 
           log(`[usage] ${inputTokens} in / ${outputTokens} out | context: ${contextPercentage}% of ${contextWindow}`);
-          activityPoster.post('status', `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, {
-            usage: usageInfo,
-          });
-          onEvent?.({ type: 'context_usage', data: { promptTokens: inputTokens, completionTokens: outputTokens, model, contextWindow, contextPercentage } });
+          activityPoster!.post('status', `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, { usage: usageInfo });
+          onEvent?.({ type: 'context_usage', data: { promptTokens: inputTokens, completionTokens: outputTokens, model: MODEL, contextWindow, contextPercentage } });
         }
 
-        // Emit done event with the final result text
-        onEvent?.({ type: 'done', data: { result: textResult ?? '', sessionId: newSessionId || sessionId || '' } });
+        onEvent?.({ type: 'done', data: { result: textResult ?? '', sessionId: currentSessionId } });
       }
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
-    activityPoster.post('error', errorMessage);
+    activityPoster!.post('error', errorMessage);
+
+    // Session may have crashed — close and null it for recovery on next message
+    if (session) {
+      try { session.close(); } catch { /* ignore close errors */ }
+      session = null;
+      log('Session closed due to error — will recreate on next message');
+    }
+
     return {
       status: 'error',
       result: null,
-      sessionId: sessionId || '',
+      sessionId: currentSessionId,
       error: errorMessage,
     };
   }
 
-  const finalSessionId = newSessionId || sessionId || '';
+  // Capture sessionId from session object if we missed system/init
+  if (!currentSessionId && session) {
+    try {
+      currentSessionId = session.sessionId;
+      persistSessionId(currentSessionId);
+    } catch { /* sessionId may not be available yet */ }
+  }
+
   const resultText = resultTexts.length > 0 ? resultTexts.join('\n\n') : null;
-  log(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${finalSessionId}`);
-  activityPoster.post('status', 'Message processed');
+  log(`Query done. Messages: ${messageCount}, results: ${resultTexts.length}, sessionId: ${currentSessionId}`);
+  activityPoster!.post('status', 'Message processed');
 
   // Fire-and-forget memory extraction — don't block the response
   if (resultText && process.env.CLAW_AUTO_MEMORY !== 'false') {
@@ -435,7 +381,7 @@ export async function processMessage(params: MessageParams, onEvent?: (event: St
   return {
     status: 'success',
     result: resultText,
-    sessionId: finalSessionId,
+    sessionId: currentSessionId,
     usage: usageInfo,
   };
 }
@@ -502,7 +448,6 @@ Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothi
     const date = new Date().toISOString().split('T')[0];
     const header = `## Auto-extracted (${date})`;
     if (existing.includes(header)) {
-      // Append to existing day section
       fs.appendFileSync(memoryFile, `\n${text}\n`);
     } else {
       fs.appendFileSync(memoryFile, `\n\n${header}\n${text}\n`);
@@ -515,10 +460,16 @@ Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothi
   }
 }
 
+// ─── Lifecycle Exports ──────────────────────────────────
+
 /**
- * Flush pending activity events. Call on SIGTERM before exit.
+ * Flush pending activity events and close session. Call on SIGTERM before exit.
  */
 export async function shutdown(): Promise<void> {
+  if (session) {
+    try { session.close(); } catch { /* ignore */ }
+    session = null;
+  }
   if (activityPoster) {
     activityPoster.post('status', 'Sprite shutting down');
     await activityPoster.stop();
