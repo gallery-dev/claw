@@ -171,6 +171,7 @@ function buildSessionOptions(assistantName?: string): SDKSessionOptions {
       ...getDynamicMcpToolPatterns(),
     ],
     permissionMode: 'acceptEdits',
+    includePartialMessages: true,
     hooks: {
       PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
       PreToolUse: [
@@ -241,6 +242,7 @@ async function processMessageInner(params: MessageParams, onEvent?: (event: Stre
   let currentSessionId = getPersistedSessionId() || '';
   const resultTexts: string[] = [];
   let messageCount = 0;
+  let streamEventCount = 0;
   let usageInfo: UsageInfo | undefined;
 
   try {
@@ -250,9 +252,33 @@ async function processMessageInner(params: MessageParams, onEvent?: (event: Stre
     for await (const msg of sess.stream()) {
       messageCount++;
       const msgType = msg.type === 'system' ? `system/${(msg as { subtype?: string }).subtype}` : msg.type;
-      log(`[msg #${messageCount}] type=${msgType}`);
+      if (msgType !== 'stream_event') log(`[msg #${messageCount}] type=${msgType}`);
 
-      // ─── Assistant messages ───────────────────────
+      // ─── Stream events (token-by-token) ───────────
+      if (msg.type === 'stream_event') {
+        streamEventCount++;
+        const event = (msg as any).event;
+        if (event?.type === 'content_block_delta') {
+          const delta = event.delta;
+          if (delta?.type === 'text_delta' && delta.text) {
+            onEvent?.({ type: 'text', data: { content: delta.text } });
+          } else if (delta?.type === 'thinking_delta' && delta.thinking) {
+            onEvent?.({ type: 'thinking', data: { content: delta.thinking } });
+          } else if (delta?.type === 'input_json_delta') {
+            // tool input streaming — ignore, we emit tool_call_start on the complete message
+          }
+        } else if (event?.type === 'content_block_start') {
+          const block = event.content_block;
+          if (block?.type === 'tool_use') {
+            onEvent?.({ type: 'tool_call_start', data: { id: block.id, name: block.name, input: {} } });
+          }
+        } else if (event?.type === 'content_block_stop') {
+          // handled by complete assistant message below
+        }
+        continue;
+      }
+
+      // ─── Assistant messages (complete) ─────────────
       if (msg.type === 'assistant') {
         const msgUsage = (msg as any).message?.usage;
         if (msgUsage) {
@@ -262,20 +288,25 @@ async function processMessageInner(params: MessageParams, onEvent?: (event: Stre
           );
         }
 
+        // Track whether we got stream_events (partial messages) for this turn
+        // If so, don't re-emit text/thinking — they were already streamed token-by-token
+        const hadStreamEvents = streamEventCount > 0;
+
         const content = (msg as any).message?.content;
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === 'text' && block.text) {
               activityPoster!.post('output', block.text);
-              onEvent?.({ type: 'text', data: { content: block.text } });
+              if (!hadStreamEvents) onEvent?.({ type: 'text', data: { content: block.text } });
             } else if (block.type === 'tool_use') {
               activityPoster!.post('tool_use', `${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
+              // Emit full tool_call_start with complete input (stream_event only had empty input)
               onEvent?.({ type: 'tool_call_start', data: { id: block.id, name: block.name, input: block.input } });
             } else if (block.type === 'tool_result') {
               onEvent?.({ type: 'tool_call_end', data: { id: block.tool_use_id, status: block.is_error ? 'error' : 'completed', result: typeof block.content === 'string' ? block.content : JSON.stringify(block.content) } });
             } else if (block.type === 'thinking' && block.thinking) {
               activityPoster!.post('thinking', block.thinking.slice(0, 500));
-              onEvent?.({ type: 'thinking', data: { content: block.thinking } });
+              if (!hadStreamEvents) onEvent?.({ type: 'thinking', data: { content: block.thinking } });
             }
           }
         }

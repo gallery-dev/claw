@@ -15633,6 +15633,7 @@ function buildSessionOptions(assistantName) {
       ...getDynamicMcpToolPatterns()
     ],
     permissionMode: "acceptEdits",
+    includePartialMessages: true,
     hooks: {
       PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
       PreToolUse: [
@@ -15698,6 +15699,7 @@ async function processMessageInner(params, onEvent) {
   let currentSessionId = getPersistedSessionId() || "";
   const resultTexts = [];
   let messageCount = 0;
+  let streamEventCount = 0;
   let usageInfo;
   try {
     const sess = getOrCreateSession(assistantName);
@@ -15705,7 +15707,27 @@ async function processMessageInner(params, onEvent) {
     for await (const msg of sess.stream()) {
       messageCount++;
       const msgType = msg.type === "system" ? `system/${msg.subtype}` : msg.type;
-      log(`[msg #${messageCount}] type=${msgType}`);
+      if (msgType !== "stream_event") log(`[msg #${messageCount}] type=${msgType}`);
+      if (msg.type === "stream_event") {
+        streamEventCount++;
+        const event = msg.event;
+        if (event?.type === "content_block_delta") {
+          const delta = event.delta;
+          if (delta?.type === "text_delta" && delta.text) {
+            onEvent?.({ type: "text", data: { content: delta.text } });
+          } else if (delta?.type === "thinking_delta" && delta.thinking) {
+            onEvent?.({ type: "thinking", data: { content: delta.thinking } });
+          } else if (delta?.type === "input_json_delta") {
+          }
+        } else if (event?.type === "content_block_start") {
+          const block = event.content_block;
+          if (block?.type === "tool_use") {
+            onEvent?.({ type: "tool_call_start", data: { id: block.id, name: block.name, input: {} } });
+          }
+        } else if (event?.type === "content_block_stop") {
+        }
+        continue;
+      }
       if (msg.type === "assistant") {
         const msgUsage = msg.message?.usage;
         if (msgUsage) {
@@ -15714,12 +15736,13 @@ async function processMessageInner(params, onEvent) {
             msgUsage.output_tokens ?? 0
           );
         }
+        const hadStreamEvents = streamEventCount > 0;
         const content = msg.message?.content;
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === "text" && block.text) {
               activityPoster.post("output", block.text);
-              onEvent?.({ type: "text", data: { content: block.text } });
+              if (!hadStreamEvents) onEvent?.({ type: "text", data: { content: block.text } });
             } else if (block.type === "tool_use") {
               activityPoster.post("tool_use", `${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
               onEvent?.({ type: "tool_call_start", data: { id: block.id, name: block.name, input: block.input } });
@@ -15727,7 +15750,7 @@ async function processMessageInner(params, onEvent) {
               onEvent?.({ type: "tool_call_end", data: { id: block.tool_use_id, status: block.is_error ? "error" : "completed", result: typeof block.content === "string" ? block.content : JSON.stringify(block.content) } });
             } else if (block.type === "thinking" && block.thinking) {
               activityPoster.post("thinking", block.thinking.slice(0, 500));
-              onEvent?.({ type: "thinking", data: { content: block.thinking } });
+              if (!hadStreamEvents) onEvent?.({ type: "thinking", data: { content: block.thinking } });
             }
           }
         }
@@ -16025,7 +16048,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-27T02:35:46.249Z" : "";
+var buildTime = true ? "2026-03-27T03:54:02.541Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
