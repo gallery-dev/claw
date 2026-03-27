@@ -15791,9 +15791,14 @@ var SessionManager = class {
       log(`[session-mgr] Creating new session for ${id} (mode=${effectiveMode}, model=${effectiveModel})`);
       session = ba(options);
     }
+    let initialSessionId = persisted?.sessionId ?? "";
+    try {
+      initialSessionId = session.sessionId || initialSessionId;
+    } catch {
+    }
     const ctx = {
       session,
-      sessionId: session.sessionId ?? persisted?.sessionId ?? "",
+      sessionId: initialSessionId,
       loopTracker,
       contextTracker,
       lastUsed: Date.now(),
@@ -16572,7 +16577,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-27T14:17:13.023Z" : "";
+var buildTime = true ? "2026-03-27T14:43:23.259Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;

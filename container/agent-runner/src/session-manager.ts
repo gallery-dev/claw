@@ -126,9 +126,13 @@ export class SessionManager {
       session = unstable_v2_createSession(options);
     }
 
+    // session.sessionId may throw on fresh sessions before first message exchange
+    let initialSessionId = persisted?.sessionId ?? '';
+    try { initialSessionId = session.sessionId || initialSessionId; } catch { /* not available yet */ }
+
     const ctx: ConversationContext = {
       session,
-      sessionId: session.sessionId ?? persisted?.sessionId ?? '',
+      sessionId: initialSessionId,
       loopTracker,
       contextTracker,
       lastUsed: Date.now(),
