@@ -25,15 +25,20 @@ function log(message: string): void {
   console.error(`[claw-server] ${message}`);
 }
 
+// Warn at startup if auth is disabled
+if (!AUTH_TOKEN) {
+  log('WARNING: No CLAW_AUTH_TOKEN or GALLERY_GATEWAY_TOKEN set — all requests will be accepted without auth');
+}
+
 // ─── Auth ────────────────────────────────────────────────
 
 /**
  * Validate Bearer token on protected endpoints.
  * Returns true if authorized, false (and sends 401) if not.
- * If no AUTH_TOKEN is configured, all requests are allowed (dev mode).
+ * If no AUTH_TOKEN is configured, all requests are allowed (logged warning at startup).
  */
 function requireAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-  if (!AUTH_TOKEN) return true; // no token configured = dev mode
+  if (!AUTH_TOKEN) return true;
 
   const authHeader = req.headers['authorization'];
   if (!authHeader || !authHeader.startsWith('Bearer ')) {

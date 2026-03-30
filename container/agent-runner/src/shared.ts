@@ -14,6 +14,35 @@ import fs from 'fs';
 import path from 'path';
 import { HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 
+// ─── Prompt Injection Scanning ───────────────────────────
+
+const INJECTION_PATTERNS = [
+  /ignore\s+(all\s+)?previous\s+instructions/i,
+  /ignore\s+(all\s+)?above\s+instructions/i,
+  /disregard\s+(all\s+)?prior\s+(instructions|context)/i,
+  /you\s+are\s+now\s+(a|an)\s+/i,
+  /new\s+instructions?\s*:/i,
+  /system\s*:\s*you\s+(are|must|should)/i,
+  /<div\s+style\s*=\s*["']display:\s*none/i,
+  /curl\s+.*\|\s*sh/i,
+  /wget\s+.*\|\s*bash/i,
+  /\u200b|\u200c|\u200d|\ufeff/,  // Zero-width characters (invisible text injection)
+];
+
+/**
+ * Scan text for prompt injection patterns. Returns array of detected patterns.
+ * Used to flag untrusted content (WebFetch results, user-uploaded files) before injection.
+ */
+export function scanForInjection(text: string): string[] {
+  const detected: string[] = [];
+  for (const pattern of INJECTION_PATTERNS) {
+    if (pattern.test(text)) {
+      detected.push(pattern.source.slice(0, 60));
+    }
+  }
+  return detected;
+}
+
 // ─── Transcript Parsing ──────────────────────────────────
 
 export interface ParsedMessage {
@@ -114,11 +143,54 @@ export function getSessionSummary(sessionId: string, transcriptPath: string, log
   return null;
 }
 
+// ─── Haiku API Helper ────────────────────────────────────
+
+/**
+ * Call Haiku with a prompt and return the text response.
+ * Fire-and-forget safe — returns null on any failure.
+ * Uses env vars directly (ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY).
+ */
+async function callHaikuForSummary(prompt: string, log?: (msg: string) => void): Promise<string | null> {
+  const baseUrl = process.env.ANTHROPIC_BASE_URL;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!baseUrl || !apiKey) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        max_tokens: 600,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json() as { content?: Array<{ type: string; text?: string }> };
+    return data.content?.[0]?.type === 'text' ? (data.content[0].text?.trim() ?? null) : null;
+  } catch (err) {
+    log?.(`[haiku-summary] Failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // ─── Pre-Compact Hook ────────────────────────────────────
 
 /**
  * Archive the full transcript to conversations/ before compaction.
- * Also writes a compaction marker to the daily memory log.
+ * Also writes a structured session summary to the daily memory log.
  *
  * @param workspaceDir - The workspace root (e.g. '/home/sprite/workspace' or '/workspace/group')
  * @param assistantName - Optional name for the assistant in transcripts
@@ -158,14 +230,78 @@ export function createPreCompactHook(workspaceDir: string, assistantName?: strin
       fs.writeFileSync(filePath, markdown);
       log?.(`Archived conversation to ${filePath}`);
 
-      // Write compaction marker to daily memory log
+      // Write structured session summary to daily memory log
       const memoryDir = path.join(workspaceDir, 'memory');
       fs.mkdirSync(memoryDir, { recursive: true });
       const dailyFile = path.join(memoryDir, `${date}.md`);
       const timestamp = new Date().toISOString().split('T')[1].replace(/\.\d+Z$/, '');
-      const marker = `\n## Context compacted at ${timestamp}\n\nConversation archived to \`conversations/${filename}\`${summary ? `\nSummary: ${summary}` : ''}\n`;
+
+      // Build structured summary via Haiku (fire-and-forget)
+      // Read existing daily summary to build on (iterative compression)
+      const existingSummary = fs.existsSync(dailyFile) ? fs.readFileSync(dailyFile, 'utf-8') : '';
+
+      const transcriptSnippet = messages
+        .map(m => `${m.role === 'user' ? 'User' : (assistantName || 'Assistant')}: ${m.content.slice(0, 500)}`)
+        .join('\n')
+        .slice(0, 6000);
+
+      const summaryPrompt = existingSummary.length > 100
+        ? `Update this existing session summary with new information from the latest conversation segment.
+
+EXISTING SUMMARY:
+${existingSummary.slice(-3000)}
+
+NEW CONVERSATION:
+${transcriptSnippet}
+
+Merge the new information into the existing structure. Update sections — don't duplicate. Move completed items from "In Progress" to "Accomplished". Add new decisions and next steps.
+
+Respond with EXACTLY this structure (skip sections that are empty):
+
+## Goal
+[Combined goal from all segments]
+
+## Accomplished
+[Everything completed across all segments]
+
+## In Progress
+[What is still ongoing after this segment]
+
+## Key Decisions
+[All important decisions, old and new]
+
+## Next Steps
+[Updated next steps after this segment]`
+        : `Summarize this conversation in structured format for future reference.
+
+TRANSCRIPT:
+${transcriptSnippet}
+
+Respond with EXACTLY this structure (skip sections that are empty):
+
+## Goal
+[What was the user trying to accomplish?]
+
+## Accomplished
+[What was completed or decided?]
+
+## In Progress
+[What is still ongoing or needs follow-up?]
+
+## Key Decisions
+[Important decisions made and why]
+
+## Next Steps
+[What should happen next, if anything]`;
+
+      const structuredSummary = await callHaikuForSummary(summaryPrompt, log);
+
+      const marker = structuredSummary
+        ? `\n## Session Summary (${timestamp})\n\nArchived: \`conversations/${filename}\`${summary ? `\nSession: ${summary}` : ''}\n\n${structuredSummary}\n`
+        : `\n## Context compacted at ${timestamp}\n\nConversation archived to \`conversations/${filename}\`${summary ? `\nSummary: ${summary}` : ''}\n`;
+
       fs.appendFileSync(dailyFile, marker);
-      log?.(`Wrote compaction marker to memory/${date}.md`);
+      log?.(`Wrote ${structuredSummary ? 'structured summary' : 'compaction marker'} to memory/${date}.md`);
     } catch (err) {
       log?.(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -176,7 +312,47 @@ export function createPreCompactHook(workspaceDir: string, assistantName?: strin
 
 // ─── Bash Secret Sanitization ────────────────────────────
 
-export const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+export const SECRET_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'OPENAI_API_KEY',
+  'GITHUB_TOKEN',
+  'GITHUB_PAT',
+  'SLACK_BOT_TOKEN',
+  'STRIPE_SECRET_KEY',
+  'SENDGRID_API_KEY',
+  'HUGGINGFACE_TOKEN',
+  'DATABASE_URL',
+  'POSTGRES_URL',
+  'MYSQL_URL',
+  'REDIS_URL',
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_ACCESS_KEY_ID',
+  'GOOGLE_API_KEY',
+  'REPLICATE_API_TOKEN',
+  'GALLERY_GATEWAY_TOKEN',
+  'GALLERY_TOKEN',
+];
+
+/**
+ * Redact hardcoded API keys and secrets from shell command strings.
+ * Catches tokens that were inlined rather than stored in env vars.
+ */
+export function redactSecretsFromCommand(command: string): string {
+  return command
+    .replace(/\b(sk-[A-Za-z0-9]{20,})/g, 'sk-***REDACTED***')
+    .replace(/\b(ghp_[A-Za-z0-9]{36,})/g, 'ghp_***REDACTED***')
+    .replace(/\b(github_pat_[A-Za-z0-9_]{82,})/g, 'github_pat_***REDACTED***')
+    .replace(/\b(xox[bpoa]-[A-Za-z0-9-]+)/g, 'xox***REDACTED***')
+    .replace(/\b(AIza[A-Za-z0-9_-]{35})/g, 'AIza***REDACTED***')
+    .replace(/\b(AKIA[A-Z0-9]{16})/g, 'AKIA***REDACTED***')
+    .replace(/\b(sk_live_[A-Za-z0-9]{24,})/g, 'sk_live_***REDACTED***')
+    .replace(/\b(r8_[A-Za-z0-9]{37})/g, 'r8_***REDACTED***')
+    .replace(/(password|secret|token|key|apikey)=["']?[A-Za-z0-9_\-\.]{8,}["']?/gi, '$1=***REDACTED***')
+    .replace(/Authorization:\s*Bearer\s+[A-Za-z0-9_\-\.]+/gi, 'Authorization: Bearer ***REDACTED***')
+    .replace(/-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----/g, '***PRIVATE_KEY_REDACTED***')
+    .replace(/\b(postgres|mysql|mongodb|redis|amqp)(:\/\/)[^\s"']+/gi, '$1$2***REDACTED***');
+}
 
 export function createSanitizeBashHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -184,13 +360,14 @@ export function createSanitizeBashHook(): HookCallback {
     const command = (preInput.tool_input as { command?: string })?.command;
     if (!command) return {};
 
+    const redacted = redactSecretsFromCommand(command);
     const unsetPrefix = `unset ${SECRET_ENV_VARS.join(' ')} 2>/dev/null; `;
     return {
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         updatedInput: {
           ...(preInput.tool_input as Record<string, unknown>),
-          command: unsetPrefix + command,
+          command: unsetPrefix + redacted,
         },
       },
     };
@@ -360,20 +537,25 @@ export class ContextWindowTracker {
   /** Last known input_tokens from the most recent assistant message (cumulative per API) */
   lastInputTokens = 0;
   lastOutputTokens = 0;
+  lastCacheReadTokens = 0;
+  lastCacheCreationTokens = 0;
   contextWindow = 0;
   private warnedAt70 = false;
   private checkpointedAt80 = false;
 
-  update(inputTokens: number, outputTokens: number, contextWindow?: number): void {
+  update(inputTokens: number, outputTokens: number, contextWindow?: number, cacheReadTokens?: number, cacheCreationTokens?: number): void {
     this.lastInputTokens = inputTokens;
     this.lastOutputTokens = outputTokens;
     if (contextWindow && contextWindow > 0) this.contextWindow = contextWindow;
+    if (cacheReadTokens !== undefined) this.lastCacheReadTokens = cacheReadTokens;
+    if (cacheCreationTokens !== undefined) this.lastCacheCreationTokens = cacheCreationTokens;
   }
 
   getPercentage(): number {
     if (this.contextWindow <= 0) return 0;
-    // input_tokens represents the full context sent to the model (system + messages + tools)
-    return this.lastInputTokens / this.contextWindow;
+    // Cache read tokens represent context that exists in the window but wasn't re-sent
+    const effectiveTokens = this.lastInputTokens + this.lastCacheReadTokens;
+    return effectiveTokens / this.contextWindow;
   }
 
   shouldWarn(): boolean {
@@ -459,6 +641,7 @@ export async function postConvexActivity(
   type: ActivityType,
   content: string,
   metadata?: unknown,
+  taskId?: string,
 ): Promise<void> {
   try {
     await fetch(`${convexUrl}/api/mutation`, {
@@ -466,7 +649,7 @@ export async function postConvexActivity(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         path: 'agentActivity:push',
-        args: { token, agentId, type, content: content.slice(0, 4000), metadata },
+        args: { token, agentId, taskId, type, content: content.slice(0, 4000), metadata },
       }),
     });
   } catch { /* best-effort */ }
@@ -477,9 +660,10 @@ export class ActivityPoster {
   private convexUrl: string | null;
   private token: string | null;
   private agentId: string;
-  private queue: { type: ActivityType; content: string; metadata?: unknown }[] = [];
+  private queue: { type: ActivityType; content: string; metadata?: unknown; taskId?: string }[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private droppedCount = 0;
+  private currentTaskId: string | undefined;
 
   constructor(convexUrl: string | null, token: string | null, agentId: string) {
     this.convexUrl = convexUrl;
@@ -491,9 +675,13 @@ export class ActivityPoster {
     }
   }
 
+  setTaskId(taskId: string | undefined): void {
+    this.currentTaskId = taskId;
+  }
+
   post(type: ActivityType, content: string, metadata?: unknown): void {
     if (!this.convexUrl || !this.token) return;
-    this.queue.push({ type, content: content.slice(0, 4000), metadata });
+    this.queue.push({ type, content: content.slice(0, 4000), metadata, taskId: this.currentTaskId });
     while (this.queue.length > ActivityPoster.MAX_QUEUE) {
       this.queue.shift();
       this.droppedCount++;
@@ -508,7 +696,7 @@ export class ActivityPoster {
 
     const batch = this.queue.splice(0, 10);
     for (const event of batch) {
-      await postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata);
+      await postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata, event.taskId);
     }
   }
 

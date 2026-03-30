@@ -236,6 +236,11 @@ async function processMessageInner(
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     hour: 'numeric', minute: '2-digit', hour12: true,
   });
+  // Validate message size
+  if (message.length > 500_000) {
+    throw new Error('Message too large (max 500KB)');
+  }
+
   let prompt = `<context timezone="${tz}" localTime="${localTime}" />\n\n`;
   if (isScheduledTask) {
     prompt += `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user.]\n\n`;
@@ -340,6 +345,9 @@ async function processMessageInner(
           ctx.contextTracker.update(
             msgUsage.input_tokens ?? 0,
             msgUsage.output_tokens ?? 0,
+            undefined,
+            msgUsage.cache_read_input_tokens ?? 0,
+            msgUsage.cache_creation_input_tokens ?? 0,
           );
         }
 
@@ -599,10 +607,10 @@ async function extractMemory(userMessage: string, assistantResult: string): Prom
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5',
-        max_tokens: 500,
+        max_tokens: 800,
         messages: [{
           role: 'user',
-          content: `Extract key facts, decisions, or preferences from this conversation that would be useful to remember in future sessions. Only extract genuinely important information — skip routine/trivial exchanges.
+          content: `Extract information worth remembering from this conversation. Be selective — only extract genuinely useful facts, not routine exchanges.
 
 EXISTING MEMORY (do NOT repeat what's already here):
 ${existing.slice(0, 2000)}
@@ -611,7 +619,15 @@ CONVERSATION:
 User: ${userMessage.slice(0, 3000)}
 Assistant: ${assistantResult.slice(0, 3000)}
 
-Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothing worth remembering. Do not include headers or timestamps — just bullet points.`,
+Extract into these categories (skip empty categories, skip if nothing new):
+
+**User preferences/habits:** Communication style, working hours, tool preferences, aesthetic preferences, things they dislike
+**Decisions made:** What was decided, why, any tradeoffs noted
+**Key facts:** Important project details, agent configurations, codebase facts, user context
+**Things that didn't work:** Approaches tried that failed (so they're not repeated)
+
+Respond ONLY with bullet points under category headers, or "NONE" if nothing worth remembering.
+No timestamps. No headers beyond the category names. Just bullet points.`,
         }],
       }),
     });

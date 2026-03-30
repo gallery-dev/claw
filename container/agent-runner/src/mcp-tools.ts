@@ -37,7 +37,7 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate.",
+  "Send a message to the user immediately while you're still running. Use this for genuinely important milestones — a major finding, a decision that needs acknowledgment, or a completion event. Do NOT use for every minor step. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate.",
   {
     text: z.string().describe('The message text to send'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher").'),
@@ -86,9 +86,11 @@ server.tool(
 const convexUrl = process.env.GALLERY_CONVEX_URL || '';
 const gatewayToken = process.env.GALLERY_GATEWAY_TOKEN || '';
 
+let currentTaskId: string | undefined;
+
 function postActivity(type: ActivityType, content: string, metadata?: unknown): void {
   if (!convexUrl || !gatewayToken) return;
-  postConvexActivity(convexUrl, gatewayToken, agentId, type, content, metadata);
+  postConvexActivity(convexUrl, gatewayToken, agentId, type, content, metadata, currentTaskId);
 }
 
 // ─── Convex Memory Index ─────────────────────────────────
@@ -184,7 +186,7 @@ async function runSubtask(
       prompt,
       options: {
         cwd: WORKSPACE_DIR,
-        model: 'claude-sonnet-4-6',
+        model: process.env.CLAW_SUBTASK_MODEL || 'claude-sonnet-4-6',
         maxTurns: 15,
         allowedTools: [
           'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
@@ -192,10 +194,9 @@ async function runSubtask(
           // No mcp__claw__* — subtasks cannot decompose further or use agent messaging
         ],
         env: {
-          ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || '',
-          ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
-          PATH: process.env.PATH || '',
-          HOME: process.env.HOME || '',
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(([k]) => !['CLAUDE_CODE_OAUTH_TOKEN'].includes(k))
+          ),
         },
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
@@ -235,7 +236,13 @@ async function runSubtask(
 
 server.tool(
   'decompose_task',
-  `Split a complex task into parallel subtasks. Each subtask runs as an independent AI worker with access to the filesystem, bash, and web tools. Use this when a task has independent parts that can run simultaneously (e.g., "research 3 competitors", "review 5 files", "generate reports for each region").
+  `Split a complex task into parallel subtasks. Each subtask runs as an independent AI worker with access to the filesystem, bash, and web tools.
+
+Use this when a task has independent parts that can run simultaneously. Good use cases:
+- Researching multiple topics at once (e.g., "research 3 competitors")
+- Reviewing multiple files or codebases in parallel
+- Running investigation + implementation simultaneously
+- Generating reports for each region/category at once
 
 GUIDELINES:
 - Max ${MAX_SUBTASKS} subtasks per call
@@ -352,7 +359,15 @@ Use this when:
 
 The target agent runs the full task as a message (same as a user sending it). This call blocks until the target agent completes.
 
-IMPORTANT: You must know the target agent's Convex ID (agentId) to delegate. You can find agent IDs by asking the user or checking workspace context.`,
+IMPORTANT: The sub-agent cannot ask you questions during delegation — give them everything they need upfront. A good delegation includes:
+1. A clear task title (specific enough that "done" is obvious)
+2. A context block with: relevant file paths, prior decisions, constraints, what NOT to do
+3. Success criteria — what does a complete result look like?
+
+Poor: "research competitors"
+Better: "Research top 5 AI agent platforms — focus on pricing models, LLM support, deployment options. Avoid consumer tools. Deliver a markdown comparison table."
+
+You must know the target agent's Convex ID (agentId) to delegate. You can find agent IDs by asking the user or checking workspace context.`,
   {
     toAgentId: z.string().describe("Convex document ID of the target agent"),
     task: z.string().describe("The task or instruction to send to the target agent — be specific and complete"),
@@ -576,6 +591,8 @@ server.tool(
   'memory_write',
   `Write or update a memory file. Use this to persist important information across sessions.
 
+Write proactively after every substantive discovery: a user preference, a decision made, something that didn't work, an important project fact. Don't wait until you're asked — write now, during the conversation. This is how you become someone who genuinely knows the owner instead of starting fresh each session.
+
 Best practices:
 • MEMORY.md — curated long-term facts, decisions, preferences.
 • memory/YYYY-MM-DD.md — daily notes, running context, progress logs.
@@ -767,35 +784,191 @@ server.tool(
   },
 );
 
+// ─── Skill Management (Autonomous) ─────────────────────────
+
+const SKILLS_DIR = path.join(WORKSPACE_DIR, 'skills');
+
+function safeSkillSlug(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+}
+
+server.tool(
+  'skill_list',
+  `List your installed skills. Shows all active skills (workspace-level and agent-specific) with their descriptions and file paths.
+
+Check this before creating a new skill to avoid duplicates.`,
+  {},
+  async () => {
+    const entries: string[] = [];
+
+    // List from filesystem (source of truth for what's immediately available)
+    if (fs.existsSync(SKILLS_DIR)) {
+      const dirs = fs.readdirSync(SKILLS_DIR).filter(d => {
+        const skillPath = path.join(SKILLS_DIR, d, 'SKILL.md');
+        return fs.existsSync(skillPath);
+      }).sort();
+
+      for (const dir of dirs) {
+        const skillPath = path.join(SKILLS_DIR, dir, 'SKILL.md');
+        const content = fs.readFileSync(skillPath, 'utf-8');
+        const firstLine = content.split('\n').find(l => l.startsWith('# '))?.replace(/^#\s*/, '') || dir;
+        const descLine = content.split('\n').find(l => l.trim() && !l.startsWith('#') && !l.startsWith('---'));
+        entries.push(`- **${firstLine}** → \`skills/${dir}/SKILL.md\`${descLine ? `\n  ${descLine.trim().slice(0, 120)}` : ''}`);
+      }
+    }
+
+    if (entries.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No skills installed. Use skill_create to author a new skill from a successful workflow.' }] };
+    }
+
+    return { content: [{ type: 'text' as const, text: `Installed skills:\n\n${entries.join('\n')}` }] };
+  },
+);
+
+server.tool(
+  'skill_create',
+  `Create a new skill from a successful workflow you just completed. Skills are reusable workflow templates that make you faster and more consistent at recurring tasks.
+
+**When to create a skill:**
+- You just completed a multi-step task that took 5+ tool calls
+- The workflow is likely to recur (similar tasks in the future)
+- The approach has been validated (it worked, the owner was satisfied)
+
+**How to write a good skill:**
+- Start with a clear trigger description (when should this skill activate?)
+- Document the exact steps, commands, and tools used
+- Include decision points (if X then Y, else Z)
+- Note common pitfalls or edge cases discovered
+- Keep it actionable — another agent (or future you) should be able to follow it exactly
+
+The skill is saved both to your local filesystem (immediately available) and to the database (persists across container restarts).`,
+  {
+    name: z.string().describe('Skill name (e.g. "Code Review", "Email Triage", "Deploy Pipeline")'),
+    description: z.string().describe('One-line description of what this skill does and when to use it'),
+    content: z.string().describe('Full skill content in markdown — workflow steps, commands, decision points, pitfalls'),
+  },
+  async (args) => {
+    const slug = safeSkillSlug(args.name);
+    const skillDir = path.join(SKILLS_DIR, slug);
+    const skillPath = path.join(skillDir, 'SKILL.md');
+
+    // Write to local filesystem (immediately available)
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(skillPath, args.content);
+
+    // Persist to Convex database (survives container restarts)
+    try {
+      await convexMutation('mcpInternal:createSkill', {
+        agentId,
+        name: args.name,
+        description: args.description,
+        content: args.content,
+      });
+    } catch (err) {
+      // If DB save fails (e.g. duplicate name), skill is still on filesystem
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes('already exists')) {
+        return { content: [{ type: 'text' as const, text: `Skill "${args.name}" already exists. Use skill_update to modify it.` }], isError: true };
+      }
+      // Non-fatal: skill works locally even if DB save failed
+      postActivity('status', `Skill "${args.name}" saved locally but DB sync failed: ${errMsg}`);
+    }
+
+    postActivity('status', `Created skill: ${args.name}`, { skillName: args.name });
+    return { content: [{ type: 'text' as const, text: `Skill created: "${args.name}" → skills/${slug}/SKILL.md\n\nThis skill is now available in your workflow. Other agents in the workspace will get it on next sync.` }] };
+  },
+);
+
+server.tool(
+  'skill_update',
+  `Update an existing skill with improvements, fixes, or additional steps discovered during recent work.
+
+**When to update a skill:**
+- You followed a skill but discovered a better approach
+- A step in the skill is outdated or broken
+- You found a new edge case or pitfall to document
+- The owner gave feedback that changes the workflow
+
+Always explain WHAT changed and WHY in your update.`,
+  {
+    name: z.string().describe('Name of the skill to update (exact match)'),
+    content: z.string().describe('Updated full skill content in markdown (replaces entire skill file)'),
+    description: z.string().optional().describe('Updated one-line description (optional)'),
+    changelog: z.string().optional().describe('Brief note of what changed and why (appended to skill for history)'),
+  },
+  async (args) => {
+    const slug = safeSkillSlug(args.name);
+    const skillPath = path.join(SKILLS_DIR, slug, 'SKILL.md');
+
+    // Append changelog if provided
+    let finalContent = args.content;
+    if (args.changelog) {
+      const date = new Date().toISOString().split('T')[0];
+      finalContent += `\n\n---\n\n## Changelog\n\n- **${date}**: ${args.changelog}\n`;
+    }
+
+    // Write to filesystem
+    fs.mkdirSync(path.join(SKILLS_DIR, slug), { recursive: true });
+    fs.writeFileSync(skillPath, finalContent);
+
+    // Update in Convex
+    try {
+      await convexMutation('mcpInternal:updateSkill', {
+        name: args.name,
+        agentId,
+        content: finalContent,
+        description: args.description,
+      });
+    } catch {
+      // Non-fatal — local file is already updated
+    }
+
+    postActivity('status', `Updated skill: ${args.name}`, { skillName: args.name });
+    return { content: [{ type: 'text' as const, text: `Skill updated: "${args.name}" → skills/${slug}/SKILL.md${args.changelog ? `\nChange: ${args.changelog}` : ''}` }] };
+  },
+);
+
 // ─── Gallery Workspace Tools ─────────────────────────────
 // These call Convex via HTTP using the gateway token, same as activity posting.
 
-/** Helper: call a Convex query via HTTP API. */
+/** Helper: call a Convex query via HTTP API with retry on 5xx. */
 async function convexQuery(fnPath: string, args: Record<string, unknown>): Promise<any> {
   if (!convexUrl || !gatewayToken) throw new Error('Gallery API not configured');
-  const res = await fetch(`${convexUrl}/api/query`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: fnPath, args: { token: gatewayToken, ...args } }),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) throw new Error(`Convex query failed: ${res.status}`);
-  const data = await res.json();
-  return data.value ?? data;
+  const delays = [100, 1000, 5000];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`${convexUrl}/api/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: fnPath, args: { token: gatewayToken, ...args } }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.value ?? data;
+    }
+    if (res.status < 500 || attempt === 2) throw new Error(`Convex query failed: ${res.status}`);
+    await new Promise(r => setTimeout(r, delays[attempt]));
+  }
 }
 
-/** Helper: call a Convex mutation via HTTP API. */
+/** Helper: call a Convex mutation via HTTP API with retry on 5xx. */
 async function convexMutation(fnPath: string, args: Record<string, unknown>): Promise<any> {
   if (!convexUrl || !gatewayToken) throw new Error('Gallery API not configured');
-  const res = await fetch(`${convexUrl}/api/mutation`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: fnPath, args: { token: gatewayToken, ...args } }),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) throw new Error(`Convex mutation failed: ${res.status}`);
-  const data = await res.json();
-  return data.value ?? data;
+  const delays = [100, 1000, 5000];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`${convexUrl}/api/mutation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: fnPath, args: { token: gatewayToken, ...args } }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.value ?? data;
+    }
+    if (res.status < 500 || attempt === 2) throw new Error(`Convex mutation failed: ${res.status}`);
+    await new Promise(r => setTimeout(r, delays[attempt]));
+  }
 }
 
 // ── Task Management ──
@@ -815,7 +988,7 @@ server.tool(
 
 server.tool(
   'gallery_create_task',
-  'Create a new task on the workspace kanban board. Appears instantly in the Gallery dashboard.',
+  'Create a new task on the workspace kanban board. Call this BEFORE starting any non-trivial work — this is how your owner tracks what you\'re doing. Appears instantly in the Gallery dashboard.',
   {
     title: z.string().describe('Task title'),
     description: z.string().optional().describe('Detailed task description'),
@@ -853,6 +1026,13 @@ server.tool(
     const task = (tasks as any[]).find((t: any) => t.title.toLowerCase() === args.title.toLowerCase());
     if (!task) return { content: [{ type: 'text' as const, text: `Task "${args.title}" not found.` }], isError: true };
 
+    // Track current task for activity visibility
+    if (args.status === 'in_progress') {
+      currentTaskId = task._id;
+    } else if (args.status === 'done' || args.status === 'failed') {
+      currentTaskId = undefined;
+    }
+
     await convexMutation('mcpInternal:updateTask', {
       taskId: task._id,
       status: args.status,
@@ -860,6 +1040,7 @@ server.tool(
       assignedAgent: args.assignedAgent,
       description: args.description,
     });
+    postActivity('status', `Task "${args.title}" → ${args.status ?? 'updated'}`, { taskId: task._id });
     return { content: [{ type: 'text' as const, text: `Task "${args.title}" updated.` }] };
   },
 );
@@ -882,7 +1063,7 @@ server.tool(
 
 server.tool(
   'gallery_add_task_comment',
-  'Add a comment or progress note to a task. Visible in the task activity feed on the dashboard.',
+  'Add a comment or progress note to a task. Call this at every meaningful milestone — think of it as narrating your progress to your owner in real-time. Visible in the task activity feed on the dashboard.',
   {
     title: z.string().describe('Title of the task to comment on'),
     content: z.string().describe('Comment text'),
@@ -916,7 +1097,7 @@ server.tool(
 
 server.tool(
   'gallery_request_review',
-  'Create a review request for the workspace owner. Use when you need human approval, have a question, or want to report completion/errors.',
+  'Create a review request for the workspace owner. When you need human input, don\'t guess — create a review and pause. Use the right type: "question" when you need clarification, "approval" when you need sign-off before proceeding, "error" when something is broken and you can\'t continue, "completion" when work is done and ready for review.',
   {
     type: z.enum(['question', 'approval', 'completion', 'error']).describe('Type of review'),
     title: z.string().describe('Short title for the review'),
