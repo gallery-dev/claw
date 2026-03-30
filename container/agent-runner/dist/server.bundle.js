@@ -77,6 +77,37 @@ function getSessionSummary(sessionId, transcriptPath, log4) {
   }
   return null;
 }
+async function callHaikuForSummary(prompt, log4) {
+  const baseUrl = process.env.ANTHROPIC_BASE_URL;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!baseUrl || !apiKey) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15e3);
+  try {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 600,
+        messages: [{ role: "user", content: prompt }]
+      })
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.content?.[0]?.type === "text" ? data.content[0].text?.trim() ?? null : null;
+  } catch (err) {
+    log4?.(`[haiku-summary] Failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 function createPreCompactHook(workspaceDir, assistantName, log4) {
   return async (input, _toolUseId, _context) => {
     const preCompact = input;
@@ -107,33 +138,113 @@ function createPreCompactHook(workspaceDir, assistantName, log4) {
       fs.mkdirSync(memoryDir, { recursive: true });
       const dailyFile = path.join(memoryDir, `${date}.md`);
       const timestamp = (/* @__PURE__ */ new Date()).toISOString().split("T")[1].replace(/\.\d+Z$/, "");
-      const marker = `
+      const existingSummary = fs.existsSync(dailyFile) ? fs.readFileSync(dailyFile, "utf-8") : "";
+      const transcriptSnippet = messages.map((m3) => `${m3.role === "user" ? "User" : assistantName || "Assistant"}: ${m3.content.slice(0, 500)}`).join("\n").slice(0, 6e3);
+      const summaryPrompt = existingSummary.length > 100 ? `Update this existing session summary with new information from the latest conversation segment.
+
+EXISTING SUMMARY:
+${existingSummary.slice(-3e3)}
+
+NEW CONVERSATION:
+${transcriptSnippet}
+
+Merge the new information into the existing structure. Update sections \u2014 don't duplicate. Move completed items from "In Progress" to "Accomplished". Add new decisions and next steps.
+
+Respond with EXACTLY this structure (skip sections that are empty):
+
+## Goal
+[Combined goal from all segments]
+
+## Accomplished
+[Everything completed across all segments]
+
+## In Progress
+[What is still ongoing after this segment]
+
+## Key Decisions
+[All important decisions, old and new]
+
+## Next Steps
+[Updated next steps after this segment]` : `Summarize this conversation in structured format for future reference.
+
+TRANSCRIPT:
+${transcriptSnippet}
+
+Respond with EXACTLY this structure (skip sections that are empty):
+
+## Goal
+[What was the user trying to accomplish?]
+
+## Accomplished
+[What was completed or decided?]
+
+## In Progress
+[What is still ongoing or needs follow-up?]
+
+## Key Decisions
+[Important decisions made and why]
+
+## Next Steps
+[What should happen next, if anything]`;
+      const structuredSummary = await callHaikuForSummary(summaryPrompt, log4);
+      const marker = structuredSummary ? `
+## Session Summary (${timestamp})
+
+Archived: \`conversations/${filename}\`${summary ? `
+Session: ${summary}` : ""}
+
+${structuredSummary}
+` : `
 ## Context compacted at ${timestamp}
 
 Conversation archived to \`conversations/${filename}\`${summary ? `
 Summary: ${summary}` : ""}
 `;
       fs.appendFileSync(dailyFile, marker);
-      log4?.(`Wrote compaction marker to memory/${date}.md`);
+      log4?.(`Wrote ${structuredSummary ? "structured summary" : "compaction marker"} to memory/${date}.md`);
     } catch (err) {
       log4?.(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
     }
     return {};
   };
 }
-var SECRET_ENV_VARS = ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
+var SECRET_ENV_VARS = [
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "GITHUB_TOKEN",
+  "GITHUB_PAT",
+  "SLACK_BOT_TOKEN",
+  "STRIPE_SECRET_KEY",
+  "SENDGRID_API_KEY",
+  "HUGGINGFACE_TOKEN",
+  "DATABASE_URL",
+  "POSTGRES_URL",
+  "MYSQL_URL",
+  "REDIS_URL",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "GOOGLE_API_KEY",
+  "REPLICATE_API_TOKEN",
+  "GALLERY_GATEWAY_TOKEN",
+  "GALLERY_TOKEN"
+];
+function redactSecretsFromCommand(command) {
+  return command.replace(/\b(sk-[A-Za-z0-9]{20,})/g, "sk-***REDACTED***").replace(/\b(ghp_[A-Za-z0-9]{36,})/g, "ghp_***REDACTED***").replace(/\b(github_pat_[A-Za-z0-9_]{82,})/g, "github_pat_***REDACTED***").replace(/\b(xox[bpoa]-[A-Za-z0-9-]+)/g, "xox***REDACTED***").replace(/\b(AIza[A-Za-z0-9_-]{35})/g, "AIza***REDACTED***").replace(/\b(AKIA[A-Z0-9]{16})/g, "AKIA***REDACTED***").replace(/\b(sk_live_[A-Za-z0-9]{24,})/g, "sk_live_***REDACTED***").replace(/\b(r8_[A-Za-z0-9]{37})/g, "r8_***REDACTED***").replace(/(password|secret|token|key|apikey)=["']?[A-Za-z0-9_\-\.]{8,}["']?/gi, "$1=***REDACTED***").replace(/Authorization:\s*Bearer\s+[A-Za-z0-9_\-\.]+/gi, "Authorization: Bearer ***REDACTED***").replace(/-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----/g, "***PRIVATE_KEY_REDACTED***").replace(/\b(postgres|mysql|mongodb|redis|amqp)(:\/\/)[^\s"']+/gi, "$1$2***REDACTED***");
+}
 function createSanitizeBashHook() {
   return async (input, _toolUseId, _context) => {
     const preInput = input;
     const command = preInput.tool_input?.command;
     if (!command) return {};
+    const redacted = redactSecretsFromCommand(command);
     const unsetPrefix = `unset ${SECRET_ENV_VARS.join(" ")} 2>/dev/null; `;
     return {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         updatedInput: {
           ...preInput.tool_input,
-          command: unsetPrefix + command
+          command: unsetPrefix + redacted
         }
       }
     };
@@ -274,17 +385,22 @@ var ContextWindowTracker = class {
   /** Last known input_tokens from the most recent assistant message (cumulative per API) */
   lastInputTokens = 0;
   lastOutputTokens = 0;
+  lastCacheReadTokens = 0;
+  lastCacheCreationTokens = 0;
   contextWindow = 0;
   warnedAt70 = false;
   checkpointedAt80 = false;
-  update(inputTokens, outputTokens, contextWindow) {
+  update(inputTokens, outputTokens, contextWindow, cacheReadTokens, cacheCreationTokens) {
     this.lastInputTokens = inputTokens;
     this.lastOutputTokens = outputTokens;
     if (contextWindow && contextWindow > 0) this.contextWindow = contextWindow;
+    if (cacheReadTokens !== void 0) this.lastCacheReadTokens = cacheReadTokens;
+    if (cacheCreationTokens !== void 0) this.lastCacheCreationTokens = cacheCreationTokens;
   }
   getPercentage() {
     if (this.contextWindow <= 0) return 0;
-    return this.lastInputTokens / this.contextWindow;
+    const effectiveTokens = this.lastInputTokens + this.lastCacheReadTokens;
+    return effectiveTokens / this.contextWindow;
   }
   shouldWarn() {
     if (this.warnedAt70) return false;
@@ -343,14 +459,14 @@ function createContextSafetyHook(tracker, activityPoster2, log4) {
     return {};
   };
 }
-async function postConvexActivity(convexUrl, token, agentId, type, content, metadata) {
+async function postConvexActivity(convexUrl, token, agentId, type, content, metadata, taskId) {
   try {
     await fetch(`${convexUrl}/api/mutation`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         path: "agentActivity:push",
-        args: { token, agentId, type, content: content.slice(0, 4e3), metadata }
+        args: { token, agentId, taskId, type, content: content.slice(0, 4e3), metadata }
       })
     });
   } catch {
@@ -364,6 +480,7 @@ var ActivityPoster = class _ActivityPoster {
   queue = [];
   timer = null;
   droppedCount = 0;
+  currentTaskId;
   constructor(convexUrl, token, agentId) {
     this.convexUrl = convexUrl;
     this.token = token;
@@ -372,9 +489,12 @@ var ActivityPoster = class _ActivityPoster {
       this.timer = setInterval(() => this.flush(), 2e3);
     }
   }
+  setTaskId(taskId) {
+    this.currentTaskId = taskId;
+  }
   post(type, content, metadata) {
     if (!this.convexUrl || !this.token) return;
-    this.queue.push({ type, content: content.slice(0, 4e3), metadata });
+    this.queue.push({ type, content: content.slice(0, 4e3), metadata, taskId: this.currentTaskId });
     while (this.queue.length > _ActivityPoster.MAX_QUEUE) {
       this.queue.shift();
       this.droppedCount++;
@@ -390,7 +510,7 @@ var ActivityPoster = class _ActivityPoster {
     if (this.queue.length === 0 || !this.convexUrl || !this.token) return;
     const batch = this.queue.splice(0, 10);
     for (const event of batch) {
-      await postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata);
+      await postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata, event.taskId);
     }
   }
   async stop() {
@@ -16089,6 +16209,9 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
     minute: "2-digit",
     hour12: true
   });
+  if (message.length > 5e5) {
+    throw new Error("Message too large (max 500KB)");
+  }
   let prompt = `<context timezone="${tz2}" localTime="${localTime}" />
 
 `;
@@ -16179,7 +16302,10 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
         if (msgUsage && ctx) {
           ctx.contextTracker.update(
             msgUsage.input_tokens ?? 0,
-            msgUsage.output_tokens ?? 0
+            msgUsage.output_tokens ?? 0,
+            void 0,
+            msgUsage.cache_read_input_tokens ?? 0,
+            msgUsage.cache_creation_input_tokens ?? 0
           );
         }
         const hadStreamEvents = streamEventCount > 0;
@@ -16386,10 +16512,10 @@ async function extractMemory(userMessage, assistantResult) {
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5",
-        max_tokens: 500,
+        max_tokens: 800,
         messages: [{
           role: "user",
-          content: `Extract key facts, decisions, or preferences from this conversation that would be useful to remember in future sessions. Only extract genuinely important information \u2014 skip routine/trivial exchanges.
+          content: `Extract information worth remembering from this conversation. Be selective \u2014 only extract genuinely useful facts, not routine exchanges.
 
 EXISTING MEMORY (do NOT repeat what's already here):
 ${existing.slice(0, 2e3)}
@@ -16398,7 +16524,15 @@ CONVERSATION:
 User: ${userMessage.slice(0, 3e3)}
 Assistant: ${assistantResult.slice(0, 3e3)}
 
-Respond with ONLY the new facts to append (as bullet points), or "NONE" if nothing worth remembering. Do not include headers or timestamps \u2014 just bullet points.`
+Extract into these categories (skip empty categories, skip if nothing new):
+
+**User preferences/habits:** Communication style, working hours, tool preferences, aesthetic preferences, things they dislike
+**Decisions made:** What was decided, why, any tradeoffs noted
+**Key facts:** Important project details, agent configurations, codebase facts, user context
+**Things that didn't work:** Approaches tried that failed (so they're not repeated)
+
+Respond ONLY with bullet points under category headers, or "NONE" if nothing worth remembering.
+No timestamps. No headers beyond the category names. Just bullet points.`
         }]
       })
     });
@@ -16472,6 +16606,9 @@ var AUTH_TOKEN = process.env.CLAW_AUTH_TOKEN || process.env.GALLERY_GATEWAY_TOKE
 var activeStreams = /* @__PURE__ */ new Map();
 function log3(message) {
   console.error(`[claw-server] ${message}`);
+}
+if (!AUTH_TOKEN) {
+  log3("WARNING: No CLAW_AUTH_TOKEN or GALLERY_GATEWAY_TOKEN set \u2014 all requests will be accepted without auth");
 }
 function requireAuth(req, res) {
   if (!AUTH_TOKEN) return true;
@@ -16572,7 +16709,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-27T16:27:44.389Z" : "";
+var buildTime = true ? "2026-03-30T23:13:18.596Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
