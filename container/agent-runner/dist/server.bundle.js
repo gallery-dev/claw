@@ -16508,7 +16508,8 @@ async function extractMemory(userMessage, assistantResult) {
       headers: {
         "Content-Type": "application/json",
         "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01"
+        "anthropic-version": "2023-06-01",
+        "x-gallery-agent-id": process.env.AGENT_ID || ""
       },
       body: JSON.stringify({
         model: "claude-haiku-4-5",
@@ -16709,7 +16710,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-30T23:13:18.596Z" : "";
+var buildTime = true ? "2026-03-31T02:01:05.659Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
@@ -16862,6 +16863,18 @@ async function handleTask(req, res) {
     assistantName: parsed.assistantName
   };
   log3(`POST /task (${params.message.length} chars, queue: ${requestQueue.length})`);
+  const fireAndForget = req.headers["x-fire-and-forget"] === "true";
+  if (fireAndForget) {
+    if (requestQueue.length >= MAX_QUEUE_SIZE) {
+      sendJson(res, 503, { error: "Queue full", queueLength: requestQueue.length });
+      return;
+    }
+    enqueueMessage(params).catch((err) => {
+      log3(`Task error (fire-and-forget): ${err instanceof Error ? err.message : String(err)}`);
+    });
+    sendJson(res, 202, { status: "accepted", queueLength: requestQueue.length + 1 });
+    return;
+  }
   try {
     const result = await enqueueMessage(params);
     sendJson(res, 200, result);
