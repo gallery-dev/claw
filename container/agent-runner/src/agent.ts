@@ -604,6 +604,7 @@ async function extractMemory(userMessage: string, assistantResult: string): Prom
         'Content-Type': 'application/json',
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
+        'x-gallery-agent-id': process.env.AGENT_ID || '',
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5',

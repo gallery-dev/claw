@@ -345,6 +345,23 @@ async function handleTask(req: http.IncomingMessage, res: http.ServerResponse): 
 
   log(`POST /task (${params.message.length} chars, queue: ${requestQueue.length})`);
 
+  // Fire-and-forget mode: return 202 immediately, process in background.
+  // Used by Scheduler DO for cron/heartbeat dispatch to avoid 30s timeout false failures.
+  const fireAndForget = req.headers['x-fire-and-forget'] === 'true';
+
+  if (fireAndForget) {
+    if (requestQueue.length >= MAX_QUEUE_SIZE) {
+      sendJson(res, 503, { error: 'Queue full', queueLength: requestQueue.length });
+      return;
+    }
+    enqueueMessage(params).catch((err) => {
+      log(`Task error (fire-and-forget): ${err instanceof Error ? err.message : String(err)}`);
+    });
+    sendJson(res, 202, { status: 'accepted', queueLength: requestQueue.length + 1 });
+    return;
+  }
+
+  // Synchronous mode: wait for completion (used by delegation).
   try {
     const result = await enqueueMessage(params);
     sendJson(res, 200, result);

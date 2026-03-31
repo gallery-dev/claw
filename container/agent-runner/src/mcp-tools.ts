@@ -977,7 +977,7 @@ server.tool(
   'gallery_list_tasks',
   'List tasks in the workspace kanban board. Returns title, status, priority, and assignee.',
   {
-    status: z.enum(['todo', 'in_progress', 'in_review', 'done']).optional().describe('Filter by status. Omit to list all.'),
+    status: z.enum(['scheduled', 'todo', 'in_progress', 'in_review', 'blocked', 'failed', 'done', 'cancelled']).optional().describe('Filter by status. Omit to list all.'),
   },
   async (args) => {
     const tasks = await convexQuery('mcpInternal:listTasks', { status: args.status });
@@ -994,8 +994,9 @@ server.tool(
     description: z.string().optional().describe('Detailed task description'),
     priority: z.enum(['urgent', 'high', 'medium', 'low', 'none']).optional(),
     assignedAgent: z.string().optional().describe('Name of the agent to assign this task to'),
-    status: z.enum(['todo', 'in_progress', 'in_review', 'done']).optional(),
+    status: z.enum(['scheduled', 'todo', 'in_progress', 'in_review', 'blocked', 'failed', 'done', 'cancelled']).optional(),
     labels: z.array(z.string()).optional().describe('Tags/labels for the task'),
+    dueDate: z.number().optional().describe('Due date as Unix timestamp in milliseconds'),
   },
   async (args) => {
     const id = await convexMutation('mcpInternal:createTask', {
@@ -1005,6 +1006,7 @@ server.tool(
       priority: args.priority,
       labels: args.labels,
       assignedAgent: args.assignedAgent,
+      dueDate: args.dueDate,
     });
     postActivity('status', `Created task: ${args.title}`, { taskId: id });
     return { content: [{ type: 'text' as const, text: `Task created: "${args.title}" [${args.status ?? 'todo'}]` }] };
@@ -1016,7 +1018,7 @@ server.tool(
   'Update a task by title. Can change status, priority, assignee, or description.',
   {
     title: z.string().describe('Title of the task to update (exact match)'),
-    status: z.enum(['todo', 'in_progress', 'in_review', 'done']).optional(),
+    status: z.enum(['scheduled', 'todo', 'in_progress', 'in_review', 'blocked', 'failed', 'done', 'cancelled']).optional(),
     priority: z.enum(['urgent', 'high', 'medium', 'low', 'none']).optional(),
     assignedAgent: z.string().optional(),
     description: z.string().optional(),
@@ -1029,7 +1031,7 @@ server.tool(
     // Track current task for activity visibility
     if (args.status === 'in_progress') {
       currentTaskId = task._id;
-    } else if (args.status === 'done' || args.status === 'failed') {
+    } else if (args.status === 'done' || args.status === 'failed' || args.status === 'cancelled') {
       currentTaskId = undefined;
     }
 
