@@ -16,7 +16,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
-import { type ActivityType, postConvexActivity } from './shared.js';
+import { type ActivityType, postConvexActivity, SECRET_ENV_VARS } from './shared.js';
 
 const WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace';
 const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
@@ -87,6 +87,23 @@ const convexUrl = process.env.GALLERY_CONVEX_URL || '';
 const gatewayToken = process.env.GALLERY_GATEWAY_TOKEN || '';
 
 let currentTaskId: string | undefined;
+let planModeActive = false;
+
+/** Check if the current operation is blocked by plan mode. Returns error content or null. */
+function checkPlanMode(toolName: string): { content: Array<{ type: 'text'; text: string }>; isError: true } | null {
+  if (!planModeActive) return null;
+  const readOnlyTools = new Set([
+    'memory_view', 'memory_search', 'gallery_list_tasks', 'gallery_list_agents',
+    'gallery_list_reviews', 'gallery_workspace_info', 'gallery_context_usage',
+    'gallery_read_peer_memory', 'skill_list', 'gallery_exit_plan_mode',
+    'update_progress', 'send_message',
+  ]);
+  if (readOnlyTools.has(toolName)) return null;
+  return {
+    content: [{ type: 'text' as const, text: `Blocked: "${toolName}" is not available in plan mode. Only read-only tools are allowed. Call gallery_exit_plan_mode to resume execution.` }],
+    isError: true,
+  };
+}
 
 function postActivity(type: ActivityType, content: string, metadata?: unknown): void {
   if (!convexUrl || !gatewayToken) return;
@@ -148,9 +165,9 @@ async function searchMemoryEntries(searchQuery: string, limit: number = 10): Pro
 // ─── Sub-task Decomposition ──────────────────────────────
 
 const DELEGATION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-const SUBTASK_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
-const MAX_CONCURRENT_SUBTASKS = 3;
-const MAX_SUBTASKS = 5;
+const SUBTASK_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_CONCURRENT_SUBTASKS = 5;
+const MAX_SUBTASKS = 10;
 
 interface SubtaskResult {
   index: number;
@@ -187,7 +204,7 @@ async function runSubtask(
       options: {
         cwd: WORKSPACE_DIR,
         model: process.env.CLAW_SUBTASK_MODEL || 'claude-sonnet-4-6',
-        maxTurns: 15,
+        maxTurns: 50,
         allowedTools: [
           'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
           'WebSearch', 'WebFetch',
@@ -195,11 +212,15 @@ async function runSubtask(
         ],
         env: {
           ...Object.fromEntries(
-            Object.entries(process.env).filter(([k]) => !['CLAUDE_CODE_OAUTH_TOKEN'].includes(k))
+            Object.entries(process.env).filter(([k]) =>
+              !['CLAUDE_CODE_OAUTH_TOKEN', ...SECRET_ENV_VARS].includes(k)
+            )
           ),
+          // Re-include API keys the SDK subprocess needs to call Claude
+          ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+          ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || '',
         },
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
+        permissionMode: 'acceptEdits',
         abortController: controller,
       },
     })) {
@@ -374,6 +395,8 @@ You must know the target agent's Convex ID (agentId) to delegate. You can find a
     context: z.string().optional().describe("Additional context, data, or files the target agent needs"),
   },
   async (args) => {
+    const blocked = checkPlanMode('gallery_delegate_task');
+    if (blocked) return blocked;
     if (!galleryApiUrl || !galleryToken) {
       return {
         content: [{ type: 'text' as const, text: 'Agent delegation requires Gallery API (not configured).' }],
@@ -389,38 +412,56 @@ You must know the target agent's Convex ID (agentId) to delegate. You can find a
       const delegateUrl = galleryWorkerUrl
         ? `${galleryWorkerUrl}/delegate`
         : `${galleryApiUrl}/api/claw/delegate`;
-      const response = await fetch(delegateUrl, {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${galleryToken}`,
-        },
-        body: JSON.stringify({
-          type: 'task',
-          toAgentId: args.toAgentId,
-          fromAgentId: agentId,
-          task: args.task,
-          context: args.context,
-        }),
-      });
 
-      if (!response.ok) {
-        const err = await response.text();
-        return {
-          content: [{ type: 'text' as const, text: `Delegation failed (${response.status}): ${err}` }],
-          isError: true,
-        };
+      // Retry with backoff on 5xx errors
+      const retryDelays = [0, 1000, 5000];
+      let lastError = '';
+      let lastStatus = 0;
+
+      for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+        if (attempt > 0) {
+          await new Promise(r => setTimeout(r, retryDelays[attempt]));
+          postActivity('status', `Delegation retry ${attempt + 1}/3 to agent ${args.toAgentId}`);
+        }
+
+        const response = await fetch(delegateUrl, {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${galleryToken}`,
+          },
+          body: JSON.stringify({
+            type: 'task',
+            toAgentId: args.toAgentId,
+            fromAgentId: agentId,
+            task: args.task,
+            context: args.context,
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json() as { success: boolean; result?: string | null };
+          return {
+            content: [{
+              type: 'text' as const,
+              text: data.result
+                ? `Agent completed task.\n\nResult:\n${data.result}`
+                : 'Agent completed task (no text output).',
+            }],
+          };
+        }
+
+        lastStatus = response.status;
+        lastError = await response.text();
+
+        // Don't retry on 4xx (client errors)
+        if (response.status < 500) break;
       }
 
-      const data = await response.json() as { success: boolean; result?: string | null };
       return {
-        content: [{
-          type: 'text' as const,
-          text: data.result
-            ? `Agent completed task.\n\nResult:\n${data.result}`
-            : 'Agent completed task (no text output).',
-        }],
+        content: [{ type: 'text' as const, text: `Delegation failed (${lastStatus}): ${lastError}` }],
+        isError: true,
       };
     } catch (err) {
       const isAbort = err instanceof Error && err.name === 'AbortError';
@@ -603,6 +644,8 @@ Best practices:
     mode: z.enum(['append', 'replace', 'create']).default('append').describe('append=add to end (default), replace=overwrite entire file, create=new file only'),
   },
   async (args) => {
+    const blocked = checkPlanMode('memory_write');
+    if (blocked) return blocked;
     let targetPath: string;
     if (args.path === 'MEMORY.md' || args.path === '/MEMORY.md') {
       targetPath = MEMORY_FILE;
@@ -759,6 +802,8 @@ server.tool(
     path: z.string().describe('File path to delete, relative to memory.'),
   },
   async (args) => {
+    const blocked = checkPlanMode('memory_delete');
+    if (blocked) return blocked;
     let targetPath: string;
     if (args.path === 'MEMORY.md' || args.path === '/MEMORY.md') {
       targetPath = MEMORY_FILE;
@@ -999,6 +1044,8 @@ server.tool(
     dueDate: z.number().optional().describe('Due date as Unix timestamp in milliseconds'),
   },
   async (args) => {
+    const blocked = checkPlanMode('gallery_create_task');
+    if (blocked) return blocked;
     const id = await convexMutation('mcpInternal:createTask', {
       title: args.title,
       description: args.description,
@@ -1015,18 +1062,35 @@ server.tool(
 
 server.tool(
   'gallery_update_task',
-  'Update a task by title. Can change status, priority, assignee, or description.',
+  'Update a task. Prefer passing taskId if you have it; falls back to title matching.',
   {
-    title: z.string().describe('Title of the task to update (exact match)'),
+    taskId: z.string().optional().describe('Task ID (preferred — use IDs from gallery_list_tasks or gallery_create_task)'),
+    title: z.string().optional().describe('Title of the task to update (fallback if no taskId)'),
     status: z.enum(['scheduled', 'todo', 'in_progress', 'in_review', 'blocked', 'failed', 'done', 'cancelled']).optional(),
     priority: z.enum(['urgent', 'high', 'medium', 'low', 'none']).optional(),
     assignedAgent: z.string().optional(),
     description: z.string().optional(),
   },
   async (args) => {
-    const tasks = await convexQuery('mcpInternal:listTasks', {});
-    const task = (tasks as any[]).find((t: any) => t.title.toLowerCase() === args.title.toLowerCase());
-    if (!task) return { content: [{ type: 'text' as const, text: `Task "${args.title}" not found.` }], isError: true };
+    let task: any;
+    if (args.taskId) {
+      // Direct ID lookup — fast and unambiguous
+      const tasks = await convexQuery('mcpInternal:listTasks', {});
+      task = (tasks as any[]).find((t: any) => t._id === args.taskId);
+      if (!task) return { content: [{ type: 'text' as const, text: `Task with ID "${args.taskId}" not found.` }], isError: true };
+    } else if (args.title) {
+      // Title-based fallback
+      const tasks = await convexQuery('mcpInternal:listTasks', {});
+      const matches = (tasks as any[]).filter((t: any) => t.title.toLowerCase() === args.title!.toLowerCase());
+      if (matches.length === 0) return { content: [{ type: 'text' as const, text: `Task "${args.title}" not found.` }], isError: true };
+      if (matches.length > 1) {
+        const list = matches.map((t: any) => `- "${t.title}" (${t.status}, id: ${t._id})`).join('\n');
+        return { content: [{ type: 'text' as const, text: `Multiple tasks match "${args.title}":\n${list}\nPlease use taskId instead.` }], isError: true };
+      }
+      task = matches[0];
+    } else {
+      return { content: [{ type: 'text' as const, text: 'Either taskId or title is required.' }], isError: true };
+    }
 
     // Track current task for activity visibility
     if (args.status === 'in_progress') {
@@ -1049,17 +1113,32 @@ server.tool(
 
 server.tool(
   'gallery_delete_task',
-  'Delete a task by title. Permanently removes it from the kanban board.',
+  'Delete a task. Prefer passing taskId if you have it; falls back to title matching.',
   {
-    title: z.string().describe('Title of the task to delete (exact match)'),
+    taskId: z.string().optional().describe('Task ID (preferred)'),
+    title: z.string().optional().describe('Title of the task to delete (fallback)'),
   },
   async (args) => {
-    const tasks = await convexQuery('mcpInternal:listTasks', {});
-    const task = (tasks as any[]).find((t: any) => t.title.toLowerCase() === args.title.toLowerCase());
-    if (!task) return { content: [{ type: 'text' as const, text: `Task "${args.title}" not found.` }], isError: true };
+    let task: any;
+    if (args.taskId) {
+      const tasks = await convexQuery('mcpInternal:listTasks', {});
+      task = (tasks as any[]).find((t: any) => t._id === args.taskId);
+      if (!task) return { content: [{ type: 'text' as const, text: `Task with ID "${args.taskId}" not found.` }], isError: true };
+    } else if (args.title) {
+      const tasks = await convexQuery('mcpInternal:listTasks', {});
+      const matches = (tasks as any[]).filter((t: any) => t.title.toLowerCase() === args.title!.toLowerCase());
+      if (matches.length === 0) return { content: [{ type: 'text' as const, text: `Task "${args.title}" not found.` }], isError: true };
+      if (matches.length > 1) {
+        const list = matches.map((t: any) => `- "${t.title}" (${t.status}, id: ${t._id})`).join('\n');
+        return { content: [{ type: 'text' as const, text: `Multiple tasks match "${args.title}":\n${list}\nPlease use taskId instead.` }], isError: true };
+      }
+      task = matches[0];
+    } else {
+      return { content: [{ type: 'text' as const, text: 'Either taskId or title is required.' }], isError: true };
+    }
 
     await convexMutation('mcpInternal:deleteTask', { taskId: task._id });
-    return { content: [{ type: 'text' as const, text: `Task "${args.title}" deleted.` }] };
+    return { content: [{ type: 'text' as const, text: `Task "${task.title}" deleted.` }] };
   },
 );
 
@@ -1072,8 +1151,13 @@ server.tool(
   },
   async (args) => {
     const tasks = await convexQuery('mcpInternal:listTasks', {});
-    const task = (tasks as any[]).find((t: any) => t.title.toLowerCase() === args.title.toLowerCase());
-    if (!task) return { content: [{ type: 'text' as const, text: `Task "${args.title}" not found.` }], isError: true };
+    const matches = (tasks as any[]).filter((t: any) => t.title.toLowerCase() === args.title.toLowerCase());
+    if (matches.length === 0) return { content: [{ type: 'text' as const, text: `Task "${args.title}" not found.` }], isError: true };
+    if (matches.length > 1) {
+      const list = matches.map((t: any) => `- "${t.title}" (${t.status}, id: ${t._id})`).join('\n');
+      return { content: [{ type: 'text' as const, text: `Multiple tasks match "${args.title}":\n${list}\nPlease use a more specific title.` }], isError: true };
+    }
+    const task = matches[0];
 
     await convexMutation('mcpInternal:addTaskComment', { taskId: task._id, content: args.content });
     return { content: [{ type: 'text' as const, text: `Comment added to "${args.title}".` }] };
@@ -1158,8 +1242,13 @@ Use this when you're working on a delegated subtask and need to send updates or 
   },
   async (args) => {
     const tasks = await convexQuery('mcpInternal:listTasks', {});
-    const childTask = (tasks as any[]).find((t: any) => t.title.toLowerCase() === args.taskTitle.toLowerCase());
-    if (!childTask) return { content: [{ type: 'text' as const, text: `Task "${args.taskTitle}" not found.` }], isError: true };
+    const matches = (tasks as any[]).filter((t: any) => t.title.toLowerCase() === args.taskTitle.toLowerCase());
+    if (matches.length === 0) return { content: [{ type: 'text' as const, text: `Task "${args.taskTitle}" not found.` }], isError: true };
+    if (matches.length > 1) {
+      const list = matches.map((t: any) => `- "${t.title}" (${t.status}, id: ${t._id})`).join('\n');
+      return { content: [{ type: 'text' as const, text: `Multiple tasks match "${args.taskTitle}":\n${list}\nPlease use a more specific title.` }], isError: true };
+    }
+    const childTask = matches[0];
     if (!childTask.parentTaskId) return { content: [{ type: 'text' as const, text: `Task "${args.taskTitle}" has no parent task.` }], isError: true };
 
     const result = await convexMutation('mcpInternal:reportToParent', {
@@ -1181,6 +1270,307 @@ server.tool(
   async () => {
     const info = await convexQuery('mcpInternal:workspaceInfo', {});
     return { content: [{ type: 'text' as const, text: JSON.stringify(info, null, 2) }] };
+  },
+);
+
+// ─── Context & Compact Tools ───────────────────────────────
+
+server.tool(
+  'gallery_context_usage',
+  `Check how much of your context window is used. Returns percentage, token counts, and limit.
+
+Use this to decide whether to summarize, compact, or wrap up. If you're above 60%, consider being more concise. Above 80%, save progress to memory immediately.`,
+  {},
+  async () => {
+    const usageFile = path.join(WORKSPACE_DIR, '.context-usage.json');
+    if (!fs.existsSync(usageFile)) {
+      return { content: [{ type: 'text' as const, text: 'Context usage data not yet available (no messages processed).' }] };
+    }
+    try {
+      const data = JSON.parse(fs.readFileSync(usageFile, 'utf-8'));
+      const age = Math.round((Date.now() - (data.updatedAt || 0)) / 1000);
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Context usage: ${data.percentage}%\n` +
+            `Input tokens: ${(data.inputTokens || 0).toLocaleString()}\n` +
+            `Cache read: ${(data.cacheReadTokens || 0).toLocaleString()}\n` +
+            `Output tokens: ${(data.outputTokens || 0).toLocaleString()}\n` +
+            `Context window: ${(data.contextWindow || 0).toLocaleString()}\n` +
+            `Updated: ${age}s ago`,
+        }],
+      };
+    } catch {
+      return { content: [{ type: 'text' as const, text: 'Failed to read context usage.' }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'gallery_compact',
+  `Manually checkpoint your current progress before context compaction. Archives the current conversation and writes a structured summary to daily memory.
+
+Use this when:
+- You're on a long task and want to save progress before auto-compaction hits
+- You're about to switch to a completely different task
+- gallery_context_usage shows you're above 70%
+
+This does NOT trigger SDK compaction — it saves a checkpoint so nothing is lost when compaction eventually fires.`,
+  {
+    focus: z.string().optional().describe('Optional: what to emphasize in the summary (e.g., "keep architecture decisions, drop debugging steps")'),
+  },
+  async (args) => {
+    const memoryDir = path.join(WORKSPACE_DIR, 'memory');
+    fs.mkdirSync(memoryDir, { recursive: true });
+
+    const date = new Date().toISOString().split('T')[0];
+    const timestamp = new Date().toISOString().split('T')[1].replace(/\.\d+Z$/, '');
+    const dailyFile = path.join(memoryDir, `${date}.md`);
+
+    // Read existing context usage
+    let contextInfo = '';
+    const usageFile = path.join(WORKSPACE_DIR, '.context-usage.json');
+    if (fs.existsSync(usageFile)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(usageFile, 'utf-8'));
+        contextInfo = `Context: ${data.percentage}% used (${(data.inputTokens || 0).toLocaleString()} tokens)`;
+      } catch { /* ignore */ }
+    }
+
+    const marker = [
+      `\n## Manual Checkpoint (${timestamp})`,
+      '',
+      contextInfo ? contextInfo : '',
+      args.focus ? `Focus: ${args.focus}` : '',
+      '',
+      'Checkpoint created by agent via gallery_compact.',
+      'Use this marker to resume work if context is compacted.',
+      '',
+    ].filter(Boolean).join('\n');
+
+    fs.appendFileSync(dailyFile, marker);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Checkpoint saved to memory/${date}.md\n${contextInfo}\n\nWrite your key findings, decisions, and next steps to MEMORY.md now before compaction occurs.`,
+      }],
+    };
+  },
+);
+
+// ─── Structured Output Tool ────────────────────────────────
+
+server.tool(
+  'gallery_structured_output',
+  `Return structured JSON data as a tool result. Use this when you need to return machine-readable data to the caller (e.g., delegation results, API responses, structured reports).
+
+The output is validated as JSON before being returned. If the data is not valid JSON, it will be returned as a string with an error flag.`,
+  {
+    data: z.string().describe('JSON string to return as structured output'),
+    schema_description: z.string().optional().describe('Optional: description of the JSON schema for documentation'),
+  },
+  async (args) => {
+    try {
+      // Validate JSON
+      const parsed = JSON.parse(args.data);
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify(parsed, null, 2),
+        }],
+      };
+    } catch {
+      return {
+        content: [{ type: 'text' as const, text: `Invalid JSON: ${args.data.slice(0, 500)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+// ─── Cross-Agent Memory ────────────────────────────────────
+
+server.tool(
+  'gallery_read_peer_memory',
+  `Read another agent's memory files. Use this to check what a peer agent has learned before delegating work (avoids duplicate effort) or to share knowledge across the team.
+
+This is READ-ONLY — you cannot write to another agent's memory. To share information, write it to your own memory and let the other agent read yours.`,
+  {
+    targetAgentId: z.string().describe("Convex document ID of the agent whose memory you want to read"),
+    query: z.string().optional().describe('Optional: search query to find specific memories (BM25 full-text search)'),
+    limit: z.number().default(5).describe('Max results for search queries'),
+  },
+  async (args) => {
+    if (!convexUrl || !gatewayToken) {
+      return { content: [{ type: 'text' as const, text: 'Cross-agent memory requires Gallery API (not configured).' }], isError: true };
+    }
+
+    try {
+      if (args.query) {
+        // Search target agent's memory via Convex
+        const res = await fetch(`${convexUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            path: 'memoryEntries:search',
+            args: { token: gatewayToken, agentId: args.targetAgentId, query: args.query, limit: args.limit },
+          }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!res.ok) return { content: [{ type: 'text' as const, text: `Failed to search peer memory: ${res.status}` }], isError: true };
+        const data = await res.json();
+        const entries = data.value ?? data ?? [];
+        if (!Array.isArray(entries) || entries.length === 0) {
+          return { content: [{ type: 'text' as const, text: `No results for "${args.query}" in agent ${args.targetAgentId}'s memory.` }] };
+        }
+        const formatted = entries.map((e: any) => `**${e.path}**\n${(e.body || '').slice(0, 500)}`).join('\n\n---\n\n');
+        return { content: [{ type: 'text' as const, text: `Found ${entries.length} result(s) in peer memory:\n\n${formatted}` }] };
+      } else {
+        // List target agent's memory entries
+        const res = await fetch(`${convexUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            path: 'memoryEntries:listPaths',
+            args: { token: gatewayToken, agentId: args.targetAgentId },
+          }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!res.ok) return { content: [{ type: 'text' as const, text: `Failed to list peer memory: ${res.status}` }], isError: true };
+        const data = await res.json();
+        const paths = data.value ?? data ?? [];
+        if (!Array.isArray(paths) || paths.length === 0) {
+          return { content: [{ type: 'text' as const, text: `Agent ${args.targetAgentId} has no indexed memory entries.` }] };
+        }
+        const formatted = paths.map((p: any) => `- ${p.path} (updated: ${new Date(p.updatedAt).toLocaleDateString()})`).join('\n');
+        return { content: [{ type: 'text' as const, text: `Agent ${args.targetAgentId}'s memory files:\n${formatted}\n\nUse query parameter to search specific topics.` }] };
+      }
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Peer memory error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+// ─── Plan Mode Toggle ──────────────────────────────────────
+
+server.tool(
+  'gallery_enter_plan_mode',
+  `Enter planning mode. Use this when you need to think through a complex task before executing it. In plan mode:
+
+1. Write your plan to a file (e.g., memory/plan-{topic}.md)
+2. Create a review of type "approval" with the plan summary
+3. Stop executing and wait for the owner to approve
+
+This is a behavioral toggle — you commit to only reading and planning, not executing. Call gallery_exit_plan_mode when approved.`,
+  {
+    plan_title: z.string().describe('Title of what you are planning'),
+    plan_content: z.string().describe('The full plan — steps, rationale, risks, alternatives'),
+  },
+  async (args) => {
+    // Write plan to memory
+    const slug = args.plan_title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+    const planFile = path.join(MEMORY_DIR, `plan-${slug}.md`);
+    fs.mkdirSync(MEMORY_DIR, { recursive: true });
+    fs.writeFileSync(planFile, `# Plan: ${args.plan_title}\n\n${args.plan_content}\n\n---\n*Created: ${new Date().toISOString()}*\n`);
+    indexMemoryEntry(`plan-${slug}.md`, fs.readFileSync(planFile, 'utf-8'));
+
+    // Create approval review
+    try {
+      const agents = await convexQuery('mcpInternal:listAgents', {});
+      const self = (agents as any[]).find((a: any) => a._id === agentId);
+      if (self) {
+        await convexMutation('mcpInternal:createReview', {
+          agentId,
+          type: 'approval',
+          title: `Plan: ${args.plan_title}`,
+          content: args.plan_content.slice(0, 2000),
+        });
+      }
+    } catch { /* non-fatal — plan is saved even if review creation fails */ }
+
+    planModeActive = true;
+    postActivity('status', `Entered plan mode: ${args.plan_title}`);
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Plan saved to memory/plan-${slug}.md and submitted for approval.\n\n` +
+          `**You are now in PLAN MODE.** Mutating tools (task create/update/delete, delegation, memory writes) are blocked. ` +
+          `Only read-only tools are available.\n\n` +
+          `When approved, call gallery_exit_plan_mode to resume execution.`,
+      }],
+    };
+  },
+);
+
+server.tool(
+  'gallery_exit_plan_mode',
+  `Exit planning mode and resume normal execution. Call this after your plan has been approved (check gallery_list_reviews for approval status).`,
+  {
+    plan_title: z.string().describe('Title of the plan that was approved'),
+  },
+  async (args) => {
+    planModeActive = false;
+    postActivity('status', `Exited plan mode: ${args.plan_title}`);
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Plan mode exited. All tools are now available. Execute the approved plan for "${args.plan_title}".\n\nRead your plan file from memory before starting execution.`,
+      }],
+    };
+  },
+);
+
+// ─── Sleep / Self-Wake ─────────────────────────────────────
+
+server.tool(
+  'gallery_sleep',
+  `Schedule a self-wake after a delay. The agent will receive a scheduled task message after the specified duration. Use this for:
+- Polling a condition ("check back in 5 minutes if the deploy finished")
+- Time-delayed actions ("send the report at 5pm")
+- Monitoring workflows ("check API health every 10 minutes")
+
+The wake message is sent as a scheduled task — it will appear as a new message in your conversation.`,
+  {
+    delay_seconds: z.number().min(10).max(3600).describe('Delay in seconds before waking (10s to 1 hour)'),
+    wake_message: z.string().describe('Message to send yourself when waking up — include context about what to check or do'),
+  },
+  async (args) => {
+    if (!galleryWorkerUrl || !galleryToken) {
+      return { content: [{ type: 'text' as const, text: 'Self-wake requires Gallery Worker (not configured).' }], isError: true };
+    }
+
+    try {
+      // Register a one-time delayed task via the scheduler
+      const response = await fetch(`${galleryWorkerUrl}/scheduler/schedule/once`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${galleryToken}`,
+        },
+        body: JSON.stringify({
+          agentId,
+          delaySeconds: args.delay_seconds,
+          message: `[SELF-WAKE] ${args.wake_message}`,
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text();
+        return { content: [{ type: 'text' as const, text: `Sleep scheduling failed (${response.status}): ${err}` }], isError: true };
+      }
+
+      const wakeTime = new Date(Date.now() + args.delay_seconds * 1000).toLocaleTimeString();
+      postActivity('status', `Scheduled self-wake in ${args.delay_seconds}s at ~${wakeTime}`);
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Self-wake scheduled in ${args.delay_seconds} seconds (~${wakeTime}).\n\nWake message: "${args.wake_message}"\n\nYou can continue working on other tasks. The wake message will arrive as a scheduled task.`,
+        }],
+      };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Sleep error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
   },
 );
 

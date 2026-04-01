@@ -30,8 +30,11 @@ import {
   createSanitizeBashHook,
   createLoopDetectionHook,
   createContextSafetyHook,
+  redactSecretsFromOutput,
+  writeContextUsage,
+  scanForInjection,
 } from './shared.js';
-import { UIStreamWriter, generateMessageId, isAiSdkEnabled } from './ui-stream.js';
+import { UIStreamWriter, generateMessageId } from './ui-stream.js';
 import type { MessageMetadata } from './ui-stream.js';
 import { SessionManager } from './session-manager.js';
 import type { ConversationContext } from './session-manager.js';
@@ -46,20 +49,37 @@ function log(message: string): void {
   console.error(`[claw] ${message}`);
 }
 
-/** Estimate cost in USD from token counts. Conservative (uses Opus rates as default). */
-function estimateCostUsd(inputTokens: number, outputTokens: number, model?: string): number {
+/** Estimate billed cost in USD from token counts. Matches AI Gateway calculation:
+ *  real provider cost × 3x markup. Cache-aware: cache reads at 10%, creation at 125%. */
+const BILLING_MARKUP = 3;
+function estimateCostUsd(
+  inputTokens: number,
+  outputTokens: number,
+  model?: string,
+  cacheReadTokens = 0,
+  cacheCreationTokens = 0,
+): number {
   const m = (model || MODEL).toLowerCase();
-  let inputRate: number; // $ per million tokens
+  let inputRate: number; // $ per million tokens (provider cost)
   let outputRate: number;
   if (m.includes('haiku')) {
-    inputRate = 0.80; outputRate = 4;
+    inputRate = 1; outputRate = 5;
   } else if (m.includes('sonnet')) {
     inputRate = 3; outputRate = 15;
+  } else if (m.includes('opus')) {
+    inputRate = 5; outputRate = 25;
   } else {
-    // Opus or unknown — use Opus rates (conservative)
-    inputRate = 15; outputRate = 75;
+    // Unknown model — use Sonnet rates as reasonable default
+    inputRate = 3; outputRate = 15;
   }
-  return (inputTokens * inputRate + outputTokens * outputRate) / 1_000_000;
+  const uncachedInput = Math.max(0, inputTokens - cacheReadTokens - cacheCreationTokens);
+  const providerCost = (
+    uncachedInput * inputRate +
+    cacheReadTokens * inputRate * 0.1 +
+    cacheCreationTokens * inputRate * 1.25 +
+    outputTokens * outputRate
+  ) / 1_000_000;
+  return providerCost * BILLING_MARKUP;
 }
 
 /** Default context window sizes by model family. */
@@ -127,17 +147,16 @@ export interface MessageResult {
   usage?: UsageInfo;
 }
 
-/** SSE event emitted during streaming. */
-export interface StreamEvent {
-  type: 'text' | 'tool_call_start' | 'tool_call_end' | 'thinking' | 'progress' | 'context_usage' | 'done';
-  data: Record<string, unknown>;
-}
 
 // ─── Persistent State ────────────────────────────────────
 // Global state shared across all conversations.
 // Per-conversation state (session, locks, trackers) lives in SessionManager.
 
 let activityPoster: ActivityPoster | null = null;
+
+// Mutable cancel ref — updated per-message, checked by PreToolUse hook
+// to abort before starting long tool executions (e.g., Bash commands).
+const activeCancelRef: { current: { cancelled: boolean } | null } = { current: null };
 
 // Session manager — handles multiple conversations per container
 const sessionManager = new SessionManager({
@@ -163,9 +182,16 @@ const sessionManager = new SessionManager({
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
         PreToolUse: [
+          // Cancel check — abort before starting tool execution if user cancelled
+          { hooks: [async () => {
+            if (activeCancelRef.current?.cancelled) {
+              return { decision: 'block' as const, reason: 'Cancelled by user' };
+            }
+            return undefined;
+          }] },
           { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
           { hooks: [createLoopDetectionHook(loopTracker, log)] },
-          { hooks: [createContextSafetyHook(contextTracker, activityPoster, log)] },
+          { hooks: [createContextSafetyHook(contextTracker, activityPoster, log, WORKSPACE_DIR)] },
         ],
       },
     };
@@ -193,7 +219,6 @@ function ensureActivityPoster(agentId: string): ActivityPoster {
 
 export async function processMessage(
   params: MessageParams,
-  onEvent?: (event: StreamEvent) => void,
   writer?: UIStreamWriter,
   cancelSignal?: { cancelled: boolean },
 ): Promise<MessageResult> {
@@ -207,27 +232,28 @@ export async function processMessage(
   const releaseLock = await sessionManager.acquireLock(conversationId);
 
   try {
-    return await processMessageInner(params, onEvent, writer, cancelSignal, ctx);
+    return await processMessageInner(params, writer, cancelSignal, ctx);
   } finally {
+    activeCancelRef.current = null;
     releaseLock();
   }
 }
 
 async function processMessageInner(
   params: MessageParams,
-  onEvent?: (event: StreamEvent) => void,
   writer?: UIStreamWriter,
   cancelSignal?: { cancelled: boolean },
   ctx?: ConversationContext,
 ): Promise<MessageResult> {
   const { message, isScheduledTask, assistantName } = params;
   const conversationId = params.sessionId || 'default';
-  const useAiSdk = !!writer;
-
   // Initialize activity poster before session creation (hooks reference it)
   const agentId = process.env.AGENT_ID || assistantName || 'unknown';
   ensureActivityPoster(agentId);
   activityPoster!.post('status', 'Processing message');
+
+  // Set cancel ref so PreToolUse hook can abort before starting tool execution
+  activeCancelRef.current = cancelSignal ?? null;
 
   // Build prompt with timezone context
   const tz = process.env.AGENT_TIMEZONE || 'UTC';
@@ -241,7 +267,62 @@ async function processMessageInner(
     throw new Error('Message too large (max 500KB)');
   }
 
-  let prompt = `<context timezone="${tz}" localTime="${localTime}" />\n\n`;
+  // ─── Dynamic workspace state (injected per-turn) ───────
+  let workspaceState = '';
+  const convexUrl = process.env.GALLERY_CONVEX_URL;
+  const gwToken = process.env.GALLERY_GATEWAY_TOKEN;
+  if (convexUrl && gwToken) {
+    try {
+      const [tasksRes, agentsRes, reviewsRes] = await Promise.allSettled([
+        fetch(`${convexUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: 'mcpInternal:listTasks', args: { token: gwToken } }),
+          signal: AbortSignal.timeout(5_000),
+        }).then(r => r.ok ? r.json() : null),
+        fetch(`${convexUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: 'mcpInternal:listAgents', args: { token: gwToken } }),
+          signal: AbortSignal.timeout(5_000),
+        }).then(r => r.ok ? r.json() : null),
+        fetch(`${convexUrl}/api/query`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: 'mcpInternal:listReviews', args: { token: gwToken, status: 'pending' } }),
+          signal: AbortSignal.timeout(5_000),
+        }).then(r => r.ok ? r.json() : null),
+      ]);
+
+      const tasks = tasksRes.status === 'fulfilled' ? (tasksRes.value?.value ?? tasksRes.value ?? []) : [];
+      const agents = agentsRes.status === 'fulfilled' ? (agentsRes.value?.value ?? agentsRes.value ?? []) : [];
+      const reviews = reviewsRes.status === 'fulfilled' ? (reviewsRes.value?.value ?? reviewsRes.value ?? []) : [];
+
+      if (Array.isArray(tasks) || Array.isArray(agents) || Array.isArray(reviews)) {
+        const parts: string[] = [];
+        if (Array.isArray(agents) && agents.length > 0) {
+          const active = agents.filter((a: any) => a.status === 'active');
+          const unhealthy = agents.filter((a: any) => (a.healthFailures ?? 0) > 2);
+          parts.push(`Agents: ${active.length} active${unhealthy.length > 0 ? `, ${unhealthy.length} UNHEALTHY (${unhealthy.map((a: any) => a.name).join(', ')})` : ''}`);
+        }
+        if (Array.isArray(tasks) && tasks.length > 0) {
+          const inProgress = tasks.filter((t: any) => t.status === 'in_progress').length;
+          const blocked = tasks.filter((t: any) => t.status === 'blocked' || t.status === 'in_review').length;
+          parts.push(`Tasks: ${tasks.length} total, ${inProgress} in progress${blocked > 0 ? `, ${blocked} blocked/in-review` : ''}`);
+        }
+        if (Array.isArray(reviews) && reviews.length > 0) {
+          parts.push(`Pending reviews: ${reviews.length}`);
+        }
+        if (parts.length > 0) {
+          workspaceState = `<workspace-state>\n${parts.join('\n')}\n</workspace-state>\n\n`;
+        }
+      }
+    } catch {
+      // Non-fatal — workspace state is nice-to-have
+    }
+  }
+
+  let prompt = `<context timezone="${tz}" localTime="${localTime}" />\n\n${workspaceState}`;
   if (isScheduledTask) {
     prompt += `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user.]\n\n`;
   }
@@ -257,16 +338,16 @@ async function processMessageInner(
   let lastEmittedToolOutput = false;
 
   // Budget/turn limit tracking
-  const maxTurns = params.maxTurns ?? 50;
-  const maxBudgetUsd = params.maxBudgetUsd ?? 2.00;
+  const maxTurns = params.maxTurns ?? 200;
+  const maxBudgetUsd = params.maxBudgetUsd ?? 10.00;
   let turnCount = 0;
   let accumulatedCostUsd = 0;
   let limitHit = false;
 
   // Emit AI SDK message start
-  if (useAiSdk) {
-    writer.start(generateMessageId());
-    writer.startStep();
+  if (writer) {
+    await writer.start(generateMessageId());
+    await writer.startStep();
   }
 
   try {
@@ -279,8 +360,8 @@ async function processMessageInner(
       // Check for cancel
       if (cancelSignal?.cancelled) {
         log('[cancel] Stream cancelled by user');
-        if (useAiSdk) {
-          writer.abort('User cancelled');
+        if (writer) {
+          await writer.abort('User cancelled');
           writer.done();
         }
         break;
@@ -296,44 +377,28 @@ async function processMessageInner(
         const event = (msg as any).event;
         if (event?.type === 'content_block_delta') {
           const delta = event.delta;
-          if (delta?.type === 'text_delta' && delta.text) {
-            if (useAiSdk) {
-              // New step boundary if coming after a tool output
-              if (lastEmittedToolOutput) {
-                writer.emitStepBoundary();
-                lastEmittedToolOutput = false;
-              }
-              writer.textDelta(delta.text); // auto-opens text block on first call
-            } else {
-              onEvent?.({ type: 'text', data: { content: delta.text } });
+          if (delta?.type === 'text_delta' && delta.text && writer) {
+            if (lastEmittedToolOutput) {
+              await writer.emitStepBoundary();
+              lastEmittedToolOutput = false;
             }
-          } else if (delta?.type === 'thinking_delta' && delta.thinking) {
-            if (useAiSdk) {
-              if (lastEmittedToolOutput) {
-                writer.emitStepBoundary();
-                lastEmittedToolOutput = false;
-              }
-              writer.reasoningDelta(delta.thinking); // auto-opens reasoning block
-            } else {
-              onEvent?.({ type: 'thinking', data: { content: delta.thinking } });
+            await writer.textDelta(delta.text);
+          } else if (delta?.type === 'thinking_delta' && delta.thinking && writer) {
+            if (lastEmittedToolOutput) {
+              await writer.emitStepBoundary();
+              lastEmittedToolOutput = false;
             }
-          } else if (delta?.type === 'input_json_delta') {
-            // tool input streaming — ignore, we emit full input on the complete message
+            await writer.reasoningDelta(delta.thinking);
           }
+          // input_json_delta — ignored, full input emitted on complete message
         } else if (event?.type === 'content_block_start') {
           const block = event.content_block;
-          if (block?.type === 'tool_use') {
-            if (useAiSdk) {
-              writer.closeOpenBlocks(); // close text/reasoning before tool
-              writer.toolInputStart(block.id, block.name);
-            } else {
-              onEvent?.({ type: 'tool_call_start', data: { id: block.id, name: block.name, input: {} } });
-            }
+          if (block?.type === 'tool_use' && writer) {
+            await writer.closeOpenBlocks();
+            await writer.toolInputStart(block.id, block.name);
           }
-        } else if (event?.type === 'content_block_stop') {
-          if (useAiSdk) {
-            writer.closeOpenBlocks(); // close text-end / reasoning-end
-          }
+        } else if (event?.type === 'content_block_stop' && writer) {
+          await writer.closeOpenBlocks();
         }
         continue;
       }
@@ -349,6 +414,8 @@ async function processMessageInner(
             msgUsage.cache_read_input_tokens ?? 0,
             msgUsage.cache_creation_input_tokens ?? 0,
           );
+          // Write context usage to file for MCP tools
+          writeContextUsage(WORKSPACE_DIR, ctx.contextTracker);
         }
 
         // Track whether we got stream_events (partial messages) for this turn
@@ -360,45 +427,38 @@ async function processMessageInner(
           for (const block of content) {
             if (block.type === 'text' && block.text) {
               activityPoster!.post('output', block.text);
-              if (!hadStreamEvents) {
-                if (useAiSdk) {
-                  writer.textStart();
-                  writer.textDelta(block.text);
-                  writer.textEnd();
-                } else {
-                  onEvent?.({ type: 'text', data: { content: block.text } });
-                }
+              if (!hadStreamEvents && writer) {
+                await writer.textStart();
+                await writer.textDelta(block.text);
+                await writer.textEnd();
               }
             } else if (block.type === 'tool_use') {
               activityPoster!.post('tool_use', `${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
-              if (useAiSdk) {
-                // Emit full tool input (stream_event only had empty input via toolInputStart)
-                writer.toolInputAvailable(block.id, block.name, block.input);
-              } else {
-                onEvent?.({ type: 'tool_call_start', data: { id: block.id, name: block.name, input: block.input } });
+              if (writer) {
+                await writer.toolInputAvailable(block.id, block.name, block.input);
               }
             } else if (block.type === 'tool_result') {
-              if (useAiSdk) {
-                const resultContent = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+              const rawContent = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
+              const injections = scanForInjection(rawContent);
+              if (injections.length > 0) {
+                activityPoster!.post('error', `⚠ Prompt injection detected in tool output: ${injections.join(', ')}`);
+                log?.(`WARNING: Prompt injection patterns detected in tool result: ${injections.join(', ')}`);
+              }
+              const resultContent = redactSecretsFromOutput(rawContent);
+              if (writer) {
                 if (block.is_error) {
-                  writer.toolOutputError(block.tool_use_id, resultContent);
+                  await writer.toolOutputError(block.tool_use_id, resultContent);
                 } else {
-                  writer.toolOutputAvailable(block.tool_use_id, resultContent);
+                  await writer.toolOutputAvailable(block.tool_use_id, resultContent);
                 }
                 lastEmittedToolOutput = true;
-              } else {
-                onEvent?.({ type: 'tool_call_end', data: { id: block.tool_use_id, status: block.is_error ? 'error' : 'completed', result: typeof block.content === 'string' ? block.content : JSON.stringify(block.content) } });
               }
             } else if (block.type === 'thinking' && block.thinking) {
               activityPoster!.post('thinking', block.thinking.slice(0, 500));
-              if (!hadStreamEvents) {
-                if (useAiSdk) {
-                  writer.reasoningStart();
-                  writer.reasoningDelta(block.thinking);
-                  writer.reasoningEnd();
-                } else {
-                  onEvent?.({ type: 'thinking', data: { content: block.thinking } });
-                }
+              if (!hadStreamEvents && writer) {
+                await writer.reasoningStart();
+                await writer.reasoningDelta(block.thinking);
+                await writer.reasoningEnd();
               }
             }
           }
@@ -407,22 +467,23 @@ async function processMessageInner(
           const hasToolUse = content.some((b: any) => b.type === 'tool_use');
           if (hasToolUse) turnCount++;
 
-          // Accumulate cost from this turn's usage
+          // Accumulate cost from this turn's usage (cache-aware, includes billing markup)
           if (msgUsage) {
             accumulatedCostUsd += estimateCostUsd(
               msgUsage.input_tokens ?? 0,
               msgUsage.output_tokens ?? 0,
+              MODEL,
+              msgUsage.cache_read_input_tokens ?? 0,
+              msgUsage.cache_creation_input_tokens ?? 0,
             );
           }
 
           // Check turn limit
           if (turnCount >= maxTurns) {
             log(`[limits] Turn limit hit: ${turnCount}/${maxTurns}`);
-            if (useAiSdk) {
-              writer.finish('max_turns');
+            if (writer) {
+              await writer.finish('max_turns');
               writer.done();
-            } else {
-              onEvent?.({ type: 'done', data: { result: '', sessionId: currentSessionId, finishReason: 'max_turns' } });
             }
             limitHit = true;
             break;
@@ -431,15 +492,16 @@ async function processMessageInner(
           // Check budget limit
           if (accumulatedCostUsd >= maxBudgetUsd) {
             log(`[limits] Budget limit hit: $${accumulatedCostUsd.toFixed(4)} >= $${maxBudgetUsd}`);
-            if (useAiSdk) {
-              writer.finish('budget_exceeded');
+            if (writer) {
+              await writer.finish('budget_exceeded');
               writer.done();
-            } else {
-              onEvent?.({ type: 'done', data: { result: '', sessionId: currentSessionId, finishReason: 'budget_exceeded' } });
             }
             limitHit = true;
             break;
           }
+
+          // Reset stream event counter for next turn so hadStreamEvents is accurate per-turn
+          streamEventCount = 0;
         }
       }
 
@@ -498,23 +560,19 @@ async function processMessageInner(
           log(`[usage] ${inputTokens} in / ${outputTokens} out | context: ${contextPercentage}% of ${contextWindow}`);
           activityPoster!.post('status', `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, { usage: usageInfo });
 
-          if (useAiSdk) {
-            writer.messageMetadata({
+          if (writer) {
+            await writer.messageMetadata({
               usage: { promptTokens: inputTokens, completionTokens: outputTokens, cacheReadTokens: usageInfo.cacheReadTokens, cacheCreationTokens: usageInfo.cacheCreationTokens },
               cost: { usd: usageInfo.totalCostUsd },
               model: MODEL,
               sessionId: currentSessionId,
             });
-          } else {
-            onEvent?.({ type: 'context_usage', data: { promptTokens: inputTokens, completionTokens: outputTokens, model: MODEL, contextWindow, contextPercentage } });
           }
         }
 
-        if (useAiSdk) {
-          writer.finish('stop');
+        if (writer) {
+          await writer.finish('stop');
           writer.done();
-        } else {
-          onEvent?.({ type: 'done', data: { result: textResult ?? '', sessionId: currentSessionId } });
         }
       }
     }
@@ -523,8 +581,8 @@ async function processMessageInner(
     log(`Agent error: ${errorMessage}`);
     activityPoster!.post('error', errorMessage);
 
-    if (useAiSdk) {
-      writer.error(errorMessage);
+    if (writer) {
+      await writer.error(errorMessage);
       writer.done();
     }
 
@@ -556,7 +614,9 @@ async function processMessageInner(
 
   // Fire-and-forget memory extraction — don't block the response
   if (resultText && process.env.CLAW_AUTO_MEMORY !== 'false') {
-    extractMemory(message, resultText).catch(() => {});
+    extractMemory(message, resultText).catch((err) => {
+      log(`Memory extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
   return {
@@ -582,7 +642,23 @@ async function processMessageInner(
  * to a cheap/fast model and appends extracted facts to MEMORY.md.
  * Runs fire-and-forget — never blocks the response.
  */
+let memoryWriteLock: Promise<void> = Promise.resolve();
+
 async function extractMemory(userMessage: string, assistantResult: string): Promise<void> {
+  // Serialize concurrent writes to MEMORY.md to prevent race conditions
+  const prev = memoryWriteLock;
+  let release: () => void;
+  memoryWriteLock = new Promise<void>((resolve) => { release = resolve; });
+  await prev;
+
+  try {
+    await extractMemoryInner(userMessage, assistantResult);
+  } finally {
+    release!();
+  }
+}
+
+async function extractMemoryInner(userMessage: string, assistantResult: string): Promise<void> {
   const memoryFile = path.join(WORKSPACE_DIR, 'MEMORY.md');
   const existing = fs.existsSync(memoryFile) ? fs.readFileSync(memoryFile, 'utf-8') : '';
 

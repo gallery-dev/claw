@@ -56,11 +56,15 @@ export class SessionManager {
   private defaultModel: string;
   private buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string, mode?: 'agent' | 'plan', model?: string) => SDKSessionOptions;
 
+  private idleTimeoutMs: number;
+  private idleTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(opts: {
     workspaceDir: string;
     maxSessions?: number;
     defaultContextWindow: number;
     defaultModel: string;
+    idleTimeoutMs?: number;
     buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string, mode?: 'agent' | 'plan', model?: string) => SDKSessionOptions;
   }) {
     this.workspaceDir = opts.workspaceDir;
@@ -68,7 +72,11 @@ export class SessionManager {
     this.maxSessions = opts.maxSessions ?? 5;
     this.defaultContextWindow = opts.defaultContextWindow;
     this.defaultModel = opts.defaultModel;
+    this.idleTimeoutMs = opts.idleTimeoutMs ?? 10 * 60 * 1000; // 10 minutes default
     this.buildOptions = opts.buildOptions;
+
+    // Periodically close idle sessions to free memory (~50-80MB each)
+    this.idleTimer = setInterval(() => this.evictIdle(), 60_000);
   }
 
   // ─── Get or Create ──────────────────────────────────
@@ -159,9 +167,15 @@ export class SessionManager {
     // Wait for previous lock
     await ctx.lockPromise;
 
-    // Create new lock
+    // Create new lock and track it for eviction safety
     let release!: () => void;
-    ctx.lockPromise = new Promise(resolve => { release = resolve; });
+    ctx.lockPromise = new Promise(resolve => {
+      release = () => {
+        ctx.lockRelease = null;
+        resolve();
+      };
+    });
+    ctx.lockRelease = release;
     return release;
   }
 
@@ -214,6 +228,8 @@ export class SessionManager {
     let oldestTime = Infinity;
 
     for (const [id, ctx] of this.conversations) {
+      // Skip conversations with an active lock — they're processing a message
+      if (ctx.lockRelease !== null) continue;
       if (ctx.lastUsed < oldestTime) {
         oldestTime = ctx.lastUsed;
         oldestId = id;
@@ -223,6 +239,21 @@ export class SessionManager {
     if (oldestId) {
       this.closeConversation(oldestId);
       log(`[session-mgr] Evicted conversation ${oldestId} (LRU)`);
+    } else {
+      // All sessions are locked — log warning instead of silently failing
+      log(`[session-mgr] WARNING: Cannot evict — all ${this.conversations.size} sessions are locked`);
+    }
+  }
+
+  /** Close sessions that have been idle longer than idleTimeoutMs. */
+  private evictIdle(): void {
+    const now = Date.now();
+    for (const [id, ctx] of this.conversations) {
+      if (ctx.lockRelease !== null) continue; // skip locked sessions
+      if (now - ctx.lastUsed > this.idleTimeoutMs) {
+        this.closeConversation(id);
+        log(`[session-mgr] Evicted idle conversation ${id} (idle ${Math.round((now - ctx.lastUsed) / 60_000)}min)`);
+      }
     }
   }
 
@@ -244,6 +275,10 @@ export class SessionManager {
    * Close all sessions. Called on SIGTERM before exit.
    */
   closeAll(): void {
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
+    }
     for (const [id, ctx] of this.conversations) {
       try { ctx.session.close(); } catch { /* ignore */ }
       log(`[session-mgr] Closed session for ${id}`);

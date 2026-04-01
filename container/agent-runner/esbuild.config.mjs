@@ -54,11 +54,19 @@ async function run() {
     outdir: undefined,
   });
 
-  // Bundle 2: Gallery CLI (replaces MCP tools — agent calls via Bash)
+  // Bundle 2: Gallery CLI (fallback — agent can also call via Bash)
   await build({
     ...shared,
     entryPoints: ['src/gallery-cli.ts'],
     outfile: 'dist/gallery-cli.bundle.js',
+    outdir: undefined,
+  });
+
+  // Bundle 3: MCP stdio server (primary tool delivery — loaded by SDK via .mcp.json)
+  await build({
+    ...shared,
+    entryPoints: ['src/mcp-tools.ts'],
+    outfile: 'dist/mcp-tools.bundle.js',
     outdir: undefined,
   });
 
@@ -69,7 +77,7 @@ async function run() {
   mkdirSync('dist', { recursive: true });
   copyFileSync(sdkCliPath, 'dist/cli.js');
 
-  console.log('✓ Bundled server.bundle.js + gallery-cli.bundle.js + cli.js');
+  console.log('✓ Bundled server.bundle.js + gallery-cli.bundle.js + mcp-tools.bundle.js + cli.js');
 }
 
 run().catch((err) => {

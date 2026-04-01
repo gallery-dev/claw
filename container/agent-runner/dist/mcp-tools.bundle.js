@@ -24640,10 +24640,9 @@ var ProgressTokenSchema = union([string2(), number2().int()]);
 var CursorSchema = string2();
 var TaskCreationParamsSchema = looseObject({
   /**
-   * Time in milliseconds to keep task results available after completion.
-   * If null, the task has unlimited lifetime until manually cleaned up.
+   * Requested duration in milliseconds to retain task from creation.
    */
-  ttl: union([number2(), _null3()]).optional(),
+  ttl: number2().optional(),
   /**
    * Time in milliseconds to wait between task status requests.
    */
@@ -24943,7 +24942,11 @@ var ClientCapabilitiesSchema = object2({
   /**
    * Present if the client supports task creation.
    */
-  tasks: ClientTasksCapabilitySchema.optional()
+  tasks: ClientTasksCapabilitySchema.optional(),
+  /**
+   * Extensions that the client supports. Keys are extension identifiers (vendor-prefix/extension-name).
+   */
+  extensions: record(string2(), AssertObjectSchema).optional()
 });
 var InitializeRequestParamsSchema = BaseRequestParamsSchema.extend({
   /**
@@ -25004,7 +25007,11 @@ var ServerCapabilitiesSchema = object2({
   /**
    * Present if the server supports task creation.
    */
-  tasks: ServerTasksCapabilitySchema.optional()
+  tasks: ServerTasksCapabilitySchema.optional(),
+  /**
+   * Extensions that the server supports. Keys are extension identifiers (vendor-prefix/extension-name).
+   */
+  extensions: record(string2(), AssertObjectSchema).optional()
 });
 var InitializeResultSchema = ResultSchema.extend({
   /**
@@ -25196,6 +25203,12 @@ var ResourceSchema = object2({
    * The MIME type of this resource, if known.
    */
   mimeType: optional(string2()),
+  /**
+   * The size of the raw resource content, in bytes (i.e., before base64 encoding or any tokenization), if known.
+   *
+   * This can be used by Hosts to display file sizes and estimate context window usage.
+   */
+  size: optional(number2()),
   /**
    * Optional annotations for the client.
    */
@@ -27691,6 +27704,10 @@ var Protocol = class {
     this._progressHandlers.clear();
     this._taskProgressTokens.clear();
     this._pendingDebouncedNotifications.clear();
+    for (const info of this._timeoutInfo.values()) {
+      clearTimeout(info.timeoutId);
+    }
+    this._timeoutInfo.clear();
     for (const controller of this._requestHandlerAbortControllers.values()) {
       controller.abort();
     }
@@ -27821,7 +27838,9 @@ var Protocol = class {
         await capturedTransport?.send(errorResponse);
       }
     }).catch((error48) => this._onerror(new Error(`Failed to send response: ${error48}`))).finally(() => {
-      this._requestHandlerAbortControllers.delete(request.id);
+      if (this._requestHandlerAbortControllers.get(request.id) === abortController) {
+        this._requestHandlerAbortControllers.delete(request.id);
+      }
     });
   }
   _onprogress(notification) {
@@ -28516,6 +28535,147 @@ var ExperimentalServerTasks = class {
    */
   requestStream(request, resultSchema, options) {
     return this._server.requestStream(request, resultSchema, options);
+  }
+  /**
+   * Sends a sampling request and returns an AsyncGenerator that yields response messages.
+   * The generator is guaranteed to end with either a 'result' or 'error' message.
+   *
+   * For task-augmented requests, yields 'taskCreated' and 'taskStatus' messages
+   * before the final result.
+   *
+   * @example
+   * ```typescript
+   * const stream = server.experimental.tasks.createMessageStream({
+   *     messages: [{ role: 'user', content: { type: 'text', text: 'Hello' } }],
+   *     maxTokens: 100
+   * }, {
+   *     onprogress: (progress) => {
+   *         // Handle streaming tokens via progress notifications
+   *         console.log('Progress:', progress.message);
+   *     }
+   * });
+   *
+   * for await (const message of stream) {
+   *     switch (message.type) {
+   *         case 'taskCreated':
+   *             console.log('Task created:', message.task.taskId);
+   *             break;
+   *         case 'taskStatus':
+   *             console.log('Task status:', message.task.status);
+   *             break;
+   *         case 'result':
+   *             console.log('Final result:', message.result);
+   *             break;
+   *         case 'error':
+   *             console.error('Error:', message.error);
+   *             break;
+   *     }
+   * }
+   * ```
+   *
+   * @param params - The sampling request parameters
+   * @param options - Optional request options (timeout, signal, task creation params, onprogress, etc.)
+   * @returns AsyncGenerator that yields ResponseMessage objects
+   *
+   * @experimental
+   */
+  createMessageStream(params, options) {
+    const clientCapabilities = this._server.getClientCapabilities();
+    if ((params.tools || params.toolChoice) && !clientCapabilities?.sampling?.tools) {
+      throw new Error("Client does not support sampling tools capability.");
+    }
+    if (params.messages.length > 0) {
+      const lastMessage = params.messages[params.messages.length - 1];
+      const lastContent = Array.isArray(lastMessage.content) ? lastMessage.content : [lastMessage.content];
+      const hasToolResults = lastContent.some((c) => c.type === "tool_result");
+      const previousMessage = params.messages.length > 1 ? params.messages[params.messages.length - 2] : void 0;
+      const previousContent = previousMessage ? Array.isArray(previousMessage.content) ? previousMessage.content : [previousMessage.content] : [];
+      const hasPreviousToolUse = previousContent.some((c) => c.type === "tool_use");
+      if (hasToolResults) {
+        if (lastContent.some((c) => c.type !== "tool_result")) {
+          throw new Error("The last message must contain only tool_result content if any is present");
+        }
+        if (!hasPreviousToolUse) {
+          throw new Error("tool_result blocks are not matching any tool_use from the previous message");
+        }
+      }
+      if (hasPreviousToolUse) {
+        const toolUseIds = new Set(previousContent.filter((c) => c.type === "tool_use").map((c) => c.id));
+        const toolResultIds = new Set(lastContent.filter((c) => c.type === "tool_result").map((c) => c.toolUseId));
+        if (toolUseIds.size !== toolResultIds.size || ![...toolUseIds].every((id) => toolResultIds.has(id))) {
+          throw new Error("ids of tool_result blocks and tool_use blocks from previous message do not match");
+        }
+      }
+    }
+    return this.requestStream({
+      method: "sampling/createMessage",
+      params
+    }, CreateMessageResultSchema, options);
+  }
+  /**
+   * Sends an elicitation request and returns an AsyncGenerator that yields response messages.
+   * The generator is guaranteed to end with either a 'result' or 'error' message.
+   *
+   * For task-augmented requests (especially URL-based elicitation), yields 'taskCreated'
+   * and 'taskStatus' messages before the final result.
+   *
+   * @example
+   * ```typescript
+   * const stream = server.experimental.tasks.elicitInputStream({
+   *     mode: 'url',
+   *     message: 'Please authenticate',
+   *     elicitationId: 'auth-123',
+   *     url: 'https://example.com/auth'
+   * }, {
+   *     task: { ttl: 300000 } // Task-augmented for long-running auth flow
+   * });
+   *
+   * for await (const message of stream) {
+   *     switch (message.type) {
+   *         case 'taskCreated':
+   *             console.log('Task created:', message.task.taskId);
+   *             break;
+   *         case 'taskStatus':
+   *             console.log('Task status:', message.task.status);
+   *             break;
+   *         case 'result':
+   *             console.log('User action:', message.result.action);
+   *             break;
+   *         case 'error':
+   *             console.error('Error:', message.error);
+   *             break;
+   *     }
+   * }
+   * ```
+   *
+   * @param params - The elicitation request parameters
+   * @param options - Optional request options (timeout, signal, task creation params, etc.)
+   * @returns AsyncGenerator that yields ResponseMessage objects
+   *
+   * @experimental
+   */
+  elicitInputStream(params, options) {
+    const clientCapabilities = this._server.getClientCapabilities();
+    const mode = params.mode ?? "form";
+    switch (mode) {
+      case "url": {
+        if (!clientCapabilities?.elicitation?.url) {
+          throw new Error("Client does not support url elicitation.");
+        }
+        break;
+      }
+      case "form": {
+        if (!clientCapabilities?.elicitation?.form) {
+          throw new Error("Client does not support form elicitation.");
+        }
+        break;
+      }
+    }
+    const normalizedParams = mode === "form" && params.mode === void 0 ? { ...params, mode: "form" } : params;
+    return this.requestStream({
+      method: "elicitation/create",
+      params: normalizedParams
+    }, ElicitResultSchema, options);
   }
   /**
    * Gets the current status of a task.
@@ -29693,6 +29853,9 @@ var McpServer = class {
           annotations = rest.shift();
         }
       } else if (typeof firstArg === "object" && firstArg !== null) {
+        if (Object.values(firstArg).some((v3) => typeof v3 === "object" && v3 !== null)) {
+          throw new Error(`Tool ${name} expected a Zod schema or ToolAnnotations, but received an unrecognized object`);
+        }
         annotations = rest.shift();
       }
     }
@@ -29810,6 +29973,9 @@ function getZodSchemaObject(schema) {
   }
   if (isZodRawShapeCompat(schema)) {
     return objectFromShape(schema);
+  }
+  if (!isZodSchemaInstance(schema)) {
+    throw new Error("inputSchema must be a Zod schema or raw shape, received an unrecognized object");
   }
   return schema;
 }
@@ -45073,20 +45239,41 @@ import path2 from "path";
 // src/shared.ts
 import fs from "fs";
 import path from "path";
+var SECRET_ENV_VARS = [
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "GITHUB_TOKEN",
+  "GITHUB_PAT",
+  "SLACK_BOT_TOKEN",
+  "STRIPE_SECRET_KEY",
+  "SENDGRID_API_KEY",
+  "HUGGINGFACE_TOKEN",
+  "DATABASE_URL",
+  "POSTGRES_URL",
+  "MYSQL_URL",
+  "REDIS_URL",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_ACCESS_KEY_ID",
+  "GOOGLE_API_KEY",
+  "REPLICATE_API_TOKEN",
+  "GALLERY_GATEWAY_TOKEN",
+  "GALLERY_TOKEN"
+];
 var LOOP_SAME_CALL_THRESHOLD = parseInt(process.env.LOOP_SAME_CALL_THRESHOLD || "3", 10);
 var LOOP_FORCE_STOP_THRESHOLD = parseInt(process.env.LOOP_FORCE_STOP_THRESHOLD || "6", 10);
 var LOOP_CYCLE_THRESHOLD = parseInt(process.env.LOOP_CYCLE_THRESHOLD || "3", 10);
 var LOOP_SAME_TOOL_THRESHOLD = parseInt(process.env.LOOP_SAME_TOOL_THRESHOLD || "5", 10);
 var CONTEXT_WARN_THRESHOLD = parseFloat(process.env.CLAW_CONTEXT_WARN_THRESHOLD || "0.70");
 var CONTEXT_CHECKPOINT_THRESHOLD = parseFloat(process.env.CLAW_CONTEXT_CHECKPOINT_THRESHOLD || "0.80");
-async function postConvexActivity(convexUrl2, token, agentId2, type, content, metadata) {
+async function postConvexActivity(convexUrl2, token, agentId2, type, content, metadata, taskId) {
   try {
     await fetch(`${convexUrl2}/api/mutation`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         path: "agentActivity:push",
-        args: { token, agentId: agentId2, type, content: content.slice(0, 4e3), metadata }
+        args: { token, agentId: agentId2, taskId, type, content: content.slice(0, 4e3), metadata }
       })
     });
   } catch {
@@ -45107,7 +45294,7 @@ var server = new McpServer({
 });
 server.tool(
   "send_message",
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. Note: when running as a scheduled task, your final output is NOT sent to the user \u2014 use this tool if you need to communicate.",
+  "Send a message to the user immediately while you're still running. Use this for genuinely important milestones \u2014 a major finding, a decision that needs acknowledgment, or a completion event. Do NOT use for every minor step. Note: when running as a scheduled task, your final output is NOT sent to the user \u2014 use this tool if you need to communicate.",
   {
     text: external_exports3.string().describe("The message text to send"),
     sender: external_exports3.string().optional().describe('Your role/identity name (e.g. "Researcher").')
@@ -45149,9 +45336,33 @@ server.tool(
 );
 var convexUrl = process.env.GALLERY_CONVEX_URL || "";
 var gatewayToken = process.env.GALLERY_GATEWAY_TOKEN || "";
+var currentTaskId;
+var planModeActive = false;
+function checkPlanMode(toolName) {
+  if (!planModeActive) return null;
+  const readOnlyTools = /* @__PURE__ */ new Set([
+    "memory_view",
+    "memory_search",
+    "gallery_list_tasks",
+    "gallery_list_agents",
+    "gallery_list_reviews",
+    "gallery_workspace_info",
+    "gallery_context_usage",
+    "gallery_read_peer_memory",
+    "skill_list",
+    "gallery_exit_plan_mode",
+    "update_progress",
+    "send_message"
+  ]);
+  if (readOnlyTools.has(toolName)) return null;
+  return {
+    content: [{ type: "text", text: `Blocked: "${toolName}" is not available in plan mode. Only read-only tools are allowed. Call gallery_exit_plan_mode to resume execution.` }],
+    isError: true
+  };
+}
 function postActivity(type, content, metadata) {
   if (!convexUrl || !gatewayToken) return;
-  postConvexActivity(convexUrl, gatewayToken, agentId, type, content, metadata);
+  postConvexActivity(convexUrl, gatewayToken, agentId, type, content, metadata, currentTaskId);
 }
 async function indexMemoryEntry(memPath, body) {
   if (!convexUrl || !gatewayToken) return;
@@ -45200,9 +45411,9 @@ async function searchMemoryEntries(searchQuery, limit = 10) {
   }
 }
 var DELEGATION_TIMEOUT_MS = 10 * 60 * 1e3;
-var SUBTASK_TIMEOUT_MS = 15 * 60 * 1e3;
-var MAX_CONCURRENT_SUBTASKS = 3;
-var MAX_SUBTASKS = 5;
+var SUBTASK_TIMEOUT_MS = 30 * 60 * 1e3;
+var MAX_CONCURRENT_SUBTASKS = 5;
+var MAX_SUBTASKS = 10;
 async function runSubtask(subtask, index) {
   const start = Date.now();
   const controller = new AbortController();
@@ -45223,8 +45434,8 @@ Context: ${subtask.context}` : "",
       prompt,
       options: {
         cwd: WORKSPACE_DIR,
-        model: "claude-sonnet-4-6",
-        maxTurns: 15,
+        model: process.env.CLAW_SUBTASK_MODEL || "claude-sonnet-4-6",
+        maxTurns: 50,
         allowedTools: [
           "Bash",
           "Read",
@@ -45237,13 +45448,16 @@ Context: ${subtask.context}` : "",
           // No mcp__claw__* — subtasks cannot decompose further or use agent messaging
         ],
         env: {
-          ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || "",
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(
+              ([k6]) => !["CLAUDE_CODE_OAUTH_TOKEN", ...SECRET_ENV_VARS].includes(k6)
+            )
+          ),
+          // Re-include API keys the SDK subprocess needs to call Claude
           ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",
-          PATH: process.env.PATH || "",
-          HOME: process.env.HOME || ""
+          ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL || ""
         },
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
+        permissionMode: "acceptEdits",
         abortController: controller
       }
     })) {
@@ -45278,7 +45492,13 @@ Context: ${subtask.context}` : "",
 }
 server.tool(
   "decompose_task",
-  `Split a complex task into parallel subtasks. Each subtask runs as an independent AI worker with access to the filesystem, bash, and web tools. Use this when a task has independent parts that can run simultaneously (e.g., "research 3 competitors", "review 5 files", "generate reports for each region").
+  `Split a complex task into parallel subtasks. Each subtask runs as an independent AI worker with access to the filesystem, bash, and web tools.
+
+Use this when a task has independent parts that can run simultaneously. Good use cases:
+- Researching multiple topics at once (e.g., "research 3 competitors")
+- Reviewing multiple files or codebases in parallel
+- Running investigation + implementation simultaneously
+- Generating reports for each region/category at once
 
 GUIDELINES:
 - Max ${MAX_SUBTASKS} subtasks per call
@@ -45384,13 +45604,23 @@ Use this when:
 
 The target agent runs the full task as a message (same as a user sending it). This call blocks until the target agent completes.
 
-IMPORTANT: You must know the target agent's Convex ID (agentId) to delegate. You can find agent IDs by asking the user or checking workspace context.`,
+IMPORTANT: The sub-agent cannot ask you questions during delegation \u2014 give them everything they need upfront. A good delegation includes:
+1. A clear task title (specific enough that "done" is obvious)
+2. A context block with: relevant file paths, prior decisions, constraints, what NOT to do
+3. Success criteria \u2014 what does a complete result look like?
+
+Poor: "research competitors"
+Better: "Research top 5 AI agent platforms \u2014 focus on pricing models, LLM support, deployment options. Avoid consumer tools. Deliver a markdown comparison table."
+
+You must know the target agent's Convex ID (agentId) to delegate. You can find agent IDs by asking the user or checking workspace context.`,
   {
     toAgentId: external_exports3.string().describe("Convex document ID of the target agent"),
     task: external_exports3.string().describe("The task or instruction to send to the target agent \u2014 be specific and complete"),
     context: external_exports3.string().optional().describe("Additional context, data, or files the target agent needs")
   },
   async (args) => {
+    const blocked = checkPlanMode("gallery_delegate_task");
+    if (blocked) return blocked;
     if (!galleryApiUrl || !galleryToken) {
       return {
         content: [{ type: "text", text: "Agent delegation requires Gallery API (not configured)." }],
@@ -45401,37 +45631,48 @@ IMPORTANT: You must know the target agent's Convex ID (agentId) to delegate. You
     const timeout = setTimeout(() => controller.abort(), DELEGATION_TIMEOUT_MS);
     try {
       const delegateUrl = galleryWorkerUrl ? `${galleryWorkerUrl}/delegate` : `${galleryApiUrl}/api/claw/delegate`;
-      const response = await fetch(delegateUrl, {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${galleryToken}`
-        },
-        body: JSON.stringify({
-          type: "task",
-          toAgentId: args.toAgentId,
-          fromAgentId: agentId,
-          task: args.task,
-          context: args.context
-        })
-      });
-      if (!response.ok) {
-        const err = await response.text();
-        return {
-          content: [{ type: "text", text: `Delegation failed (${response.status}): ${err}` }],
-          isError: true
-        };
-      }
-      const data = await response.json();
-      return {
-        content: [{
-          type: "text",
-          text: data.result ? `Agent completed task.
+      const retryDelays = [0, 1e3, 5e3];
+      let lastError = "";
+      let lastStatus = 0;
+      for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r3) => setTimeout(r3, retryDelays[attempt]));
+          postActivity("status", `Delegation retry ${attempt + 1}/3 to agent ${args.toAgentId}`);
+        }
+        const response = await fetch(delegateUrl, {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${galleryToken}`
+          },
+          body: JSON.stringify({
+            type: "task",
+            toAgentId: args.toAgentId,
+            fromAgentId: agentId,
+            task: args.task,
+            context: args.context
+          })
+        });
+        if (response.ok) {
+          const data = await response.json();
+          return {
+            content: [{
+              type: "text",
+              text: data.result ? `Agent completed task.
 
 Result:
 ${data.result}` : "Agent completed task (no text output)."
-        }]
+            }]
+          };
+        }
+        lastStatus = response.status;
+        lastError = await response.text();
+        if (response.status < 500) break;
+      }
+      return {
+        content: [{ type: "text", text: `Delegation failed (${lastStatus}): ${lastError}` }],
+        isError: true
       };
     } catch (err) {
       const isAbort = err instanceof Error && err.name === "AbortError";
@@ -45581,6 +45822,8 @@ server.tool(
   "memory_write",
   `Write or update a memory file. Use this to persist important information across sessions.
 
+Write proactively after every substantive discovery: a user preference, a decision made, something that didn't work, an important project fact. Don't wait until you're asked \u2014 write now, during the conversation. This is how you become someone who genuinely knows the owner instead of starting fresh each session.
+
 Best practices:
 \u2022 MEMORY.md \u2014 curated long-term facts, decisions, preferences.
 \u2022 memory/YYYY-MM-DD.md \u2014 daily notes, running context, progress logs.
@@ -45591,6 +45834,8 @@ Best practices:
     mode: external_exports3.enum(["append", "replace", "create"]).default("append").describe("append=add to end (default), replace=overwrite entire file, create=new file only")
   },
   async (args) => {
+    const blocked = checkPlanMode("memory_write");
+    if (blocked) return blocked;
     let targetPath;
     if (args.path === "MEMORY.md" || args.path === "/MEMORY.md") {
       targetPath = MEMORY_FILE;
@@ -45726,6 +45971,8 @@ server.tool(
     path: external_exports3.string().describe("File path to delete, relative to memory.")
   },
   async (args) => {
+    const blocked = checkPlanMode("memory_delete");
+    if (blocked) return blocked;
     let targetPath;
     if (args.path === "MEMORY.md" || args.path === "/MEMORY.md") {
       targetPath = MEMORY_FILE;
@@ -45744,35 +45991,177 @@ server.tool(
     return { content: [{ type: "text", text: `Deleted ${args.path}` }] };
   }
 );
+var SKILLS_DIR = path2.join(WORKSPACE_DIR, "skills");
+function safeSkillSlug(name) {
+  return name.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+}
+server.tool(
+  "skill_list",
+  `List your installed skills. Shows all active skills (workspace-level and agent-specific) with their descriptions and file paths.
+
+Check this before creating a new skill to avoid duplicates.`,
+  {},
+  async () => {
+    const entries = [];
+    if (fs2.existsSync(SKILLS_DIR)) {
+      const dirs = fs2.readdirSync(SKILLS_DIR).filter((d) => {
+        const skillPath = path2.join(SKILLS_DIR, d, "SKILL.md");
+        return fs2.existsSync(skillPath);
+      }).sort();
+      for (const dir of dirs) {
+        const skillPath = path2.join(SKILLS_DIR, dir, "SKILL.md");
+        const content = fs2.readFileSync(skillPath, "utf-8");
+        const firstLine = content.split("\n").find((l3) => l3.startsWith("# "))?.replace(/^#\s*/, "") || dir;
+        const descLine = content.split("\n").find((l3) => l3.trim() && !l3.startsWith("#") && !l3.startsWith("---"));
+        entries.push(`- **${firstLine}** \u2192 \`skills/${dir}/SKILL.md\`${descLine ? `
+  ${descLine.trim().slice(0, 120)}` : ""}`);
+      }
+    }
+    if (entries.length === 0) {
+      return { content: [{ type: "text", text: "No skills installed. Use skill_create to author a new skill from a successful workflow." }] };
+    }
+    return { content: [{ type: "text", text: `Installed skills:
+
+${entries.join("\n")}` }] };
+  }
+);
+server.tool(
+  "skill_create",
+  `Create a new skill from a successful workflow you just completed. Skills are reusable workflow templates that make you faster and more consistent at recurring tasks.
+
+**When to create a skill:**
+- You just completed a multi-step task that took 5+ tool calls
+- The workflow is likely to recur (similar tasks in the future)
+- The approach has been validated (it worked, the owner was satisfied)
+
+**How to write a good skill:**
+- Start with a clear trigger description (when should this skill activate?)
+- Document the exact steps, commands, and tools used
+- Include decision points (if X then Y, else Z)
+- Note common pitfalls or edge cases discovered
+- Keep it actionable \u2014 another agent (or future you) should be able to follow it exactly
+
+The skill is saved both to your local filesystem (immediately available) and to the database (persists across container restarts).`,
+  {
+    name: external_exports3.string().describe('Skill name (e.g. "Code Review", "Email Triage", "Deploy Pipeline")'),
+    description: external_exports3.string().describe("One-line description of what this skill does and when to use it"),
+    content: external_exports3.string().describe("Full skill content in markdown \u2014 workflow steps, commands, decision points, pitfalls")
+  },
+  async (args) => {
+    const slug = safeSkillSlug(args.name);
+    const skillDir = path2.join(SKILLS_DIR, slug);
+    const skillPath = path2.join(skillDir, "SKILL.md");
+    fs2.mkdirSync(skillDir, { recursive: true });
+    fs2.writeFileSync(skillPath, args.content);
+    try {
+      await convexMutation("mcpInternal:createSkill", {
+        agentId,
+        name: args.name,
+        description: args.description,
+        content: args.content
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errMsg.includes("already exists")) {
+        return { content: [{ type: "text", text: `Skill "${args.name}" already exists. Use skill_update to modify it.` }], isError: true };
+      }
+      postActivity("status", `Skill "${args.name}" saved locally but DB sync failed: ${errMsg}`);
+    }
+    postActivity("status", `Created skill: ${args.name}`, { skillName: args.name });
+    return { content: [{ type: "text", text: `Skill created: "${args.name}" \u2192 skills/${slug}/SKILL.md
+
+This skill is now available in your workflow. Other agents in the workspace will get it on next sync.` }] };
+  }
+);
+server.tool(
+  "skill_update",
+  `Update an existing skill with improvements, fixes, or additional steps discovered during recent work.
+
+**When to update a skill:**
+- You followed a skill but discovered a better approach
+- A step in the skill is outdated or broken
+- You found a new edge case or pitfall to document
+- The owner gave feedback that changes the workflow
+
+Always explain WHAT changed and WHY in your update.`,
+  {
+    name: external_exports3.string().describe("Name of the skill to update (exact match)"),
+    content: external_exports3.string().describe("Updated full skill content in markdown (replaces entire skill file)"),
+    description: external_exports3.string().optional().describe("Updated one-line description (optional)"),
+    changelog: external_exports3.string().optional().describe("Brief note of what changed and why (appended to skill for history)")
+  },
+  async (args) => {
+    const slug = safeSkillSlug(args.name);
+    const skillPath = path2.join(SKILLS_DIR, slug, "SKILL.md");
+    let finalContent = args.content;
+    if (args.changelog) {
+      const date5 = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+      finalContent += `
+
+---
+
+## Changelog
+
+- **${date5}**: ${args.changelog}
+`;
+    }
+    fs2.mkdirSync(path2.join(SKILLS_DIR, slug), { recursive: true });
+    fs2.writeFileSync(skillPath, finalContent);
+    try {
+      await convexMutation("mcpInternal:updateSkill", {
+        name: args.name,
+        agentId,
+        content: finalContent,
+        description: args.description
+      });
+    } catch {
+    }
+    postActivity("status", `Updated skill: ${args.name}`, { skillName: args.name });
+    return { content: [{ type: "text", text: `Skill updated: "${args.name}" \u2192 skills/${slug}/SKILL.md${args.changelog ? `
+Change: ${args.changelog}` : ""}` }] };
+  }
+);
 async function convexQuery(fnPath, args) {
   if (!convexUrl || !gatewayToken) throw new Error("Gallery API not configured");
-  const res = await fetch(`${convexUrl}/api/query`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path: fnPath, args: { token: gatewayToken, ...args } }),
-    signal: AbortSignal.timeout(15e3)
-  });
-  if (!res.ok) throw new Error(`Convex query failed: ${res.status}`);
-  const data = await res.json();
-  return data.value ?? data;
+  const delays = [100, 1e3, 5e3];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`${convexUrl}/api/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: fnPath, args: { token: gatewayToken, ...args } }),
+      signal: AbortSignal.timeout(15e3)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.value ?? data;
+    }
+    if (res.status < 500 || attempt === 2) throw new Error(`Convex query failed: ${res.status}`);
+    await new Promise((r3) => setTimeout(r3, delays[attempt]));
+  }
 }
 async function convexMutation(fnPath, args) {
   if (!convexUrl || !gatewayToken) throw new Error("Gallery API not configured");
-  const res = await fetch(`${convexUrl}/api/mutation`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path: fnPath, args: { token: gatewayToken, ...args } }),
-    signal: AbortSignal.timeout(15e3)
-  });
-  if (!res.ok) throw new Error(`Convex mutation failed: ${res.status}`);
-  const data = await res.json();
-  return data.value ?? data;
+  const delays = [100, 1e3, 5e3];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`${convexUrl}/api/mutation`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: fnPath, args: { token: gatewayToken, ...args } }),
+      signal: AbortSignal.timeout(15e3)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.value ?? data;
+    }
+    if (res.status < 500 || attempt === 2) throw new Error(`Convex mutation failed: ${res.status}`);
+    await new Promise((r3) => setTimeout(r3, delays[attempt]));
+  }
 }
 server.tool(
   "gallery_list_tasks",
   "List tasks in the workspace kanban board. Returns title, status, priority, and assignee.",
   {
-    status: external_exports3.enum(["todo", "in_progress", "in_review", "done"]).optional().describe("Filter by status. Omit to list all.")
+    status: external_exports3.enum(["scheduled", "todo", "in_progress", "in_review", "blocked", "failed", "done", "cancelled"]).optional().describe("Filter by status. Omit to list all.")
   },
   async (args) => {
     const tasks = await convexQuery("mcpInternal:listTasks", { status: args.status });
@@ -45782,23 +46171,27 @@ server.tool(
 );
 server.tool(
   "gallery_create_task",
-  "Create a new task on the workspace kanban board. Appears instantly in the Gallery dashboard.",
+  "Create a new task on the workspace kanban board. Call this BEFORE starting any non-trivial work \u2014 this is how your owner tracks what you're doing. Appears instantly in the Gallery dashboard.",
   {
     title: external_exports3.string().describe("Task title"),
     description: external_exports3.string().optional().describe("Detailed task description"),
     priority: external_exports3.enum(["urgent", "high", "medium", "low", "none"]).optional(),
     assignedAgent: external_exports3.string().optional().describe("Name of the agent to assign this task to"),
-    status: external_exports3.enum(["todo", "in_progress", "in_review", "done"]).optional(),
-    labels: external_exports3.array(external_exports3.string()).optional().describe("Tags/labels for the task")
+    status: external_exports3.enum(["scheduled", "todo", "in_progress", "in_review", "blocked", "failed", "done", "cancelled"]).optional(),
+    labels: external_exports3.array(external_exports3.string()).optional().describe("Tags/labels for the task"),
+    dueDate: external_exports3.number().optional().describe("Due date as Unix timestamp in milliseconds")
   },
   async (args) => {
+    const blocked = checkPlanMode("gallery_create_task");
+    if (blocked) return blocked;
     const id = await convexMutation("mcpInternal:createTask", {
       title: args.title,
       description: args.description,
       status: args.status,
       priority: args.priority,
       labels: args.labels,
-      assignedAgent: args.assignedAgent
+      assignedAgent: args.assignedAgent,
+      dueDate: args.dueDate
     });
     postActivity("status", `Created task: ${args.title}`, { taskId: id });
     return { content: [{ type: "text", text: `Task created: "${args.title}" [${args.status ?? "todo"}]` }] };
@@ -45806,18 +46199,40 @@ server.tool(
 );
 server.tool(
   "gallery_update_task",
-  "Update a task by title. Can change status, priority, assignee, or description.",
+  "Update a task. Prefer passing taskId if you have it; falls back to title matching.",
   {
-    title: external_exports3.string().describe("Title of the task to update (exact match)"),
-    status: external_exports3.enum(["todo", "in_progress", "in_review", "done"]).optional(),
+    taskId: external_exports3.string().optional().describe("Task ID (preferred \u2014 use IDs from gallery_list_tasks or gallery_create_task)"),
+    title: external_exports3.string().optional().describe("Title of the task to update (fallback if no taskId)"),
+    status: external_exports3.enum(["scheduled", "todo", "in_progress", "in_review", "blocked", "failed", "done", "cancelled"]).optional(),
     priority: external_exports3.enum(["urgent", "high", "medium", "low", "none"]).optional(),
     assignedAgent: external_exports3.string().optional(),
     description: external_exports3.string().optional()
   },
   async (args) => {
-    const tasks = await convexQuery("mcpInternal:listTasks", {});
-    const task = tasks.find((t) => t.title.toLowerCase() === args.title.toLowerCase());
-    if (!task) return { content: [{ type: "text", text: `Task "${args.title}" not found.` }], isError: true };
+    let task;
+    if (args.taskId) {
+      const tasks = await convexQuery("mcpInternal:listTasks", {});
+      task = tasks.find((t) => t._id === args.taskId);
+      if (!task) return { content: [{ type: "text", text: `Task with ID "${args.taskId}" not found.` }], isError: true };
+    } else if (args.title) {
+      const tasks = await convexQuery("mcpInternal:listTasks", {});
+      const matches = tasks.filter((t) => t.title.toLowerCase() === args.title.toLowerCase());
+      if (matches.length === 0) return { content: [{ type: "text", text: `Task "${args.title}" not found.` }], isError: true };
+      if (matches.length > 1) {
+        const list = matches.map((t) => `- "${t.title}" (${t.status}, id: ${t._id})`).join("\n");
+        return { content: [{ type: "text", text: `Multiple tasks match "${args.title}":
+${list}
+Please use taskId instead.` }], isError: true };
+      }
+      task = matches[0];
+    } else {
+      return { content: [{ type: "text", text: "Either taskId or title is required." }], isError: true };
+    }
+    if (args.status === "in_progress") {
+      currentTaskId = task._id;
+    } else if (args.status === "done" || args.status === "failed" || args.status === "cancelled") {
+      currentTaskId = void 0;
+    }
     await convexMutation("mcpInternal:updateTask", {
       taskId: task._id,
       status: args.status,
@@ -45825,34 +46240,59 @@ server.tool(
       assignedAgent: args.assignedAgent,
       description: args.description
     });
+    postActivity("status", `Task "${args.title}" \u2192 ${args.status ?? "updated"}`, { taskId: task._id });
     return { content: [{ type: "text", text: `Task "${args.title}" updated.` }] };
   }
 );
 server.tool(
   "gallery_delete_task",
-  "Delete a task by title. Permanently removes it from the kanban board.",
+  "Delete a task. Prefer passing taskId if you have it; falls back to title matching.",
   {
-    title: external_exports3.string().describe("Title of the task to delete (exact match)")
+    taskId: external_exports3.string().optional().describe("Task ID (preferred)"),
+    title: external_exports3.string().optional().describe("Title of the task to delete (fallback)")
   },
   async (args) => {
-    const tasks = await convexQuery("mcpInternal:listTasks", {});
-    const task = tasks.find((t) => t.title.toLowerCase() === args.title.toLowerCase());
-    if (!task) return { content: [{ type: "text", text: `Task "${args.title}" not found.` }], isError: true };
+    let task;
+    if (args.taskId) {
+      const tasks = await convexQuery("mcpInternal:listTasks", {});
+      task = tasks.find((t) => t._id === args.taskId);
+      if (!task) return { content: [{ type: "text", text: `Task with ID "${args.taskId}" not found.` }], isError: true };
+    } else if (args.title) {
+      const tasks = await convexQuery("mcpInternal:listTasks", {});
+      const matches = tasks.filter((t) => t.title.toLowerCase() === args.title.toLowerCase());
+      if (matches.length === 0) return { content: [{ type: "text", text: `Task "${args.title}" not found.` }], isError: true };
+      if (matches.length > 1) {
+        const list = matches.map((t) => `- "${t.title}" (${t.status}, id: ${t._id})`).join("\n");
+        return { content: [{ type: "text", text: `Multiple tasks match "${args.title}":
+${list}
+Please use taskId instead.` }], isError: true };
+      }
+      task = matches[0];
+    } else {
+      return { content: [{ type: "text", text: "Either taskId or title is required." }], isError: true };
+    }
     await convexMutation("mcpInternal:deleteTask", { taskId: task._id });
-    return { content: [{ type: "text", text: `Task "${args.title}" deleted.` }] };
+    return { content: [{ type: "text", text: `Task "${task.title}" deleted.` }] };
   }
 );
 server.tool(
   "gallery_add_task_comment",
-  "Add a comment or progress note to a task. Visible in the task activity feed on the dashboard.",
+  "Add a comment or progress note to a task. Call this at every meaningful milestone \u2014 think of it as narrating your progress to your owner in real-time. Visible in the task activity feed on the dashboard.",
   {
     title: external_exports3.string().describe("Title of the task to comment on"),
     content: external_exports3.string().describe("Comment text")
   },
   async (args) => {
     const tasks = await convexQuery("mcpInternal:listTasks", {});
-    const task = tasks.find((t) => t.title.toLowerCase() === args.title.toLowerCase());
-    if (!task) return { content: [{ type: "text", text: `Task "${args.title}" not found.` }], isError: true };
+    const matches = tasks.filter((t) => t.title.toLowerCase() === args.title.toLowerCase());
+    if (matches.length === 0) return { content: [{ type: "text", text: `Task "${args.title}" not found.` }], isError: true };
+    if (matches.length > 1) {
+      const list = matches.map((t) => `- "${t.title}" (${t.status}, id: ${t._id})`).join("\n");
+      return { content: [{ type: "text", text: `Multiple tasks match "${args.title}":
+${list}
+Please use a more specific title.` }], isError: true };
+    }
+    const task = matches[0];
     await convexMutation("mcpInternal:addTaskComment", { taskId: task._id, content: args.content });
     return { content: [{ type: "text", text: `Comment added to "${args.title}".` }] };
   }
@@ -45871,7 +46311,7 @@ server.tool(
 );
 server.tool(
   "gallery_request_review",
-  "Create a review request for the workspace owner. Use when you need human approval, have a question, or want to report completion/errors.",
+  `Create a review request for the workspace owner. When you need human input, don't guess \u2014 create a review and pause. Use the right type: "question" when you need clarification, "approval" when you need sign-off before proceeding, "error" when something is broken and you can't continue, "completion" when work is done and ready for review.`,
   {
     type: external_exports3.enum(["question", "approval", "completion", "error"]).describe("Type of review"),
     title: external_exports3.string().describe("Short title for the review"),
@@ -45923,8 +46363,15 @@ Use this when you're working on a delegated subtask and need to send updates or 
   },
   async (args) => {
     const tasks = await convexQuery("mcpInternal:listTasks", {});
-    const childTask = tasks.find((t) => t.title.toLowerCase() === args.taskTitle.toLowerCase());
-    if (!childTask) return { content: [{ type: "text", text: `Task "${args.taskTitle}" not found.` }], isError: true };
+    const matches = tasks.filter((t) => t.title.toLowerCase() === args.taskTitle.toLowerCase());
+    if (matches.length === 0) return { content: [{ type: "text", text: `Task "${args.taskTitle}" not found.` }], isError: true };
+    if (matches.length > 1) {
+      const list = matches.map((t) => `- "${t.title}" (${t.status}, id: ${t._id})`).join("\n");
+      return { content: [{ type: "text", text: `Multiple tasks match "${args.taskTitle}":
+${list}
+Please use a more specific title.` }], isError: true };
+    }
+    const childTask = matches[0];
     if (!childTask.parentTaskId) return { content: [{ type: "text", text: `Task "${args.taskTitle}" has no parent task.` }], isError: true };
     const result = await convexMutation("mcpInternal:reportToParent", {
       taskId: childTask._id,
@@ -45942,6 +46389,297 @@ server.tool(
   async () => {
     const info = await convexQuery("mcpInternal:workspaceInfo", {});
     return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+  }
+);
+server.tool(
+  "gallery_context_usage",
+  `Check how much of your context window is used. Returns percentage, token counts, and limit.
+
+Use this to decide whether to summarize, compact, or wrap up. If you're above 60%, consider being more concise. Above 80%, save progress to memory immediately.`,
+  {},
+  async () => {
+    const usageFile = path2.join(WORKSPACE_DIR, ".context-usage.json");
+    if (!fs2.existsSync(usageFile)) {
+      return { content: [{ type: "text", text: "Context usage data not yet available (no messages processed)." }] };
+    }
+    try {
+      const data = JSON.parse(fs2.readFileSync(usageFile, "utf-8"));
+      const age = Math.round((Date.now() - (data.updatedAt || 0)) / 1e3);
+      return {
+        content: [{
+          type: "text",
+          text: `Context usage: ${data.percentage}%
+Input tokens: ${(data.inputTokens || 0).toLocaleString()}
+Cache read: ${(data.cacheReadTokens || 0).toLocaleString()}
+Output tokens: ${(data.outputTokens || 0).toLocaleString()}
+Context window: ${(data.contextWindow || 0).toLocaleString()}
+Updated: ${age}s ago`
+        }]
+      };
+    } catch {
+      return { content: [{ type: "text", text: "Failed to read context usage." }], isError: true };
+    }
+  }
+);
+server.tool(
+  "gallery_compact",
+  `Manually checkpoint your current progress before context compaction. Archives the current conversation and writes a structured summary to daily memory.
+
+Use this when:
+- You're on a long task and want to save progress before auto-compaction hits
+- You're about to switch to a completely different task
+- gallery_context_usage shows you're above 70%
+
+This does NOT trigger SDK compaction \u2014 it saves a checkpoint so nothing is lost when compaction eventually fires.`,
+  {
+    focus: external_exports3.string().optional().describe('Optional: what to emphasize in the summary (e.g., "keep architecture decisions, drop debugging steps")')
+  },
+  async (args) => {
+    const memoryDir = path2.join(WORKSPACE_DIR, "memory");
+    fs2.mkdirSync(memoryDir, { recursive: true });
+    const date5 = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString().split("T")[1].replace(/\.\d+Z$/, "");
+    const dailyFile = path2.join(memoryDir, `${date5}.md`);
+    let contextInfo = "";
+    const usageFile = path2.join(WORKSPACE_DIR, ".context-usage.json");
+    if (fs2.existsSync(usageFile)) {
+      try {
+        const data = JSON.parse(fs2.readFileSync(usageFile, "utf-8"));
+        contextInfo = `Context: ${data.percentage}% used (${(data.inputTokens || 0).toLocaleString()} tokens)`;
+      } catch {
+      }
+    }
+    const marker = [
+      `
+## Manual Checkpoint (${timestamp})`,
+      "",
+      contextInfo ? contextInfo : "",
+      args.focus ? `Focus: ${args.focus}` : "",
+      "",
+      "Checkpoint created by agent via gallery_compact.",
+      "Use this marker to resume work if context is compacted.",
+      ""
+    ].filter(Boolean).join("\n");
+    fs2.appendFileSync(dailyFile, marker);
+    return {
+      content: [{
+        type: "text",
+        text: `Checkpoint saved to memory/${date5}.md
+${contextInfo}
+
+Write your key findings, decisions, and next steps to MEMORY.md now before compaction occurs.`
+      }]
+    };
+  }
+);
+server.tool(
+  "gallery_structured_output",
+  `Return structured JSON data as a tool result. Use this when you need to return machine-readable data to the caller (e.g., delegation results, API responses, structured reports).
+
+The output is validated as JSON before being returned. If the data is not valid JSON, it will be returned as a string with an error flag.`,
+  {
+    data: external_exports3.string().describe("JSON string to return as structured output"),
+    schema_description: external_exports3.string().optional().describe("Optional: description of the JSON schema for documentation")
+  },
+  async (args) => {
+    try {
+      const parsed = JSON.parse(args.data);
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(parsed, null, 2)
+        }]
+      };
+    } catch {
+      return {
+        content: [{ type: "text", text: `Invalid JSON: ${args.data.slice(0, 500)}` }],
+        isError: true
+      };
+    }
+  }
+);
+server.tool(
+  "gallery_read_peer_memory",
+  `Read another agent's memory files. Use this to check what a peer agent has learned before delegating work (avoids duplicate effort) or to share knowledge across the team.
+
+This is READ-ONLY \u2014 you cannot write to another agent's memory. To share information, write it to your own memory and let the other agent read yours.`,
+  {
+    targetAgentId: external_exports3.string().describe("Convex document ID of the agent whose memory you want to read"),
+    query: external_exports3.string().optional().describe("Optional: search query to find specific memories (BM25 full-text search)"),
+    limit: external_exports3.number().default(5).describe("Max results for search queries")
+  },
+  async (args) => {
+    if (!convexUrl || !gatewayToken) {
+      return { content: [{ type: "text", text: "Cross-agent memory requires Gallery API (not configured)." }], isError: true };
+    }
+    try {
+      if (args.query) {
+        const res = await fetch(`${convexUrl}/api/query`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            path: "memoryEntries:search",
+            args: { token: gatewayToken, agentId: args.targetAgentId, query: args.query, limit: args.limit }
+          }),
+          signal: AbortSignal.timeout(15e3)
+        });
+        if (!res.ok) return { content: [{ type: "text", text: `Failed to search peer memory: ${res.status}` }], isError: true };
+        const data = await res.json();
+        const entries = data.value ?? data ?? [];
+        if (!Array.isArray(entries) || entries.length === 0) {
+          return { content: [{ type: "text", text: `No results for "${args.query}" in agent ${args.targetAgentId}'s memory.` }] };
+        }
+        const formatted = entries.map((e3) => `**${e3.path}**
+${(e3.body || "").slice(0, 500)}`).join("\n\n---\n\n");
+        return { content: [{ type: "text", text: `Found ${entries.length} result(s) in peer memory:
+
+${formatted}` }] };
+      } else {
+        const res = await fetch(`${convexUrl}/api/query`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            path: "memoryEntries:listPaths",
+            args: { token: gatewayToken, agentId: args.targetAgentId }
+          }),
+          signal: AbortSignal.timeout(15e3)
+        });
+        if (!res.ok) return { content: [{ type: "text", text: `Failed to list peer memory: ${res.status}` }], isError: true };
+        const data = await res.json();
+        const paths = data.value ?? data ?? [];
+        if (!Array.isArray(paths) || paths.length === 0) {
+          return { content: [{ type: "text", text: `Agent ${args.targetAgentId} has no indexed memory entries.` }] };
+        }
+        const formatted = paths.map((p) => `- ${p.path} (updated: ${new Date(p.updatedAt).toLocaleDateString()})`).join("\n");
+        return { content: [{ type: "text", text: `Agent ${args.targetAgentId}'s memory files:
+${formatted}
+
+Use query parameter to search specific topics.` }] };
+      }
+    } catch (err) {
+      return { content: [{ type: "text", text: `Peer memory error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  }
+);
+server.tool(
+  "gallery_enter_plan_mode",
+  `Enter planning mode. Use this when you need to think through a complex task before executing it. In plan mode:
+
+1. Write your plan to a file (e.g., memory/plan-{topic}.md)
+2. Create a review of type "approval" with the plan summary
+3. Stop executing and wait for the owner to approve
+
+This is a behavioral toggle \u2014 you commit to only reading and planning, not executing. Call gallery_exit_plan_mode when approved.`,
+  {
+    plan_title: external_exports3.string().describe("Title of what you are planning"),
+    plan_content: external_exports3.string().describe("The full plan \u2014 steps, rationale, risks, alternatives")
+  },
+  async (args) => {
+    const slug = args.plan_title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 50);
+    const planFile = path2.join(MEMORY_DIR, `plan-${slug}.md`);
+    fs2.mkdirSync(MEMORY_DIR, { recursive: true });
+    fs2.writeFileSync(planFile, `# Plan: ${args.plan_title}
+
+${args.plan_content}
+
+---
+*Created: ${(/* @__PURE__ */ new Date()).toISOString()}*
+`);
+    indexMemoryEntry(`plan-${slug}.md`, fs2.readFileSync(planFile, "utf-8"));
+    try {
+      const agents = await convexQuery("mcpInternal:listAgents", {});
+      const self2 = agents.find((a3) => a3._id === agentId);
+      if (self2) {
+        await convexMutation("mcpInternal:createReview", {
+          agentId,
+          type: "approval",
+          title: `Plan: ${args.plan_title}`,
+          content: args.plan_content.slice(0, 2e3)
+        });
+      }
+    } catch {
+    }
+    planModeActive = true;
+    postActivity("status", `Entered plan mode: ${args.plan_title}`);
+    return {
+      content: [{
+        type: "text",
+        text: `Plan saved to memory/plan-${slug}.md and submitted for approval.
+
+**You are now in PLAN MODE.** Mutating tools (task create/update/delete, delegation, memory writes) are blocked. Only read-only tools are available.
+
+When approved, call gallery_exit_plan_mode to resume execution.`
+      }]
+    };
+  }
+);
+server.tool(
+  "gallery_exit_plan_mode",
+  `Exit planning mode and resume normal execution. Call this after your plan has been approved (check gallery_list_reviews for approval status).`,
+  {
+    plan_title: external_exports3.string().describe("Title of the plan that was approved")
+  },
+  async (args) => {
+    planModeActive = false;
+    postActivity("status", `Exited plan mode: ${args.plan_title}`);
+    return {
+      content: [{
+        type: "text",
+        text: `Plan mode exited. All tools are now available. Execute the approved plan for "${args.plan_title}".
+
+Read your plan file from memory before starting execution.`
+      }]
+    };
+  }
+);
+server.tool(
+  "gallery_sleep",
+  `Schedule a self-wake after a delay. The agent will receive a scheduled task message after the specified duration. Use this for:
+- Polling a condition ("check back in 5 minutes if the deploy finished")
+- Time-delayed actions ("send the report at 5pm")
+- Monitoring workflows ("check API health every 10 minutes")
+
+The wake message is sent as a scheduled task \u2014 it will appear as a new message in your conversation.`,
+  {
+    delay_seconds: external_exports3.number().min(10).max(3600).describe("Delay in seconds before waking (10s to 1 hour)"),
+    wake_message: external_exports3.string().describe("Message to send yourself when waking up \u2014 include context about what to check or do")
+  },
+  async (args) => {
+    if (!galleryWorkerUrl || !galleryToken) {
+      return { content: [{ type: "text", text: "Self-wake requires Gallery Worker (not configured)." }], isError: true };
+    }
+    try {
+      const response = await fetch(`${galleryWorkerUrl}/scheduler/schedule/once`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${galleryToken}`
+        },
+        body: JSON.stringify({
+          agentId,
+          delaySeconds: args.delay_seconds,
+          message: `[SELF-WAKE] ${args.wake_message}`
+        })
+      });
+      if (!response.ok) {
+        const err = await response.text();
+        return { content: [{ type: "text", text: `Sleep scheduling failed (${response.status}): ${err}` }], isError: true };
+      }
+      const wakeTime = new Date(Date.now() + args.delay_seconds * 1e3).toLocaleTimeString();
+      postActivity("status", `Scheduled self-wake in ${args.delay_seconds}s at ~${wakeTime}`);
+      return {
+        content: [{
+          type: "text",
+          text: `Self-wake scheduled in ${args.delay_seconds} seconds (~${wakeTime}).
+
+Wake message: "${args.wake_message}"
+
+You can continue working on other tasks. The wake message will arrive as a scheduled task.`
+        }]
+      };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Sleep error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
   }
 );
 function formatSize(bytes) {

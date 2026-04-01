@@ -348,6 +348,14 @@ export function redactSecretsFromCommand(command: string): string {
     .replace(/\b(AKIA[A-Z0-9]{16})/g, 'AKIA***REDACTED***')
     .replace(/\b(sk_live_[A-Za-z0-9]{24,})/g, 'sk_live_***REDACTED***')
     .replace(/\b(r8_[A-Za-z0-9]{37})/g, 'r8_***REDACTED***')
+    .replace(/\b(gho_[A-Za-z0-9]{36,})/g, 'gho_***REDACTED***')
+    .replace(/\b(ghs_[A-Za-z0-9]{36,})/g, 'ghs_***REDACTED***')
+    .replace(/\b(ghr_[A-Za-z0-9]{36,})/g, 'ghr_***REDACTED***')
+    .replace(/\b(xoxe-[A-Za-z0-9-]+)/g, 'xoxe-***REDACTED***')
+    .replace(/\b(whsec_[A-Za-z0-9]{32,})/g, 'whsec_***REDACTED***')
+    .replace(/\b(SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})/g, 'SG.***REDACTED***')
+    .replace(/\b(ABIA[A-Z0-9]{16})/g, 'ABIA***REDACTED***')
+    .replace(/\b(ASIA[A-Z0-9]{16})/g, 'ASIA***REDACTED***')
     .replace(/(password|secret|token|key|apikey)=["']?[A-Za-z0-9_\-\.]{8,}["']?/gi, '$1=***REDACTED***')
     .replace(/Authorization:\s*Bearer\s+[A-Za-z0-9_\-\.]+/gi, 'Authorization: Bearer ***REDACTED***')
     .replace(/-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----/g, '***PRIVATE_KEY_REDACTED***')
@@ -362,16 +370,77 @@ export function createSanitizeBashHook(): HookCallback {
 
     const redacted = redactSecretsFromCommand(command);
     const unsetPrefix = `unset ${SECRET_ENV_VARS.join(' ')} 2>/dev/null; `;
+    // Block /proc/self/environ access to prevent leaking unset env vars from parent process
+    const procGuard = `chmod 000 /proc/self/environ 2>/dev/null; `;
     return {
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         updatedInput: {
           ...(preInput.tool_input as Record<string, unknown>),
-          command: unsetPrefix + redacted,
+          command: procGuard + unsetPrefix + redacted,
         },
       },
     };
   };
+}
+
+// ─── Output Secret Redaction ────────────────────────────
+
+/**
+ * Redact secrets from tool output (stdout/stderr). Applied to tool_result
+ * content before streaming to the user. Extends command redaction with
+ * patterns specific to output formats (JSON, base64, environment dumps).
+ */
+export function redactSecretsFromOutput(text: string): string {
+  let redacted = redactSecretsFromCommand(text);
+
+  // JSON key-value patterns: "api_key": "sk-...", "secret": "...", "token": "..."
+  redacted = redacted.replace(
+    /("(?:api[_-]?key|secret|token|password|credential|auth)[^"]*"\s*:\s*")([^"]{8,})"/gi,
+    '$1***REDACTED***"',
+  );
+
+  // Base64-encoded secrets (40+ chars of base64, likely a key/token)
+  redacted = redacted.replace(
+    /\b[A-Za-z0-9+/]{40,}={0,2}\b/g,
+    (match) => {
+      // Only redact if it looks like a secret (high entropy, not a known safe pattern like UUIDs)
+      if (/^[0-9a-f-]+$/i.test(match)) return match; // UUID-like, keep
+      if (match.length > 60) return '***BASE64_REDACTED***';
+      return match;
+    },
+  );
+
+  // Environment dump patterns: KEY=value from /proc/self/environ or env output
+  redacted = redacted.replace(
+    /\b(ANTHROPIC_API_KEY|GALLERY_GATEWAY_TOKEN|GALLERY_TOKEN|AWS_SECRET_ACCESS_KEY|OPENAI_API_KEY|STRIPE_SECRET_KEY|DATABASE_URL|GITHUB_TOKEN)=([^\s\0]+)/gi,
+    '$1=***REDACTED***',
+  );
+
+  return redacted;
+}
+
+// ─── Context Usage File ─────────────────────────────────
+
+const CONTEXT_USAGE_FILE = '.context-usage.json';
+
+/**
+ * Write context usage stats to a well-known file so the MCP process can read them.
+ * Called from the context safety hook and after each assistant message.
+ */
+export function writeContextUsage(workspaceDir: string, tracker: ContextWindowTracker): void {
+  try {
+    const data = {
+      percentage: Math.round(tracker.getPercentage() * 100),
+      inputTokens: tracker.lastInputTokens,
+      outputTokens: tracker.lastOutputTokens,
+      cacheReadTokens: tracker.lastCacheReadTokens,
+      cacheCreationTokens: tracker.lastCacheCreationTokens,
+      contextWindow: tracker.contextWindow,
+      updatedAt: Date.now(),
+    };
+    fs.writeFileSync(path.join(workspaceDir, CONTEXT_USAGE_FILE), JSON.stringify(data));
+  } catch { /* non-fatal */ }
 }
 
 // ─── Tool Loop Detection ─────────────────────────────────
@@ -549,6 +618,11 @@ export class ContextWindowTracker {
     if (contextWindow && contextWindow > 0) this.contextWindow = contextWindow;
     if (cacheReadTokens !== undefined) this.lastCacheReadTokens = cacheReadTokens;
     if (cacheCreationTokens !== undefined) this.lastCacheCreationTokens = cacheCreationTokens;
+
+    // Auto-reset warning flags when usage drops below thresholds (e.g., after compaction)
+    const pct = this.getPercentage();
+    if (pct < CONTEXT_WARN_THRESHOLD && this.warnedAt70) this.warnedAt70 = false;
+    if (pct < CONTEXT_CHECKPOINT_THRESHOLD && this.checkpointedAt80) this.checkpointedAt80 = false;
   }
 
   getPercentage(): number {
@@ -586,8 +660,12 @@ export function createContextSafetyHook(
   tracker: ContextWindowTracker,
   activityPoster: { post: (type: ActivityType, content: string, metadata?: unknown) => void } | null,
   log?: (msg: string) => void,
+  workspaceDir?: string,
 ): HookCallback {
   return async (_input, _toolUseId, _context) => {
+    // Write context usage to file for MCP tools to read
+    if (workspaceDir) writeContextUsage(workspaceDir, tracker);
+
     const pct = tracker.getPercentage();
 
     if (tracker.shouldCheckpoint()) {
@@ -656,13 +734,14 @@ export async function postConvexActivity(
 }
 
 export class ActivityPoster {
-  private static readonly MAX_QUEUE = 100;
+  private static readonly MAX_QUEUE = 500;
   private convexUrl: string | null;
   private token: string | null;
   private agentId: string;
   private queue: { type: ActivityType; content: string; metadata?: unknown; taskId?: string }[] = [];
   private timer: ReturnType<typeof setInterval> | null = null;
   private droppedCount = 0;
+  private flushing = false;
   private currentTaskId: string | undefined;
 
   constructor(convexUrl: string | null, token: string | null, agentId: string) {
@@ -692,19 +771,37 @@ export class ActivityPoster {
   getDroppedCount(): number { return this.droppedCount; }
 
   async flush(): Promise<void> {
-    if (this.queue.length === 0 || !this.convexUrl || !this.token) return;
-
-    const batch = this.queue.splice(0, 10);
-    for (const event of batch) {
-      await postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata, event.taskId);
+    if (this.flushing || this.queue.length === 0 || !this.convexUrl || !this.token) return;
+    this.flushing = true;
+    try {
+      const batch = this.queue.splice(0, 25);
+      const results = await Promise.allSettled(
+        batch.map((event) =>
+          Promise.race([
+            postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata, event.taskId),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Activity post timeout')), 10_000)),
+          ])
+        ),
+      );
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      if (failed > 0) {
+        console.error(`[activity-poster] ${failed}/${batch.length} events failed to post`);
+      }
+    } finally {
+      this.flushing = false;
     }
   }
 
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    while (this.queue.length > 0) {
+    // Flush remaining with a hard deadline to avoid blocking shutdown
+    const deadline = Date.now() + 15_000;
+    while (this.queue.length > 0 && Date.now() < deadline) {
       await this.flush();
+    }
+    if (this.queue.length > 0) {
+      console.error(`[activity-poster] Shutdown: dropped ${this.queue.length} events (deadline exceeded)`);
     }
   }
 }

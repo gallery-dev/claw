@@ -10,12 +10,12 @@
  */
 
 import http from 'http';
-import { processMessage, getStatus, getActivityMetrics, shutdown, type MessageParams, type StreamEvent } from './agent.js';
-import { UIStreamWriter, generateStreamId, isAiSdkEnabled } from './ui-stream.js';
+import { processMessage, getStatus, getActivityMetrics, shutdown, type MessageParams } from './agent.js';
+import { UIStreamWriter, generateStreamId } from './ui-stream.js';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const MAX_QUEUE_SIZE = parseInt(process.env.CLAW_MAX_QUEUE_SIZE || '50', 10);
-const REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || '600000', 10);
+const REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || '1800000', 10);
 const AUTH_TOKEN = process.env.CLAW_AUTH_TOKEN || process.env.GALLERY_GATEWAY_TOKEN || '';
 
 // Active SSE streams — keyed by streamId for cancel support
@@ -80,14 +80,19 @@ async function processQueue(): Promise<void> {
 
   processing = true;
 
-  // Take the first item, then batch any queued items of the same type
-  // (don't mix tasks with regular messages — they have different semantics)
+  // Take the first item, then batch any queued items with the same type AND sessionId
+  // (don't mix tasks with messages, or messages from different conversations)
   const first = requestQueue.shift()!;
   const items = [first];
   const isTask = first.params.isScheduledTask;
+  const sessionId = first.params.sessionId;
 
-  // Collect same-type items from the front of the queue
-  while (requestQueue.length > 0 && requestQueue[0].params.isScheduledTask === isTask) {
+  // Collect same-type, same-session items from the front of the queue
+  while (
+    requestQueue.length > 0 &&
+    requestQueue[0].params.isScheduledTask === isTask &&
+    requestQueue[0].params.sessionId === sessionId
+  ) {
     items.push(requestQueue.shift()!);
   }
 
@@ -214,10 +219,9 @@ async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse
   };
 
   const wantSSE = (req.headers['accept'] || '').includes('text/event-stream');
-  const useAiSdk = isAiSdkEnabled();
-  log(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE}, aisdk: ${useAiSdk})`);
+  log(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE})`);
 
-  if (wantSSE && useAiSdk) {
+  if (wantSSE) {
     // ─── AI SDK UI Message Stream Protocol v1 ──────
     const writer = new UIStreamWriter(res);
     const streamId = generateStreamId();
@@ -225,57 +229,26 @@ async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse
     activeStreams.set(streamId, streamState);
 
     // Emit stream ID so frontend can cancel
-    writer.galleryStreamId(streamId);
+    await writer.galleryStreamId(streamId);
 
     try {
-      const result = await processMessage(params, undefined, writer, streamState);
+      const result = await processMessage(params, writer, streamState);
       markReady();
       // writer.finish() + writer.done() are called inside processMessage when it sees 'result'
       // If processMessage returned without emitting done (edge case), ensure stream ends
       if (!writer.isEnded && !res.destroyed) {
-        writer.finish('stop');
+        await writer.finish('stop');
         writer.done();
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Error processing message (AI SDK): ${errMsg}`);
       if (!writer.isEnded && !res.destroyed) {
-        writer.error(errMsg);
+        await writer.error(errMsg);
         writer.done();
       }
     } finally {
       activeStreams.delete(streamId);
-    }
-  } else if (wantSSE) {
-    // ─── Legacy SSE format ──────────────────────────
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-
-    const onEvent = (event: StreamEvent) => {
-      if (res.destroyed) return;
-      res.write(`data: ${JSON.stringify(event)}\n\n`);
-    };
-
-    try {
-      const result = await processMessage(params, onEvent);
-      markReady();
-      if (!res.destroyed) {
-        res.write(`data: ${JSON.stringify({ type: 'result', data: result })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log(`Error processing message (SSE): ${errMsg}`);
-      if (!res.destroyed) {
-        res.write(`data: ${JSON.stringify({ type: 'error', data: { error: errMsg } })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-      }
     }
   } else {
     // ─── JSON mode — queue and wait for full result ─
@@ -438,10 +411,12 @@ const server = http.createServer(async (req, res) => {
       if (!requireAuth(req, res)) return;
       await handleTask(req, res);
     } else if (method === 'GET' && url === '/health') {
+      if (!requireAuth(req, res)) return;
       handleHealth(req, res);
     } else if (method === 'GET' && url === '/ready') {
-      handleReady(req, res);
+      handleReady(req, res); // Minimal liveness probe — no sensitive data
     } else if (method === 'GET' && url === '/status') {
+      if (!requireAuth(req, res)) return;
       handleStatus(req, res);
     } else {
       sendJson(res, 404, { error: 'Not found' });

@@ -2,7 +2,7 @@
  * UI Message Stream Protocol v1 — AI SDK compatible SSE writer.
  *
  * Emits named JSON types over SSE that `useChat()` from `@ai-sdk/react`
- * can parse natively. Replaces our custom SSE format when SSE_FORMAT=aisdk.
+ * can parse natively.
  *
  * Protocol: https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol
  * Required header: X-Vercel-AI-UI-Message-Stream: v1
@@ -56,40 +56,58 @@ export class UIStreamWriter {
 
   // ─── Low-level ──────────────────────────────────────
 
-  private write(chunk: Record<string, unknown>): void {
+  private backpressureWarned = false;
+
+  private async write(chunk: Record<string, unknown>): Promise<void> {
     if (this.ended || this.res.destroyed) return;
-    this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    const ok = this.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    if (!ok) {
+      if (!this.backpressureWarned) {
+        this.backpressureWarned = true;
+        console.error('[ui-stream] Backpressure detected — pausing until drain');
+      }
+      // Wait for drain or connection close to avoid hanging if res is destroyed
+      // between write() returning false and the drain event firing.
+      await new Promise<void>((resolve) => {
+        const cleanup = () => { this.res.off('drain', onDrain); this.res.off('close', onClose); this.res.off('error', onClose); };
+        const onDrain = () => { cleanup(); resolve(); };
+        const onClose = () => { cleanup(); resolve(); };
+        this.res.once('drain', onDrain);
+        this.res.once('close', onClose);
+        this.res.once('error', onClose);
+      });
+    }
   }
 
   // ─── Message Lifecycle ──────────────────────────────
 
-  start(messageId?: string): void {
-    this.write({
+  async start(messageId?: string): Promise<void> {
+    await this.write({
       type: 'start',
       ...(messageId ? { messageId } : {}),
     });
   }
 
-  finish(finishReason: string = 'stop', metadata?: MessageMetadata): void {
-    this.closeOpenBlocks();
+  async finish(finishReason: string = 'stop', metadata?: MessageMetadata): Promise<void> {
+    await this.closeOpenBlocks();
     if (this.stepOpen) {
-      this.finishStep();
+      await this.finishStep();
     }
-    this.write({
+    await this.write({
       type: 'finish',
       finishReason,
       ...(metadata ? { messageMetadata: metadata } : {}),
     });
   }
 
-  startStep(): void {
-    this.write({ type: 'start-step' });
+  async startStep(): Promise<void> {
+    await this.write({ type: 'start-step' });
     this.stepOpen = true;
   }
 
-  finishStep(): void {
-    this.closeOpenBlocks();
-    this.write({ type: 'finish-step' });
+  async finishStep(): Promise<void> {
+    await this.closeOpenBlocks();
+    await this.write({ type: 'finish-step' });
     this.stepOpen = false;
   }
 
@@ -99,25 +117,25 @@ export class UIStreamWriter {
     return this._currentTextId;
   }
 
-  textStart(id?: string): string {
+  async textStart(id?: string): Promise<string> {
     const blockId = id ?? `text-${++this.textIdCounter}`;
     this._currentTextId = blockId;
-    this.write({ type: 'text-start', id: blockId });
+    await this.write({ type: 'text-start', id: blockId });
     return blockId;
   }
 
-  textDelta(delta: string, id?: string): void {
+  async textDelta(delta: string, id?: string): Promise<void> {
     // Auto-open text block if needed
     if (!this._currentTextId) {
-      this.textStart(id);
+      await this.textStart(id);
     }
-    this.write({ type: 'text-delta', id: this._currentTextId, delta });
+    await this.write({ type: 'text-delta', id: this._currentTextId, delta });
   }
 
-  textEnd(id?: string): void {
+  async textEnd(id?: string): Promise<void> {
     const blockId = id ?? this._currentTextId;
     if (!blockId) return;
-    this.write({ type: 'text-end', id: blockId });
+    await this.write({ type: 'text-end', id: blockId });
     this._currentTextId = null;
   }
 
@@ -127,84 +145,84 @@ export class UIStreamWriter {
     return this._currentReasoningId;
   }
 
-  reasoningStart(id?: string): string {
+  async reasoningStart(id?: string): Promise<string> {
     const blockId = id ?? `reasoning-${++this.reasoningIdCounter}`;
     this._currentReasoningId = blockId;
-    this.write({ type: 'reasoning-start', id: blockId });
+    await this.write({ type: 'reasoning-start', id: blockId });
     return blockId;
   }
 
-  reasoningDelta(delta: string, id?: string): void {
+  async reasoningDelta(delta: string, id?: string): Promise<void> {
     if (!this._currentReasoningId) {
-      this.reasoningStart(id);
+      await this.reasoningStart(id);
     }
-    this.write({ type: 'reasoning-delta', id: this._currentReasoningId, delta });
+    await this.write({ type: 'reasoning-delta', id: this._currentReasoningId, delta });
   }
 
-  reasoningEnd(id?: string): void {
+  async reasoningEnd(id?: string): Promise<void> {
     const blockId = id ?? this._currentReasoningId;
     if (!blockId) return;
-    this.write({ type: 'reasoning-end', id: blockId });
+    await this.write({ type: 'reasoning-end', id: blockId });
     this._currentReasoningId = null;
   }
 
   // ─── Tool Calls ─────────────────────────────────────
 
-  toolInputStart(toolCallId: string, toolName: string): void {
-    this.closeOpenBlocks();
-    this.write({ type: 'tool-input-start', toolCallId, toolName });
+  async toolInputStart(toolCallId: string, toolName: string): Promise<void> {
+    await this.closeOpenBlocks();
+    await this.write({ type: 'tool-input-start', toolCallId, toolName });
   }
 
-  toolInputAvailable(toolCallId: string, toolName: string, input: unknown): void {
-    this.write({ type: 'tool-input-available', toolCallId, toolName, input });
+  async toolInputAvailable(toolCallId: string, toolName: string, input: unknown): Promise<void> {
+    await this.write({ type: 'tool-input-available', toolCallId, toolName, input });
   }
 
-  toolOutputAvailable(toolCallId: string, output: unknown): void {
-    this.write({ type: 'tool-output-available', toolCallId, output });
+  async toolOutputAvailable(toolCallId: string, output: unknown): Promise<void> {
+    await this.write({ type: 'tool-output-available', toolCallId, output });
   }
 
-  toolOutputError(toolCallId: string, errorText: string): void {
-    this.write({ type: 'tool-output-error', toolCallId, errorText });
+  async toolOutputError(toolCallId: string, errorText: string): Promise<void> {
+    await this.write({ type: 'tool-output-error', toolCallId, errorText });
   }
 
   // ─── Custom Gallery Data ────────────────────────────
 
-  galleryData(name: string, data: unknown): void {
-    this.write({ type: `data-gallery-${name}`, data });
+  async galleryData(name: string, data: unknown): Promise<void> {
+    await this.write({ type: `data-gallery-${name}`, data });
   }
 
-  galleryStreamId(streamId: string): void {
-    this.galleryData('stream-id', { streamId });
+  async galleryStreamId(streamId: string): Promise<void> {
+    await this.galleryData('stream-id', { streamId });
   }
 
-  galleryProgress(data: { steps: string[]; current: number; status: string; note?: string }): void {
-    this.galleryData('progress', data);
+  async galleryProgress(data: { steps: string[]; current: number; status: string; note?: string }): Promise<void> {
+    await this.galleryData('progress', data);
   }
 
-  galleryCompacting(status: 'started' | 'done'): void {
-    this.galleryData('compacting', { status });
+  async galleryCompacting(status: 'started' | 'done'): Promise<void> {
+    await this.galleryData('compacting', { status });
   }
 
-  galleryReview(data: { reviewId: string; reviewType: string }): void {
-    this.galleryData('review', data);
+  async galleryReview(data: { reviewId: string; reviewType: string }): Promise<void> {
+    await this.galleryData('review', data);
   }
 
   // ─── Metadata ───────────────────────────────────────
 
-  messageMetadata(metadata: MessageMetadata): void {
-    this.write({ type: 'message-metadata', messageMetadata: metadata });
+  async messageMetadata(metadata: MessageMetadata): Promise<void> {
+    await this.write({ type: 'message-metadata', messageMetadata: metadata });
   }
 
   // ─── Error / Abort ──────────────────────────────────
 
-  error(errorText: string): void {
-    this.closeOpenBlocks();
-    this.write({ type: 'error', errorText });
+  async error(errorText: string): Promise<void> {
+    await this.closeOpenBlocks();
+    await this.write({ type: 'error', errorText });
   }
 
-  abort(reason?: string): void {
-    this.closeOpenBlocks();
-    this.write({ type: 'abort', ...(reason ? { reason } : {}) });
+  async abort(reason?: string): Promise<void> {
+    await this.closeOpenBlocks();
+    await this.write({ type: 'abort', ...(reason ? { reason } : {}) });
   }
 
   // ─── Stream Termination ─────────────────────────────
@@ -225,9 +243,9 @@ export class UIStreamWriter {
   // ─── Helpers ────────────────────────────────────────
 
   /** Close any open text or reasoning blocks. */
-  closeOpenBlocks(): void {
-    if (this._currentTextId) this.textEnd();
-    if (this._currentReasoningId) this.reasoningEnd();
+  async closeOpenBlocks(): Promise<void> {
+    if (this._currentTextId) await this.textEnd();
+    if (this._currentReasoningId) await this.reasoningEnd();
   }
 
   /** Whether a step boundary is needed before the next content. */
@@ -236,9 +254,9 @@ export class UIStreamWriter {
   }
 
   /** Emit step boundary (finish current step, start new one). */
-  emitStepBoundary(): void {
-    this.finishStep();
-    this.startStep();
+  async emitStepBoundary(): Promise<void> {
+    await this.finishStep();
+    await this.startStep();
   }
 }
 
@@ -252,7 +270,3 @@ export function generateStreamId(): string {
   return `stream_${crypto.randomBytes(8).toString('hex')}`;
 }
 
-/** Check if AI SDK UI Message Stream format is enabled. */
-export function isAiSdkEnabled(): boolean {
-  return process.env.SSE_FORMAT === 'aisdk';
-}

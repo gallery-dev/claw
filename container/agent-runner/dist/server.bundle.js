@@ -11,6 +11,28 @@ import { fileURLToPath } from "url";
 // src/shared.ts
 import fs from "fs";
 import path from "path";
+var INJECTION_PATTERNS = [
+  /ignore\s+(all\s+)?previous\s+instructions/i,
+  /ignore\s+(all\s+)?above\s+instructions/i,
+  /disregard\s+(all\s+)?prior\s+(instructions|context)/i,
+  /you\s+are\s+now\s+(a|an)\s+/i,
+  /new\s+instructions?\s*:/i,
+  /system\s*:\s*you\s+(are|must|should)/i,
+  /<div\s+style\s*=\s*["']display:\s*none/i,
+  /curl\s+.*\|\s*sh/i,
+  /wget\s+.*\|\s*bash/i,
+  /\u200b|\u200c|\u200d|\ufeff/
+  // Zero-width characters (invisible text injection)
+];
+function scanForInjection(text) {
+  const detected = [];
+  for (const pattern of INJECTION_PATTERNS) {
+    if (pattern.test(text)) {
+      detected.push(pattern.source.slice(0, 60));
+    }
+  }
+  return detected;
+}
 function parseTranscript(content) {
   const messages = [];
   for (const line of content.split("\n")) {
@@ -230,7 +252,7 @@ var SECRET_ENV_VARS = [
   "GALLERY_TOKEN"
 ];
 function redactSecretsFromCommand(command) {
-  return command.replace(/\b(sk-[A-Za-z0-9]{20,})/g, "sk-***REDACTED***").replace(/\b(ghp_[A-Za-z0-9]{36,})/g, "ghp_***REDACTED***").replace(/\b(github_pat_[A-Za-z0-9_]{82,})/g, "github_pat_***REDACTED***").replace(/\b(xox[bpoa]-[A-Za-z0-9-]+)/g, "xox***REDACTED***").replace(/\b(AIza[A-Za-z0-9_-]{35})/g, "AIza***REDACTED***").replace(/\b(AKIA[A-Z0-9]{16})/g, "AKIA***REDACTED***").replace(/\b(sk_live_[A-Za-z0-9]{24,})/g, "sk_live_***REDACTED***").replace(/\b(r8_[A-Za-z0-9]{37})/g, "r8_***REDACTED***").replace(/(password|secret|token|key|apikey)=["']?[A-Za-z0-9_\-\.]{8,}["']?/gi, "$1=***REDACTED***").replace(/Authorization:\s*Bearer\s+[A-Za-z0-9_\-\.]+/gi, "Authorization: Bearer ***REDACTED***").replace(/-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----/g, "***PRIVATE_KEY_REDACTED***").replace(/\b(postgres|mysql|mongodb|redis|amqp)(:\/\/)[^\s"']+/gi, "$1$2***REDACTED***");
+  return command.replace(/\b(sk-[A-Za-z0-9]{20,})/g, "sk-***REDACTED***").replace(/\b(ghp_[A-Za-z0-9]{36,})/g, "ghp_***REDACTED***").replace(/\b(github_pat_[A-Za-z0-9_]{82,})/g, "github_pat_***REDACTED***").replace(/\b(xox[bpoa]-[A-Za-z0-9-]+)/g, "xox***REDACTED***").replace(/\b(AIza[A-Za-z0-9_-]{35})/g, "AIza***REDACTED***").replace(/\b(AKIA[A-Z0-9]{16})/g, "AKIA***REDACTED***").replace(/\b(sk_live_[A-Za-z0-9]{24,})/g, "sk_live_***REDACTED***").replace(/\b(r8_[A-Za-z0-9]{37})/g, "r8_***REDACTED***").replace(/\b(gho_[A-Za-z0-9]{36,})/g, "gho_***REDACTED***").replace(/\b(ghs_[A-Za-z0-9]{36,})/g, "ghs_***REDACTED***").replace(/\b(ghr_[A-Za-z0-9]{36,})/g, "ghr_***REDACTED***").replace(/\b(xoxe-[A-Za-z0-9-]+)/g, "xoxe-***REDACTED***").replace(/\b(whsec_[A-Za-z0-9]{32,})/g, "whsec_***REDACTED***").replace(/\b(SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})/g, "SG.***REDACTED***").replace(/\b(ABIA[A-Z0-9]{16})/g, "ABIA***REDACTED***").replace(/\b(ASIA[A-Z0-9]{16})/g, "ASIA***REDACTED***").replace(/(password|secret|token|key|apikey)=["']?[A-Za-z0-9_\-\.]{8,}["']?/gi, "$1=***REDACTED***").replace(/Authorization:\s*Bearer\s+[A-Za-z0-9_\-\.]+/gi, "Authorization: Bearer ***REDACTED***").replace(/-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----/g, "***PRIVATE_KEY_REDACTED***").replace(/\b(postgres|mysql|mongodb|redis|amqp)(:\/\/)[^\s"']+/gi, "$1$2***REDACTED***");
 }
 function createSanitizeBashHook() {
   return async (input, _toolUseId, _context) => {
@@ -239,16 +261,53 @@ function createSanitizeBashHook() {
     if (!command) return {};
     const redacted = redactSecretsFromCommand(command);
     const unsetPrefix = `unset ${SECRET_ENV_VARS.join(" ")} 2>/dev/null; `;
+    const procGuard = `chmod 000 /proc/self/environ 2>/dev/null; `;
     return {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         updatedInput: {
           ...preInput.tool_input,
-          command: unsetPrefix + redacted
+          command: procGuard + unsetPrefix + redacted
         }
       }
     };
   };
+}
+function redactSecretsFromOutput(text) {
+  let redacted = redactSecretsFromCommand(text);
+  redacted = redacted.replace(
+    /("(?:api[_-]?key|secret|token|password|credential|auth)[^"]*"\s*:\s*")([^"]{8,})"/gi,
+    '$1***REDACTED***"'
+  );
+  redacted = redacted.replace(
+    /\b[A-Za-z0-9+/]{40,}={0,2}\b/g,
+    (match) => {
+      if (/^[0-9a-f-]+$/i.test(match)) return match;
+      if (match.length > 60) return "***BASE64_REDACTED***";
+      return match;
+    }
+  );
+  redacted = redacted.replace(
+    /\b(ANTHROPIC_API_KEY|GALLERY_GATEWAY_TOKEN|GALLERY_TOKEN|AWS_SECRET_ACCESS_KEY|OPENAI_API_KEY|STRIPE_SECRET_KEY|DATABASE_URL|GITHUB_TOKEN)=([^\s\0]+)/gi,
+    "$1=***REDACTED***"
+  );
+  return redacted;
+}
+var CONTEXT_USAGE_FILE = ".context-usage.json";
+function writeContextUsage(workspaceDir, tracker) {
+  try {
+    const data = {
+      percentage: Math.round(tracker.getPercentage() * 100),
+      inputTokens: tracker.lastInputTokens,
+      outputTokens: tracker.lastOutputTokens,
+      cacheReadTokens: tracker.lastCacheReadTokens,
+      cacheCreationTokens: tracker.lastCacheCreationTokens,
+      contextWindow: tracker.contextWindow,
+      updatedAt: Date.now()
+    };
+    fs.writeFileSync(path.join(workspaceDir, CONTEXT_USAGE_FILE), JSON.stringify(data));
+  } catch {
+  }
 }
 var LOOP_SAME_CALL_THRESHOLD = parseInt(process.env.LOOP_SAME_CALL_THRESHOLD || "3", 10);
 var LOOP_FORCE_STOP_THRESHOLD = parseInt(process.env.LOOP_FORCE_STOP_THRESHOLD || "6", 10);
@@ -396,6 +455,9 @@ var ContextWindowTracker = class {
     if (contextWindow && contextWindow > 0) this.contextWindow = contextWindow;
     if (cacheReadTokens !== void 0) this.lastCacheReadTokens = cacheReadTokens;
     if (cacheCreationTokens !== void 0) this.lastCacheCreationTokens = cacheCreationTokens;
+    const pct = this.getPercentage();
+    if (pct < CONTEXT_WARN_THRESHOLD && this.warnedAt70) this.warnedAt70 = false;
+    if (pct < CONTEXT_CHECKPOINT_THRESHOLD && this.checkpointedAt80) this.checkpointedAt80 = false;
   }
   getPercentage() {
     if (this.contextWindow <= 0) return 0;
@@ -423,8 +485,9 @@ var ContextWindowTracker = class {
     this.checkpointedAt80 = false;
   }
 };
-function createContextSafetyHook(tracker, activityPoster2, log4) {
+function createContextSafetyHook(tracker, activityPoster2, log4, workspaceDir) {
   return async (_input, _toolUseId, _context) => {
+    if (workspaceDir) writeContextUsage(workspaceDir, tracker);
     const pct = tracker.getPercentage();
     if (tracker.shouldCheckpoint()) {
       const pctStr = Math.round(pct * 100);
@@ -473,13 +536,14 @@ async function postConvexActivity(convexUrl, token, agentId, type, content, meta
   }
 }
 var ActivityPoster = class _ActivityPoster {
-  static MAX_QUEUE = 100;
+  static MAX_QUEUE = 500;
   convexUrl;
   token;
   agentId;
   queue = [];
   timer = null;
   droppedCount = 0;
+  flushing = false;
   currentTaskId;
   constructor(convexUrl, token, agentId) {
     this.convexUrl = convexUrl;
@@ -507,17 +571,35 @@ var ActivityPoster = class _ActivityPoster {
     return this.droppedCount;
   }
   async flush() {
-    if (this.queue.length === 0 || !this.convexUrl || !this.token) return;
-    const batch = this.queue.splice(0, 10);
-    for (const event of batch) {
-      await postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata, event.taskId);
+    if (this.flushing || this.queue.length === 0 || !this.convexUrl || !this.token) return;
+    this.flushing = true;
+    try {
+      const batch = this.queue.splice(0, 25);
+      const results = await Promise.allSettled(
+        batch.map(
+          (event) => Promise.race([
+            postConvexActivity(this.convexUrl, this.token, this.agentId, event.type, event.content, event.metadata, event.taskId),
+            new Promise((_3, reject) => setTimeout(() => reject(new Error("Activity post timeout")), 1e4))
+          ])
+        )
+      );
+      const failed = results.filter((r3) => r3.status === "rejected").length;
+      if (failed > 0) {
+        console.error(`[activity-poster] ${failed}/${batch.length} events failed to post`);
+      }
+    } finally {
+      this.flushing = false;
     }
   }
   async stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    while (this.queue.length > 0) {
+    const deadline = Date.now() + 15e3;
+    while (this.queue.length > 0 && Date.now() < deadline) {
       await this.flush();
+    }
+    if (this.queue.length > 0) {
+      console.error(`[activity-poster] Shutdown: dropped ${this.queue.length} events (deadline exceeded)`);
     }
   }
 };
@@ -543,125 +625,150 @@ var UIStreamWriter = class {
     });
   }
   // ─── Low-level ──────────────────────────────────────
-  write(chunk) {
+  backpressureWarned = false;
+  async write(chunk) {
     if (this.ended || this.res.destroyed) return;
-    this.res.write(`data: ${JSON.stringify(chunk)}
+    const ok = this.res.write(`data: ${JSON.stringify(chunk)}
 
 `);
+    if (!ok) {
+      if (!this.backpressureWarned) {
+        this.backpressureWarned = true;
+        console.error("[ui-stream] Backpressure detected \u2014 pausing until drain");
+      }
+      await new Promise((resolve) => {
+        const cleanup = () => {
+          this.res.off("drain", onDrain);
+          this.res.off("close", onClose);
+          this.res.off("error", onClose);
+        };
+        const onDrain = () => {
+          cleanup();
+          resolve();
+        };
+        const onClose = () => {
+          cleanup();
+          resolve();
+        };
+        this.res.once("drain", onDrain);
+        this.res.once("close", onClose);
+        this.res.once("error", onClose);
+      });
+    }
   }
   // ─── Message Lifecycle ──────────────────────────────
-  start(messageId) {
-    this.write({
+  async start(messageId) {
+    await this.write({
       type: "start",
       ...messageId ? { messageId } : {}
     });
   }
-  finish(finishReason = "stop", metadata) {
-    this.closeOpenBlocks();
+  async finish(finishReason = "stop", metadata) {
+    await this.closeOpenBlocks();
     if (this.stepOpen) {
-      this.finishStep();
+      await this.finishStep();
     }
-    this.write({
+    await this.write({
       type: "finish",
       finishReason,
       ...metadata ? { messageMetadata: metadata } : {}
     });
   }
-  startStep() {
-    this.write({ type: "start-step" });
+  async startStep() {
+    await this.write({ type: "start-step" });
     this.stepOpen = true;
   }
-  finishStep() {
-    this.closeOpenBlocks();
-    this.write({ type: "finish-step" });
+  async finishStep() {
+    await this.closeOpenBlocks();
+    await this.write({ type: "finish-step" });
     this.stepOpen = false;
   }
   // ─── Text Content ───────────────────────────────────
   get currentTextId() {
     return this._currentTextId;
   }
-  textStart(id) {
+  async textStart(id) {
     const blockId = id ?? `text-${++this.textIdCounter}`;
     this._currentTextId = blockId;
-    this.write({ type: "text-start", id: blockId });
+    await this.write({ type: "text-start", id: blockId });
     return blockId;
   }
-  textDelta(delta, id) {
+  async textDelta(delta, id) {
     if (!this._currentTextId) {
-      this.textStart(id);
+      await this.textStart(id);
     }
-    this.write({ type: "text-delta", id: this._currentTextId, delta });
+    await this.write({ type: "text-delta", id: this._currentTextId, delta });
   }
-  textEnd(id) {
+  async textEnd(id) {
     const blockId = id ?? this._currentTextId;
     if (!blockId) return;
-    this.write({ type: "text-end", id: blockId });
+    await this.write({ type: "text-end", id: blockId });
     this._currentTextId = null;
   }
   // ─── Reasoning/Thinking ─────────────────────────────
   get currentReasoningId() {
     return this._currentReasoningId;
   }
-  reasoningStart(id) {
+  async reasoningStart(id) {
     const blockId = id ?? `reasoning-${++this.reasoningIdCounter}`;
     this._currentReasoningId = blockId;
-    this.write({ type: "reasoning-start", id: blockId });
+    await this.write({ type: "reasoning-start", id: blockId });
     return blockId;
   }
-  reasoningDelta(delta, id) {
+  async reasoningDelta(delta, id) {
     if (!this._currentReasoningId) {
-      this.reasoningStart(id);
+      await this.reasoningStart(id);
     }
-    this.write({ type: "reasoning-delta", id: this._currentReasoningId, delta });
+    await this.write({ type: "reasoning-delta", id: this._currentReasoningId, delta });
   }
-  reasoningEnd(id) {
+  async reasoningEnd(id) {
     const blockId = id ?? this._currentReasoningId;
     if (!blockId) return;
-    this.write({ type: "reasoning-end", id: blockId });
+    await this.write({ type: "reasoning-end", id: blockId });
     this._currentReasoningId = null;
   }
   // ─── Tool Calls ─────────────────────────────────────
-  toolInputStart(toolCallId, toolName) {
-    this.closeOpenBlocks();
-    this.write({ type: "tool-input-start", toolCallId, toolName });
+  async toolInputStart(toolCallId, toolName) {
+    await this.closeOpenBlocks();
+    await this.write({ type: "tool-input-start", toolCallId, toolName });
   }
-  toolInputAvailable(toolCallId, toolName, input) {
-    this.write({ type: "tool-input-available", toolCallId, toolName, input });
+  async toolInputAvailable(toolCallId, toolName, input) {
+    await this.write({ type: "tool-input-available", toolCallId, toolName, input });
   }
-  toolOutputAvailable(toolCallId, output) {
-    this.write({ type: "tool-output-available", toolCallId, output });
+  async toolOutputAvailable(toolCallId, output) {
+    await this.write({ type: "tool-output-available", toolCallId, output });
   }
-  toolOutputError(toolCallId, errorText) {
-    this.write({ type: "tool-output-error", toolCallId, errorText });
+  async toolOutputError(toolCallId, errorText) {
+    await this.write({ type: "tool-output-error", toolCallId, errorText });
   }
   // ─── Custom Gallery Data ────────────────────────────
-  galleryData(name, data) {
-    this.write({ type: `data-gallery-${name}`, data });
+  async galleryData(name, data) {
+    await this.write({ type: `data-gallery-${name}`, data });
   }
-  galleryStreamId(streamId) {
-    this.galleryData("stream-id", { streamId });
+  async galleryStreamId(streamId) {
+    await this.galleryData("stream-id", { streamId });
   }
-  galleryProgress(data) {
-    this.galleryData("progress", data);
+  async galleryProgress(data) {
+    await this.galleryData("progress", data);
   }
-  galleryCompacting(status) {
-    this.galleryData("compacting", { status });
+  async galleryCompacting(status) {
+    await this.galleryData("compacting", { status });
   }
-  galleryReview(data) {
-    this.galleryData("review", data);
+  async galleryReview(data) {
+    await this.galleryData("review", data);
   }
   // ─── Metadata ───────────────────────────────────────
-  messageMetadata(metadata) {
-    this.write({ type: "message-metadata", messageMetadata: metadata });
+  async messageMetadata(metadata) {
+    await this.write({ type: "message-metadata", messageMetadata: metadata });
   }
   // ─── Error / Abort ──────────────────────────────────
-  error(errorText) {
-    this.closeOpenBlocks();
-    this.write({ type: "error", errorText });
+  async error(errorText) {
+    await this.closeOpenBlocks();
+    await this.write({ type: "error", errorText });
   }
-  abort(reason) {
-    this.closeOpenBlocks();
-    this.write({ type: "abort", ...reason ? { reason } : {} });
+  async abort(reason) {
+    await this.closeOpenBlocks();
+    await this.write({ type: "abort", ...reason ? { reason } : {} });
   }
   // ─── Stream Termination ─────────────────────────────
   done() {
@@ -677,18 +784,18 @@ var UIStreamWriter = class {
   }
   // ─── Helpers ────────────────────────────────────────
   /** Close any open text or reasoning blocks. */
-  closeOpenBlocks() {
-    if (this._currentTextId) this.textEnd();
-    if (this._currentReasoningId) this.reasoningEnd();
+  async closeOpenBlocks() {
+    if (this._currentTextId) await this.textEnd();
+    if (this._currentReasoningId) await this.reasoningEnd();
   }
   /** Whether a step boundary is needed before the next content. */
   needsStepBoundary(lastEmittedToolOutput) {
     return lastEmittedToolOutput && this.stepOpen;
   }
   /** Emit step boundary (finish current step, start new one). */
-  emitStepBoundary() {
-    this.finishStep();
-    this.startStep();
+  async emitStepBoundary() {
+    await this.finishStep();
+    await this.startStep();
   }
 };
 function generateMessageId() {
@@ -696,9 +803,6 @@ function generateMessageId() {
 }
 function generateStreamId() {
   return `stream_${crypto.randomBytes(8).toString("hex")}`;
-}
-function isAiSdkEnabled() {
-  return process.env.SSE_FORMAT === "aisdk";
 }
 
 // src/session-manager.ts
@@ -15857,13 +15961,17 @@ var SessionManager = class {
   defaultContextWindow;
   defaultModel;
   buildOptions;
+  idleTimeoutMs;
+  idleTimer = null;
   constructor(opts) {
     this.workspaceDir = opts.workspaceDir;
     this.sessionsDir = path2.join(opts.workspaceDir, ".sessions");
     this.maxSessions = opts.maxSessions ?? 5;
     this.defaultContextWindow = opts.defaultContextWindow;
     this.defaultModel = opts.defaultModel;
+    this.idleTimeoutMs = opts.idleTimeoutMs ?? 10 * 60 * 1e3;
     this.buildOptions = opts.buildOptions;
+    this.idleTimer = setInterval(() => this.evictIdle(), 6e4);
   }
   // ─── Get or Create ──────────────────────────────────
   /**
@@ -15937,8 +16045,12 @@ var SessionManager = class {
     await ctx.lockPromise;
     let release;
     ctx.lockPromise = new Promise((resolve) => {
-      release = resolve;
+      release = () => {
+        ctx.lockRelease = null;
+        resolve();
+      };
     });
+    ctx.lockRelease = release;
     return release;
   }
   // ─── Session ID Persistence ─────────────────────────
@@ -15983,6 +16095,7 @@ var SessionManager = class {
     let oldestId = null;
     let oldestTime = Infinity;
     for (const [id, ctx] of this.conversations) {
+      if (ctx.lockRelease !== null) continue;
       if (ctx.lastUsed < oldestTime) {
         oldestTime = ctx.lastUsed;
         oldestId = id;
@@ -15991,6 +16104,19 @@ var SessionManager = class {
     if (oldestId) {
       this.closeConversation(oldestId);
       log(`[session-mgr] Evicted conversation ${oldestId} (LRU)`);
+    } else {
+      log(`[session-mgr] WARNING: Cannot evict \u2014 all ${this.conversations.size} sessions are locked`);
+    }
+  }
+  /** Close sessions that have been idle longer than idleTimeoutMs. */
+  evictIdle() {
+    const now = Date.now();
+    for (const [id, ctx] of this.conversations) {
+      if (ctx.lockRelease !== null) continue;
+      if (now - ctx.lastUsed > this.idleTimeoutMs) {
+        this.closeConversation(id);
+        log(`[session-mgr] Evicted idle conversation ${id} (idle ${Math.round((now - ctx.lastUsed) / 6e4)}min)`);
+      }
     }
   }
   // ─── Cleanup ────────────────────────────────────────
@@ -16011,6 +16137,10 @@ var SessionManager = class {
    * Close all sessions. Called on SIGTERM before exit.
    */
   closeAll() {
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = null;
+    }
     for (const [id, ctx] of this.conversations) {
       try {
         ctx.session.close();
@@ -16089,21 +16219,27 @@ var MODEL = process.env.CLAW_MODEL || "claude-opus-4-6";
 function log2(message) {
   console.error(`[claw] ${message}`);
 }
-function estimateCostUsd(inputTokens, outputTokens, model) {
+var BILLING_MARKUP = 3;
+function estimateCostUsd(inputTokens, outputTokens, model, cacheReadTokens = 0, cacheCreationTokens = 0) {
   const m3 = (model || MODEL).toLowerCase();
   let inputRate;
   let outputRate;
   if (m3.includes("haiku")) {
-    inputRate = 0.8;
-    outputRate = 4;
+    inputRate = 1;
+    outputRate = 5;
   } else if (m3.includes("sonnet")) {
     inputRate = 3;
     outputRate = 15;
+  } else if (m3.includes("opus")) {
+    inputRate = 5;
+    outputRate = 25;
   } else {
-    inputRate = 15;
-    outputRate = 75;
+    inputRate = 3;
+    outputRate = 15;
   }
-  return (inputTokens * inputRate + outputTokens * outputRate) / 1e6;
+  const uncachedInput = Math.max(0, inputTokens - cacheReadTokens - cacheCreationTokens);
+  const providerCost = (uncachedInput * inputRate + cacheReadTokens * inputRate * 0.1 + cacheCreationTokens * inputRate * 1.25 + outputTokens * outputRate) / 1e6;
+  return providerCost * BILLING_MARKUP;
 }
 function getDefaultContextWindow(model) {
   const m3 = model.toLowerCase();
@@ -16130,6 +16266,7 @@ function getDynamicMcpToolPatterns() {
   }
 }
 var activityPoster = null;
+var activeCancelRef = { current: null };
 var sessionManager = new SessionManager({
   workspaceDir: WORKSPACE_DIR,
   maxSessions: 5,
@@ -16161,9 +16298,16 @@ var sessionManager = new SessionManager({
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log2)] }],
         PreToolUse: [
+          // Cancel check — abort before starting tool execution if user cancelled
+          { hooks: [async () => {
+            if (activeCancelRef.current?.cancelled) {
+              return { decision: "block", reason: "Cancelled by user" };
+            }
+            return void 0;
+          }] },
           { matcher: "Bash", hooks: [createSanitizeBashHook()] },
           { hooks: [createLoopDetectionHook(loopTracker, log2)] },
-          { hooks: [createContextSafetyHook(contextTracker, activityPoster, log2)] }
+          { hooks: [createContextSafetyHook(contextTracker, activityPoster, log2, WORKSPACE_DIR)] }
         ]
       }
     };
@@ -16181,23 +16325,24 @@ function ensureActivityPoster(agentId) {
   }
   return activityPoster;
 }
-async function processMessage(params, onEvent, writer, cancelSignal) {
+async function processMessage(params, writer, cancelSignal) {
   const conversationId = params.sessionId || "default";
   const ctx = sessionManager.getOrCreate(conversationId, params.assistantName, params.mode, params.model);
   const releaseLock = await sessionManager.acquireLock(conversationId);
   try {
-    return await processMessageInner(params, onEvent, writer, cancelSignal, ctx);
+    return await processMessageInner(params, writer, cancelSignal, ctx);
   } finally {
+    activeCancelRef.current = null;
     releaseLock();
   }
 }
-async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
+async function processMessageInner(params, writer, cancelSignal, ctx) {
   const { message, isScheduledTask, assistantName } = params;
   const conversationId = params.sessionId || "default";
-  const useAiSdk = !!writer;
   const agentId = process.env.AGENT_ID || assistantName || "unknown";
   ensureActivityPoster(agentId);
   activityPoster.post("status", "Processing message");
+  activeCancelRef.current = cancelSignal ?? null;
   const tz2 = process.env.AGENT_TIMEZONE || "UTC";
   const localTime = (/* @__PURE__ */ new Date()).toLocaleString("en-US", {
     timeZone: tz2,
@@ -16212,9 +16357,63 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
   if (message.length > 5e5) {
     throw new Error("Message too large (max 500KB)");
   }
-  let prompt = `<context timezone="${tz2}" localTime="${localTime}" />
+  let workspaceState = "";
+  const convexUrl = process.env.GALLERY_CONVEX_URL;
+  const gwToken = process.env.GALLERY_GATEWAY_TOKEN;
+  if (convexUrl && gwToken) {
+    try {
+      const [tasksRes, agentsRes, reviewsRes] = await Promise.allSettled([
+        fetch(`${convexUrl}/api/query`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: "mcpInternal:listTasks", args: { token: gwToken } }),
+          signal: AbortSignal.timeout(5e3)
+        }).then((r3) => r3.ok ? r3.json() : null),
+        fetch(`${convexUrl}/api/query`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: "mcpInternal:listAgents", args: { token: gwToken } }),
+          signal: AbortSignal.timeout(5e3)
+        }).then((r3) => r3.ok ? r3.json() : null),
+        fetch(`${convexUrl}/api/query`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: "mcpInternal:listReviews", args: { token: gwToken, status: "pending" } }),
+          signal: AbortSignal.timeout(5e3)
+        }).then((r3) => r3.ok ? r3.json() : null)
+      ]);
+      const tasks = tasksRes.status === "fulfilled" ? tasksRes.value?.value ?? tasksRes.value ?? [] : [];
+      const agents = agentsRes.status === "fulfilled" ? agentsRes.value?.value ?? agentsRes.value ?? [] : [];
+      const reviews = reviewsRes.status === "fulfilled" ? reviewsRes.value?.value ?? reviewsRes.value ?? [] : [];
+      if (Array.isArray(tasks) || Array.isArray(agents) || Array.isArray(reviews)) {
+        const parts = [];
+        if (Array.isArray(agents) && agents.length > 0) {
+          const active = agents.filter((a3) => a3.status === "active");
+          const unhealthy = agents.filter((a3) => (a3.healthFailures ?? 0) > 2);
+          parts.push(`Agents: ${active.length} active${unhealthy.length > 0 ? `, ${unhealthy.length} UNHEALTHY (${unhealthy.map((a3) => a3.name).join(", ")})` : ""}`);
+        }
+        if (Array.isArray(tasks) && tasks.length > 0) {
+          const inProgress = tasks.filter((t) => t.status === "in_progress").length;
+          const blocked = tasks.filter((t) => t.status === "blocked" || t.status === "in_review").length;
+          parts.push(`Tasks: ${tasks.length} total, ${inProgress} in progress${blocked > 0 ? `, ${blocked} blocked/in-review` : ""}`);
+        }
+        if (Array.isArray(reviews) && reviews.length > 0) {
+          parts.push(`Pending reviews: ${reviews.length}`);
+        }
+        if (parts.length > 0) {
+          workspaceState = `<workspace-state>
+${parts.join("\n")}
+</workspace-state>
 
 `;
+        }
+      }
+    } catch {
+    }
+  }
+  let prompt = `<context timezone="${tz2}" localTime="${localTime}" />
+
+${workspaceState}`;
   if (isScheduledTask) {
     prompt += `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user.]
 
@@ -16227,14 +16426,14 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
   let streamEventCount = 0;
   let usageInfo;
   let lastEmittedToolOutput = false;
-  const maxTurns = params.maxTurns ?? 50;
-  const maxBudgetUsd = params.maxBudgetUsd ?? 2;
+  const maxTurns = params.maxTurns ?? 200;
+  const maxBudgetUsd = params.maxBudgetUsd ?? 10;
   let turnCount = 0;
   let accumulatedCostUsd = 0;
   let limitHit = false;
-  if (useAiSdk) {
-    writer.start(generateMessageId());
-    writer.startStep();
+  if (writer) {
+    await writer.start(generateMessageId());
+    await writer.startStep();
   }
   try {
     if (!ctx) throw new Error("No conversation context");
@@ -16244,8 +16443,8 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
     for await (const msg of sess.stream()) {
       if (cancelSignal?.cancelled) {
         log2("[cancel] Stream cancelled by user");
-        if (useAiSdk) {
-          writer.abort("User cancelled");
+        if (writer) {
+          await writer.abort("User cancelled");
           writer.done();
         }
         break;
@@ -16258,42 +16457,27 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
         const event = msg.event;
         if (event?.type === "content_block_delta") {
           const delta = event.delta;
-          if (delta?.type === "text_delta" && delta.text) {
-            if (useAiSdk) {
-              if (lastEmittedToolOutput) {
-                writer.emitStepBoundary();
-                lastEmittedToolOutput = false;
-              }
-              writer.textDelta(delta.text);
-            } else {
-              onEvent?.({ type: "text", data: { content: delta.text } });
+          if (delta?.type === "text_delta" && delta.text && writer) {
+            if (lastEmittedToolOutput) {
+              await writer.emitStepBoundary();
+              lastEmittedToolOutput = false;
             }
-          } else if (delta?.type === "thinking_delta" && delta.thinking) {
-            if (useAiSdk) {
-              if (lastEmittedToolOutput) {
-                writer.emitStepBoundary();
-                lastEmittedToolOutput = false;
-              }
-              writer.reasoningDelta(delta.thinking);
-            } else {
-              onEvent?.({ type: "thinking", data: { content: delta.thinking } });
+            await writer.textDelta(delta.text);
+          } else if (delta?.type === "thinking_delta" && delta.thinking && writer) {
+            if (lastEmittedToolOutput) {
+              await writer.emitStepBoundary();
+              lastEmittedToolOutput = false;
             }
-          } else if (delta?.type === "input_json_delta") {
+            await writer.reasoningDelta(delta.thinking);
           }
         } else if (event?.type === "content_block_start") {
           const block = event.content_block;
-          if (block?.type === "tool_use") {
-            if (useAiSdk) {
-              writer.closeOpenBlocks();
-              writer.toolInputStart(block.id, block.name);
-            } else {
-              onEvent?.({ type: "tool_call_start", data: { id: block.id, name: block.name, input: {} } });
-            }
+          if (block?.type === "tool_use" && writer) {
+            await writer.closeOpenBlocks();
+            await writer.toolInputStart(block.id, block.name);
           }
-        } else if (event?.type === "content_block_stop") {
-          if (useAiSdk) {
-            writer.closeOpenBlocks();
-          }
+        } else if (event?.type === "content_block_stop" && writer) {
+          await writer.closeOpenBlocks();
         }
         continue;
       }
@@ -16307,6 +16491,7 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
             msgUsage.cache_read_input_tokens ?? 0,
             msgUsage.cache_creation_input_tokens ?? 0
           );
+          writeContextUsage(WORKSPACE_DIR, ctx.contextTracker);
         }
         const hadStreamEvents = streamEventCount > 0;
         const content = msg.message?.content;
@@ -16314,44 +16499,38 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
           for (const block of content) {
             if (block.type === "text" && block.text) {
               activityPoster.post("output", block.text);
-              if (!hadStreamEvents) {
-                if (useAiSdk) {
-                  writer.textStart();
-                  writer.textDelta(block.text);
-                  writer.textEnd();
-                } else {
-                  onEvent?.({ type: "text", data: { content: block.text } });
-                }
+              if (!hadStreamEvents && writer) {
+                await writer.textStart();
+                await writer.textDelta(block.text);
+                await writer.textEnd();
               }
             } else if (block.type === "tool_use") {
               activityPoster.post("tool_use", `${block.name}(${JSON.stringify(block.input).slice(0, 200)})`);
-              if (useAiSdk) {
-                writer.toolInputAvailable(block.id, block.name, block.input);
-              } else {
-                onEvent?.({ type: "tool_call_start", data: { id: block.id, name: block.name, input: block.input } });
+              if (writer) {
+                await writer.toolInputAvailable(block.id, block.name, block.input);
               }
             } else if (block.type === "tool_result") {
-              if (useAiSdk) {
-                const resultContent = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+              const rawContent = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+              const injections = scanForInjection(rawContent);
+              if (injections.length > 0) {
+                activityPoster.post("error", `\u26A0 Prompt injection detected in tool output: ${injections.join(", ")}`);
+                log2?.(`WARNING: Prompt injection patterns detected in tool result: ${injections.join(", ")}`);
+              }
+              const resultContent = redactSecretsFromOutput(rawContent);
+              if (writer) {
                 if (block.is_error) {
-                  writer.toolOutputError(block.tool_use_id, resultContent);
+                  await writer.toolOutputError(block.tool_use_id, resultContent);
                 } else {
-                  writer.toolOutputAvailable(block.tool_use_id, resultContent);
+                  await writer.toolOutputAvailable(block.tool_use_id, resultContent);
                 }
                 lastEmittedToolOutput = true;
-              } else {
-                onEvent?.({ type: "tool_call_end", data: { id: block.tool_use_id, status: block.is_error ? "error" : "completed", result: typeof block.content === "string" ? block.content : JSON.stringify(block.content) } });
               }
             } else if (block.type === "thinking" && block.thinking) {
               activityPoster.post("thinking", block.thinking.slice(0, 500));
-              if (!hadStreamEvents) {
-                if (useAiSdk) {
-                  writer.reasoningStart();
-                  writer.reasoningDelta(block.thinking);
-                  writer.reasoningEnd();
-                } else {
-                  onEvent?.({ type: "thinking", data: { content: block.thinking } });
-                }
+              if (!hadStreamEvents && writer) {
+                await writer.reasoningStart();
+                await writer.reasoningDelta(block.thinking);
+                await writer.reasoningEnd();
               }
             }
           }
@@ -16360,31 +16539,31 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
           if (msgUsage) {
             accumulatedCostUsd += estimateCostUsd(
               msgUsage.input_tokens ?? 0,
-              msgUsage.output_tokens ?? 0
+              msgUsage.output_tokens ?? 0,
+              MODEL,
+              msgUsage.cache_read_input_tokens ?? 0,
+              msgUsage.cache_creation_input_tokens ?? 0
             );
           }
           if (turnCount >= maxTurns) {
             log2(`[limits] Turn limit hit: ${turnCount}/${maxTurns}`);
-            if (useAiSdk) {
-              writer.finish("max_turns");
+            if (writer) {
+              await writer.finish("max_turns");
               writer.done();
-            } else {
-              onEvent?.({ type: "done", data: { result: "", sessionId: currentSessionId, finishReason: "max_turns" } });
             }
             limitHit = true;
             break;
           }
           if (accumulatedCostUsd >= maxBudgetUsd) {
             log2(`[limits] Budget limit hit: $${accumulatedCostUsd.toFixed(4)} >= $${maxBudgetUsd}`);
-            if (useAiSdk) {
-              writer.finish("budget_exceeded");
+            if (writer) {
+              await writer.finish("budget_exceeded");
               writer.done();
-            } else {
-              onEvent?.({ type: "done", data: { result: "", sessionId: currentSessionId, finishReason: "budget_exceeded" } });
             }
             limitHit = true;
             break;
           }
+          streamEventCount = 0;
         }
       }
       if (msg.type === "system" && msg.subtype === "init") {
@@ -16424,22 +16603,18 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
           };
           log2(`[usage] ${inputTokens} in / ${outputTokens} out | context: ${contextPercentage}% of ${contextWindow}`);
           activityPoster.post("status", `Context: ${contextPercentage}% used (${inputTokens} in / ${outputTokens} out)`, { usage: usageInfo });
-          if (useAiSdk) {
-            writer.messageMetadata({
+          if (writer) {
+            await writer.messageMetadata({
               usage: { promptTokens: inputTokens, completionTokens: outputTokens, cacheReadTokens: usageInfo.cacheReadTokens, cacheCreationTokens: usageInfo.cacheCreationTokens },
               cost: { usd: usageInfo.totalCostUsd },
               model: MODEL,
               sessionId: currentSessionId
             });
-          } else {
-            onEvent?.({ type: "context_usage", data: { promptTokens: inputTokens, completionTokens: outputTokens, model: MODEL, contextWindow, contextPercentage } });
           }
         }
-        if (useAiSdk) {
-          writer.finish("stop");
+        if (writer) {
+          await writer.finish("stop");
           writer.done();
-        } else {
-          onEvent?.({ type: "done", data: { result: textResult ?? "", sessionId: currentSessionId } });
         }
       }
     }
@@ -16447,8 +16622,8 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log2(`Agent error: ${errorMessage}`);
     activityPoster.post("error", errorMessage);
-    if (useAiSdk) {
-      writer.error(errorMessage);
+    if (writer) {
+      await writer.error(errorMessage);
       writer.done();
     }
     sessionManager.handleError(conversationId);
@@ -16471,7 +16646,8 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
   log2(`${statusMsg}, sessionId: ${currentSessionId}`);
   activityPoster.post("status", limitHit ? statusMsg : "Message processed");
   if (resultText && process.env.CLAW_AUTO_MEMORY !== "false") {
-    extractMemory(message, resultText).catch(() => {
+    extractMemory(message, resultText).catch((err) => {
+      log2(`Memory extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     });
   }
   return {
@@ -16492,7 +16668,21 @@ async function processMessageInner(params, onEvent, writer, cancelSignal, ctx) {
     } : void 0)
   };
 }
+var memoryWriteLock = Promise.resolve();
 async function extractMemory(userMessage, assistantResult) {
+  const prev = memoryWriteLock;
+  let release;
+  memoryWriteLock = new Promise((resolve) => {
+    release = resolve;
+  });
+  await prev;
+  try {
+    await extractMemoryInner(userMessage, assistantResult);
+  } finally {
+    release();
+  }
+}
+async function extractMemoryInner(userMessage, assistantResult) {
   const memoryFile = path3.join(WORKSPACE_DIR, "MEMORY.md");
   const existing = fs3.existsSync(memoryFile) ? fs3.readFileSync(memoryFile, "utf-8") : "";
   if (userMessage.length < 20 && assistantResult.length < 100) return;
@@ -16602,7 +16792,7 @@ function getStatus() {
 // src/server.ts
 var PORT = parseInt(process.env.PORT || "8080", 10);
 var MAX_QUEUE_SIZE = parseInt(process.env.CLAW_MAX_QUEUE_SIZE || "50", 10);
-var REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || "600000", 10);
+var REQUEST_TIMEOUT_MS = parseInt(process.env.CLAW_REQUEST_TIMEOUT_MS || "1800000", 10);
 var AUTH_TOKEN = process.env.CLAW_AUTH_TOKEN || process.env.GALLERY_GATEWAY_TOKEN || "";
 var activeStreams = /* @__PURE__ */ new Map();
 function log3(message) {
@@ -16643,7 +16833,8 @@ async function processQueue() {
   const first = requestQueue.shift();
   const items = [first];
   const isTask = first.params.isScheduledTask;
-  while (requestQueue.length > 0 && requestQueue[0].params.isScheduledTask === isTask) {
+  const sessionId = first.params.sessionId;
+  while (requestQueue.length > 0 && requestQueue[0].params.isScheduledTask === isTask && requestQueue[0].params.sessionId === sessionId) {
     items.push(requestQueue.shift());
   }
   let params;
@@ -16710,7 +16901,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-03-31T02:01:05.659Z" : "";
+var buildTime = true ? "2026-04-01T06:25:27.856Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
@@ -16748,64 +16939,29 @@ async function handleMessage(req, res) {
     model: typeof parsed.model === "string" ? parsed.model : void 0
   };
   const wantSSE = (req.headers["accept"] || "").includes("text/event-stream");
-  const useAiSdk = isAiSdkEnabled();
-  log3(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE}, aisdk: ${useAiSdk})`);
-  if (wantSSE && useAiSdk) {
+  log3(`POST /message (${params.message.length} chars, queue: ${requestQueue.length}, sse: ${wantSSE})`);
+  if (wantSSE) {
     const writer = new UIStreamWriter(res);
     const streamId = generateStreamId();
     const streamState = { cancelled: false };
     activeStreams.set(streamId, streamState);
-    writer.galleryStreamId(streamId);
+    await writer.galleryStreamId(streamId);
     try {
-      const result = await processMessage(params, void 0, writer, streamState);
+      const result = await processMessage(params, writer, streamState);
       markReady();
       if (!writer.isEnded && !res.destroyed) {
-        writer.finish("stop");
+        await writer.finish("stop");
         writer.done();
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log3(`Error processing message (AI SDK): ${errMsg}`);
       if (!writer.isEnded && !res.destroyed) {
-        writer.error(errMsg);
+        await writer.error(errMsg);
         writer.done();
       }
     } finally {
       activeStreams.delete(streamId);
-    }
-  } else if (wantSSE) {
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no"
-    });
-    const onEvent = (event) => {
-      if (res.destroyed) return;
-      res.write(`data: ${JSON.stringify(event)}
-
-`);
-    };
-    try {
-      const result = await processMessage(params, onEvent);
-      markReady();
-      if (!res.destroyed) {
-        res.write(`data: ${JSON.stringify({ type: "result", data: result })}
-
-`);
-        res.write("data: [DONE]\n\n");
-        res.end();
-      }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log3(`Error processing message (SSE): ${errMsg}`);
-      if (!res.destroyed) {
-        res.write(`data: ${JSON.stringify({ type: "error", data: { error: errMsg } })}
-
-`);
-        res.write("data: [DONE]\n\n");
-        res.end();
-      }
     }
   } else {
     try {
@@ -16941,10 +17097,12 @@ var server = http.createServer(async (req, res) => {
       if (!requireAuth(req, res)) return;
       await handleTask(req, res);
     } else if (method === "GET" && url === "/health") {
+      if (!requireAuth(req, res)) return;
       handleHealth(req, res);
     } else if (method === "GET" && url === "/ready") {
       handleReady(req, res);
     } else if (method === "GET" && url === "/status") {
+      if (!requireAuth(req, res)) return;
       handleStatus(req, res);
     } else {
       sendJson(res, 404, { error: "Not found" });

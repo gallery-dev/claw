@@ -695,6 +695,200 @@ async function handleMemory(sub: string, flags: Record<string, string>, position
   }
 }
 
+// -- context --
+
+async function handleContext(sub: string) {
+  if (sub !== 'usage' && sub !== '') fail(`Unknown context subcommand: ${sub}. Use: usage`);
+  const usageFile = path.join(WORKSPACE_DIR, '.context-usage.json');
+  if (!fs.existsSync(usageFile)) { ok('Context usage data not yet available (no messages processed).'); return; }
+  try {
+    const data = JSON.parse(fs.readFileSync(usageFile, 'utf-8'));
+    const age = Math.round((Date.now() - (data.updatedAt || 0)) / 1000);
+    ok(
+      `Context usage: ${data.percentage}%\n` +
+      `Input tokens: ${(data.inputTokens || 0).toLocaleString()}\n` +
+      `Cache read: ${(data.cacheReadTokens || 0).toLocaleString()}\n` +
+      `Output tokens: ${(data.outputTokens || 0).toLocaleString()}\n` +
+      `Context window: ${(data.contextWindow || 0).toLocaleString()}\n` +
+      `Updated: ${age}s ago`,
+    );
+  } catch { fail('Failed to read context usage.'); }
+}
+
+// -- compact --
+
+async function handleCompact(flags: Record<string, string>) {
+  const memoryDirPath = path.join(WORKSPACE_DIR, 'memory');
+  fs.mkdirSync(memoryDirPath, { recursive: true });
+
+  const date = new Date().toISOString().split('T')[0];
+  const timestamp = new Date().toISOString().split('T')[1].replace(/\.\d+Z$/, '');
+  const dailyFile = path.join(memoryDirPath, `${date}.md`);
+
+  let contextInfo = '';
+  const usageFile = path.join(WORKSPACE_DIR, '.context-usage.json');
+  if (fs.existsSync(usageFile)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(usageFile, 'utf-8'));
+      contextInfo = `Context: ${data.percentage}% used (${(data.inputTokens || 0).toLocaleString()} tokens)`;
+    } catch { /* ignore */ }
+  }
+
+  const marker = [
+    `\n## Manual Checkpoint (${timestamp})`,
+    '',
+    contextInfo || null,
+    flags['focus'] ? `Focus: ${flags['focus']}` : null,
+    '',
+    'Checkpoint created by agent via `gallery compact`.',
+    'Use this marker to resume work if context is compacted.',
+    '',
+  ].filter(Boolean).join('\n');
+
+  fs.appendFileSync(dailyFile, marker);
+  ok(`Checkpoint saved to memory/${date}.md\n${contextInfo}\n\nWrite your key findings, decisions, and next steps to MEMORY.md now before compaction occurs.`);
+}
+
+// -- structured-output --
+
+async function handleStructuredOutput(flags: Record<string, string>) {
+  const data = flags['data'];
+  if (!data) fail('Missing --data (JSON string)');
+  try {
+    const parsed = JSON.parse(data);
+    ok(JSON.stringify(parsed, null, 2));
+  } catch { fail(`Invalid JSON: ${data.slice(0, 500)}`); }
+}
+
+// -- peer-memory --
+
+async function handlePeerMemory(sub: string, flags: Record<string, string>) {
+  const targetAgent = flags['agent'] || flags['agent-id'];
+  if (!targetAgent) fail('Missing --agent (target agent ID)');
+
+  switch (sub) {
+    case 'search': {
+      const query = flags['query'];
+      if (!query) fail('Missing --query');
+      const limit = parseInt(flags['limit'] || '5', 10);
+      const res = await fetch(`${convexUrl}/api/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          path: 'memoryEntries:search',
+          args: { token: gatewayToken, agentId: targetAgent, query, limit },
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) fail(`Failed to search peer memory: ${res.status}`);
+      const data = await res.json();
+      const entries = data.value ?? data ?? [];
+      if (!Array.isArray(entries) || entries.length === 0) { ok(`No results for "${query}" in agent ${targetAgent}'s memory.`); break; }
+      const formatted = entries.map((e: any) => `**${e.path}**\n${(e.body || '').slice(0, 500)}`).join('\n\n---\n\n');
+      ok(`Found ${entries.length} result(s) in peer memory:\n\n${formatted}`);
+      break;
+    }
+
+    case 'list': {
+      const res = await fetch(`${convexUrl}/api/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          path: 'memoryEntries:listPaths',
+          args: { token: gatewayToken, agentId: targetAgent },
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) fail(`Failed to list peer memory: ${res.status}`);
+      const data = await res.json();
+      const paths = data.value ?? data ?? [];
+      if (!Array.isArray(paths) || paths.length === 0) { ok(`Agent ${targetAgent} has no indexed memory entries.`); break; }
+      const formatted = paths.map((p: any) => `- ${p.path} (updated: ${new Date(p.updatedAt).toLocaleDateString()})`).join('\n');
+      ok(`Agent ${targetAgent}'s memory files:\n${formatted}\n\nUse 'gallery peer-memory search --agent ${targetAgent} --query "..."' to search.`);
+      break;
+    }
+
+    default:
+      fail(`Unknown peer-memory subcommand: ${sub}. Use: list, search`);
+  }
+}
+
+// -- plan --
+
+async function handlePlan(sub: string, flags: Record<string, string>) {
+  switch (sub) {
+    case 'enter': {
+      const title = flags['title'];
+      const content = flags['content'];
+      if (!title || !content) fail('Missing --title and --content');
+
+      const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+      const planFile = path.join(MEMORY_DIR, `plan-${slug}.md`);
+      fs.mkdirSync(MEMORY_DIR, { recursive: true });
+      fs.writeFileSync(planFile, `# Plan: ${title}\n\n${content}\n\n---\n*Created: ${new Date().toISOString()}*\n`);
+      indexMemoryEntry(`plan-${slug}.md`, fs.readFileSync(planFile, 'utf-8'));
+
+      try {
+        await convexMutation('mcpInternal:createReview', {
+          agentId,
+          type: 'approval',
+          title: `Plan: ${title}`,
+          content: content.slice(0, 2000),
+        });
+      } catch { /* non-fatal */ }
+
+      postActivity('status', `Entered plan mode: ${title}`);
+      ok(`Plan saved to memory/plan-${slug}.md and submitted for approval.\n\n**PLAN MODE:** Do not execute file writes, bash commands, or external actions until approved. Only read, research, and refine.\n\nWhen approved, run: gallery plan exit --title "${title}"`);
+      break;
+    }
+
+    case 'exit': {
+      const title = flags['title'] || 'untitled';
+      postActivity('status', `Exited plan mode: ${title}`);
+      ok(`Plan mode exited. You may now execute the approved plan for "${title}".\n\nRead your plan file from memory before starting execution.`);
+      break;
+    }
+
+    default:
+      fail(`Unknown plan subcommand: ${sub}. Use: enter, exit`);
+  }
+}
+
+// -- sleep --
+
+async function handleSleep(flags: Record<string, string>) {
+  const delayStr = flags['delay'] || flags['seconds'];
+  const message = flags['message'];
+  if (!delayStr || !message) fail('Missing --delay (seconds) and --message');
+
+  const delay = parseInt(delayStr, 10);
+  if (isNaN(delay) || delay < 10 || delay > 3600) fail('--delay must be 10–3600 seconds');
+
+  if (!galleryWorkerUrl || !galleryToken) fail('Self-wake requires Gallery Worker (not configured).');
+
+  const response = await fetch(`${galleryWorkerUrl}/scheduler/schedule/once`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${galleryToken}`,
+    },
+    body: JSON.stringify({
+      agentId,
+      delaySeconds: delay,
+      message: `[SELF-WAKE] ${message}`,
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    fail(`Sleep scheduling failed (${response.status}): ${err}`);
+  }
+
+  const wakeTime = new Date(Date.now() + delay * 1000).toLocaleTimeString();
+  postActivity('status', `Scheduled self-wake in ${delay}s at ~${wakeTime}`);
+  ok(`Self-wake scheduled in ${delay} seconds (~${wakeTime}).\nWake message: "${message}"\n\nContinue other work. The wake message will arrive as a scheduled task.`);
+}
+
 // ─── Main Dispatch ──────────────────────────────────────
 
 async function main() {
@@ -723,8 +917,26 @@ async function main() {
       case 'memory':
         await handleMemory(subcommand, flags, positional);
         break;
+      case 'context':
+        await handleContext(subcommand);
+        break;
+      case 'compact':
+        await handleCompact(flags);
+        break;
+      case 'structured-output':
+        await handleStructuredOutput(flags);
+        break;
+      case 'peer-memory':
+        await handlePeerMemory(subcommand, flags);
+        break;
+      case 'plan':
+        await handlePlan(subcommand, flags);
+        break;
+      case 'sleep':
+        await handleSleep(flags);
+        break;
       default:
-        fail(`Unknown command: ${command}. Available: task, agent, review, workspace, memory, send-message, progress`);
+        fail(`Unknown command: ${command}. Available: task, agent, review, workspace, memory, send-message, progress, context, compact, structured-output, peer-memory, plan, sleep`);
     }
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err));
