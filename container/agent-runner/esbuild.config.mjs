@@ -25,7 +25,7 @@ const shared = {
   sourcemap: false,
   minify: false, // keep readable for debugging on sprites
   define: {
-    'CLAW_VERSION': JSON.stringify(pkg.version),
+    'CLAW_VERSION': JSON.stringify(process.env.CLAW_VERSION || pkg.version),
     'CLAW_BUILD_TIME': JSON.stringify(new Date().toISOString()),
   },
   // Node built-ins stay as imports — everything else gets bundled
