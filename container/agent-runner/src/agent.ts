@@ -578,6 +578,27 @@ async function processMessageInner(
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
+    const isCreditError = /CREDITS_EXHAUSTED|Credit limit reached|NO_BILLING_PROFILE|Payment Required/i.test(errorMessage);
+
+    if (isCreditError) {
+      log('Credit limit reached — stopping agent');
+      activityPoster!.post('error', 'Credit limit reached. Add more credits in billing settings.');
+
+      if (writer) {
+        await writer.error('Credit limit reached. Add more credits in billing settings.');
+        writer.done();
+      }
+
+      sessionManager.handleError(conversationId);
+
+      return {
+        status: 'error',
+        result: null,
+        sessionId: currentSessionId,
+        error: 'CREDITS_EXHAUSTED',
+      };
+    }
+
     log(`Agent error: ${errorMessage}`);
     activityPoster!.post('error', errorMessage);
 

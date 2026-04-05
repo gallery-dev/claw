@@ -16620,6 +16620,22 @@ ${workspaceState}`;
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
+    const isCreditError = /CREDITS_EXHAUSTED|Credit limit reached|NO_BILLING_PROFILE|Payment Required/i.test(errorMessage);
+    if (isCreditError) {
+      log2("Credit limit reached \u2014 stopping agent");
+      activityPoster.post("error", "Credit limit reached. Add more credits in billing settings.");
+      if (writer) {
+        await writer.error("Credit limit reached. Add more credits in billing settings.");
+        writer.done();
+      }
+      sessionManager.handleError(conversationId);
+      return {
+        status: "error",
+        result: null,
+        sessionId: currentSessionId,
+        error: "CREDITS_EXHAUSTED"
+      };
+    }
     log2(`Agent error: ${errorMessage}`);
     activityPoster.post("error", errorMessage);
     if (writer) {
@@ -16900,8 +16916,8 @@ function sendJson(res, status, data) {
   });
   res.end(body);
 }
-var version = true ? "8b07d8ae" : "dev";
-var buildTime = true ? "2026-04-01T07:08:13.377Z" : "";
+var version = true ? "1.0.0" : "dev";
+var buildTime = true ? "2026-04-05T05:08:16.815Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
