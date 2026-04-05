@@ -16253,7 +16253,7 @@ function getDefaultContextWindow(model) {
 }
 function loadMcpConfig() {
   try {
-    if (!fs3.existsSync(MCP_CONFIG_FILE)) return { configs: {}, toolPatterns: [] };
+    if (!fs3.existsSync(MCP_CONFIG_FILE)) return { toolPatterns: [] };
     const config = JSON.parse(fs3.readFileSync(MCP_CONFIG_FILE, "utf-8"));
     const servers = config.mcpServers || {};
     const names = Object.keys(servers);
@@ -16265,12 +16265,11 @@ function loadMcpConfig() {
       }
     }
     return {
-      configs: servers,
       toolPatterns: names.map((name) => `mcp__${name}__*`)
     };
   } catch (err) {
     log2(`[mcp] Failed to read ${MCP_CONFIG_FILE}: ${err instanceof Error ? err.message : err}`);
-    return { configs: {}, toolPatterns: [] };
+    return { toolPatterns: [] };
   }
 }
 var activityPoster = null;
@@ -16283,14 +16282,10 @@ var sessionManager = new SessionManager({
   buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
     const __dirname = path3.dirname(fileURLToPath(import.meta.url));
     const mcp = loadMcpConfig();
-    if (Object.keys(mcp.configs).length > 0) {
-      log2(`[mcp] Passing ${Object.keys(mcp.configs).length} mcpServers to SDK session: ${Object.keys(mcp.configs).join(", ")}`);
-    }
     return {
       model: model || MODEL,
       pathToClaudeCodeExecutable: path3.join(__dirname, "cli.js"),
       env: { ...process.env },
-      mcpServers: Object.keys(mcp.configs).length > 0 ? mcp.configs : void 0,
       allowedTools: [
         "Bash",
         "Read",
@@ -16954,7 +16949,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-04-05T18:36:23.257Z" : "";
+var buildTime = true ? "2026-04-05T18:49:21.867Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;

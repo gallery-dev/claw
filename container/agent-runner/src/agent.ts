@@ -20,7 +20,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import type { SDKSessionOptions, McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
+import type { SDKSessionOptions } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import {
   ToolCallTracker,
@@ -105,13 +105,12 @@ function getDefaultContextWindow(model: string): number {
  * to auto-discover and approve .mcp.json — which fails silently in containers.
  */
 function loadMcpConfig(): {
-  configs: Record<string, McpServerConfig>;
   toolPatterns: string[];
 } {
   try {
-    if (!fs.existsSync(MCP_CONFIG_FILE)) return { configs: {}, toolPatterns: [] };
+    if (!fs.existsSync(MCP_CONFIG_FILE)) return { toolPatterns: [] };
     const config = JSON.parse(fs.readFileSync(MCP_CONFIG_FILE, 'utf-8'));
-    const servers: Record<string, McpServerConfig> = config.mcpServers || {};
+    const servers: Record<string, Record<string, unknown>> = config.mcpServers || {};
     const names = Object.keys(servers);
     if (names.length > 0) {
       log(`[mcp] Found ${names.length} customer MCP servers: ${names.join(', ')}`);
@@ -121,12 +120,11 @@ function loadMcpConfig(): {
       }
     }
     return {
-      configs: servers,
       toolPatterns: names.map(name => `mcp__${name}__*`),
     };
   } catch (err) {
     log(`[mcp] Failed to read ${MCP_CONFIG_FILE}: ${err instanceof Error ? err.message : err}`);
-    return { configs: {}, toolPatterns: [] };
+    return { toolPatterns: [] };
   }
 }
 
@@ -183,14 +181,13 @@ const sessionManager = new SessionManager({
   buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const mcp = loadMcpConfig();
-    if (Object.keys(mcp.configs).length > 0) {
-      log(`[mcp] Passing ${Object.keys(mcp.configs).length} mcpServers to SDK session: ${Object.keys(mcp.configs).join(', ')}`);
-    }
+    // Note: V2 sessions (unstable_v2_createSession) ignore mcpServers option —
+    // the CLI subprocess auto-loads .mcp.json from cwd (project root).
+    // We still need toolPatterns in allowedTools so the SDK permits MCP tool calls.
     return {
       model: model || MODEL,
       pathToClaudeCodeExecutable: path.join(__dirname, 'cli.js'),
       env: { ...process.env },
-      mcpServers: Object.keys(mcp.configs).length > 0 ? mcp.configs : undefined,
       allowedTools: [
         'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
         'WebSearch', 'WebFetch',
