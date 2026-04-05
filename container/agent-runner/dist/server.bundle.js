@@ -16951,8 +16951,8 @@ function sendJson(res, status, data) {
   });
   res.end(body);
 }
-var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-04-05T19:22:29.109Z" : "";
+var version = true ? "0c8356f3" : "dev";
+var buildTime = true ? "2026-04-05T19:27:24.252Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
