@@ -186,7 +186,10 @@ const sessionManager = new SessionManager({
     // We still need toolPatterns in allowedTools so the SDK permits MCP tool calls.
     return {
       model: model || MODEL,
-      pathToClaudeCodeExecutable: path.join(__dirname, 'cli.js'),
+      // Use cli-wrapper.js which injects --mcp-config from .mcp.json.
+      // V2 sessions hardcode settingSources=[] and mcpServers={}, so the real
+      // cli.js never loads project MCP config. The wrapper fixes this.
+      pathToClaudeCodeExecutable: path.join(__dirname, 'cli-wrapper.js'),
       env: { ...process.env },
       allowedTools: [
         'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',

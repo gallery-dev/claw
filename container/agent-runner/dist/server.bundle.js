@@ -16284,7 +16284,10 @@ var sessionManager = new SessionManager({
     const mcp = loadMcpConfig();
     return {
       model: model || MODEL,
-      pathToClaudeCodeExecutable: path3.join(__dirname, "cli.js"),
+      // Use cli-wrapper.js which injects --mcp-config from .mcp.json.
+      // V2 sessions hardcode settingSources=[] and mcpServers={}, so the real
+      // cli.js never loads project MCP config. The wrapper fixes this.
+      pathToClaudeCodeExecutable: path3.join(__dirname, "cli-wrapper.js"),
       env: { ...process.env },
       allowedTools: [
         "Bash",
@@ -16949,7 +16952,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-04-05T18:49:21.867Z" : "";
+var buildTime = true ? "2026-04-05T19:06:10.929Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;

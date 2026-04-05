@@ -77,7 +77,12 @@ async function run() {
   mkdirSync('dist', { recursive: true });
   copyFileSync(sdkCliPath, 'dist/cli.js');
 
-  console.log('✓ Bundled server.bundle.js + gallery-cli.bundle.js + mcp-tools.bundle.js + cli.js');
+  // Copy cli-wrapper.js — injects --mcp-config from .mcp.json before loading
+  // the real CLI. Needed because V2 sessions hardcode settingSources=[] and
+  // mcpServers={}, preventing the CLI from loading project MCP config.
+  copyFileSync('src/cli-wrapper.js', 'dist/cli-wrapper.js');
+
+  console.log('✓ Bundled server.bundle.js + gallery-cli.bundle.js + mcp-tools.bundle.js + cli.js + cli-wrapper.js');
 }
 
 run().catch((err) => {
