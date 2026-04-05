@@ -20,7 +20,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import type { SDKSessionOptions } from '@anthropic-ai/claude-agent-sdk';
+import type { SDKSessionOptions, McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import {
   ToolCallTracker,
@@ -97,21 +97,37 @@ function getDefaultContextWindow(model: string): number {
 // Session persistence is now handled by SessionManager.
 
 /**
- * Read .mcp.json to get customer MCP server names for allowedTools patterns.
- * The SDK auto-loads .mcp.json from cwd for server configuration;
- * we just need the names to add mcp__<name>__* to allowedTools.
+ * Read .mcp.json and return both the full MCP server configs (for the SDK
+ * mcpServers option) and the allowedTools patterns (mcp__<name>__*).
+ *
+ * Passing configs explicitly via SDKSessionOptions.mcpServers ensures the SDK
+ * connects to MCP servers directly, rather than relying on the CLI subprocess
+ * to auto-discover and approve .mcp.json — which fails silently in containers.
  */
-function getDynamicMcpToolPatterns(): string[] {
+function loadMcpConfig(): {
+  configs: Record<string, McpServerConfig>;
+  toolPatterns: string[];
+} {
   try {
-    if (!fs.existsSync(MCP_CONFIG_FILE)) return [];
+    if (!fs.existsSync(MCP_CONFIG_FILE)) return { configs: {}, toolPatterns: [] };
     const config = JSON.parse(fs.readFileSync(MCP_CONFIG_FILE, 'utf-8'));
-    const servers = config.mcpServers || {};
+    const servers: Record<string, McpServerConfig> = config.mcpServers || {};
     const names = Object.keys(servers);
     if (names.length > 0) {
       log(`[mcp] Found ${names.length} customer MCP servers: ${names.join(', ')}`);
+      for (const name of names) {
+        const s = servers[name] as Record<string, unknown>;
+        log(`[mcp]   ${name}: type=${s.type ?? 'stdio'}, ${s.url ? `url=${s.url}` : `cmd=${s.command}`}`);
+      }
     }
-    return names.map(name => `mcp__${name}__*`);
-  } catch { return []; }
+    return {
+      configs: servers,
+      toolPatterns: names.map(name => `mcp__${name}__*`),
+    };
+  } catch (err) {
+    log(`[mcp] Failed to read ${MCP_CONFIG_FILE}: ${err instanceof Error ? err.message : err}`);
+    return { configs: {}, toolPatterns: [] };
+  }
 }
 
 // ─── Public Interfaces ───────────────────────────────────
@@ -166,16 +182,18 @@ const sessionManager = new SessionManager({
   defaultModel: MODEL,
   buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    const mcp = loadMcpConfig();
     return {
       model: model || MODEL,
       pathToClaudeCodeExecutable: path.join(__dirname, 'cli.js'),
       env: { ...process.env },
+      mcpServers: Object.keys(mcp.configs).length > 0 ? mcp.configs : undefined,
       allowedTools: [
         'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
         'WebSearch', 'WebFetch',
         'Task', 'TaskOutput', 'TaskStop',
         'NotebookEdit',
-        ...getDynamicMcpToolPatterns(),
+        ...mcp.toolPatterns,
       ],
       permissionMode: mode === 'plan' ? 'plan' : 'acceptEdits',
       includePartialMessages: true,
@@ -187,7 +205,7 @@ const sessionManager = new SessionManager({
             if (activeCancelRef.current?.cancelled) {
               return { decision: 'block' as const, reason: 'Cancelled by user' };
             }
-            return undefined;
+            return {};
           }] },
           { matcher: 'Bash', hooks: [createSanitizeBashHook()] },
           { hooks: [createLoopDetectionHook(loopTracker, log)] },
@@ -509,6 +527,10 @@ async function processMessageInner(
       if (msg.type === 'system' && msg.subtype === 'init') {
         currentSessionId = msg.session_id;
         log(`Session initialized: ${currentSessionId} (conversation: ${conversationId})`);
+        if ((msg as any).mcp_servers?.length) {
+          const mcpStatus = (msg as any).mcp_servers.map((s: any) => `${s.name}:${s.status}`).join(', ');
+          log(`[mcp] Server status: ${mcpStatus}`);
+        }
         activityPoster!.post('status', `Session initialized: ${currentSessionId}`);
         sessionManager.persistSessionId(conversationId, currentSessionId);
       }

@@ -16251,18 +16251,26 @@ function getDefaultContextWindow(model) {
   if (m3.includes("deepseek")) return 128e3;
   return 128e3;
 }
-function getDynamicMcpToolPatterns() {
+function loadMcpConfig() {
   try {
-    if (!fs3.existsSync(MCP_CONFIG_FILE)) return [];
+    if (!fs3.existsSync(MCP_CONFIG_FILE)) return { configs: {}, toolPatterns: [] };
     const config = JSON.parse(fs3.readFileSync(MCP_CONFIG_FILE, "utf-8"));
     const servers = config.mcpServers || {};
     const names = Object.keys(servers);
     if (names.length > 0) {
       log2(`[mcp] Found ${names.length} customer MCP servers: ${names.join(", ")}`);
+      for (const name of names) {
+        const s3 = servers[name];
+        log2(`[mcp]   ${name}: type=${s3.type ?? "stdio"}, ${s3.url ? `url=${s3.url}` : `cmd=${s3.command}`}`);
+      }
     }
-    return names.map((name) => `mcp__${name}__*`);
-  } catch {
-    return [];
+    return {
+      configs: servers,
+      toolPatterns: names.map((name) => `mcp__${name}__*`)
+    };
+  } catch (err) {
+    log2(`[mcp] Failed to read ${MCP_CONFIG_FILE}: ${err instanceof Error ? err.message : err}`);
+    return { configs: {}, toolPatterns: [] };
   }
 }
 var activityPoster = null;
@@ -16274,10 +16282,12 @@ var sessionManager = new SessionManager({
   defaultModel: MODEL,
   buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
     const __dirname = path3.dirname(fileURLToPath(import.meta.url));
+    const mcp = loadMcpConfig();
     return {
       model: model || MODEL,
       pathToClaudeCodeExecutable: path3.join(__dirname, "cli.js"),
       env: { ...process.env },
+      mcpServers: Object.keys(mcp.configs).length > 0 ? mcp.configs : void 0,
       allowedTools: [
         "Bash",
         "Read",
@@ -16291,7 +16301,7 @@ var sessionManager = new SessionManager({
         "TaskOutput",
         "TaskStop",
         "NotebookEdit",
-        ...getDynamicMcpToolPatterns()
+        ...mcp.toolPatterns
       ],
       permissionMode: mode === "plan" ? "plan" : "acceptEdits",
       includePartialMessages: true,
@@ -16303,7 +16313,7 @@ var sessionManager = new SessionManager({
             if (activeCancelRef.current?.cancelled) {
               return { decision: "block", reason: "Cancelled by user" };
             }
-            return void 0;
+            return {};
           }] },
           { matcher: "Bash", hooks: [createSanitizeBashHook()] },
           { hooks: [createLoopDetectionHook(loopTracker, log2)] },
@@ -16569,6 +16579,10 @@ ${workspaceState}`;
       if (msg.type === "system" && msg.subtype === "init") {
         currentSessionId = msg.session_id;
         log2(`Session initialized: ${currentSessionId} (conversation: ${conversationId})`);
+        if (msg.mcp_servers?.length) {
+          const mcpStatus = msg.mcp_servers.map((s3) => `${s3.name}:${s3.status}`).join(", ");
+          log2(`[mcp] Server status: ${mcpStatus}`);
+        }
         activityPoster.post("status", `Session initialized: ${currentSessionId}`);
         sessionManager.persistSessionId(conversationId, currentSessionId);
       }
@@ -16916,8 +16930,8 @@ function sendJson(res, status, data) {
   });
   res.end(body);
 }
-var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-04-05T05:08:16.815Z" : "";
+var version = true ? "cc579769" : "dev";
+var buildTime = true ? "2026-04-05T18:13:45.545Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
