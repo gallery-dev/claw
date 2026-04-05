@@ -199,6 +199,11 @@ const sessionManager = new SessionManager({
         ...mcp.toolPatterns,
       ],
       permissionMode: mode === 'plan' ? 'plan' : 'acceptEdits',
+      // Capture CLI subprocess stderr — SDK defaults to "ignore" which swallows all MCP errors
+      stderr: (data: string) => {
+        const line = data.trim();
+        if (line) log(`[sdk-stderr] ${line}`);
+      },
       includePartialMessages: true,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],

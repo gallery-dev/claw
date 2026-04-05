@@ -16307,6 +16307,11 @@ var sessionManager = new SessionManager({
         ...mcp.toolPatterns
       ],
       permissionMode: mode === "plan" ? "plan" : "acceptEdits",
+      // Capture CLI subprocess stderr — SDK defaults to "ignore" which swallows all MCP errors
+      stderr: (data) => {
+        const line = data.trim();
+        if (line) log2(`[sdk-stderr] ${line}`);
+      },
       includePartialMessages: true,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log2)] }],
@@ -16948,8 +16953,8 @@ function sendJson(res, status, data) {
   });
   res.end(body);
 }
-var version = true ? "1771c52f" : "dev";
-var buildTime = true ? "2026-04-05T18:34:13.994Z" : "";
+var version = true ? "1.0.0" : "dev";
+var buildTime = true ? "2026-04-05T18:36:23.257Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
