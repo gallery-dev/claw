@@ -16283,6 +16283,9 @@ var sessionManager = new SessionManager({
   buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
     const __dirname = path3.dirname(fileURLToPath(import.meta.url));
     const mcp = loadMcpConfig();
+    if (Object.keys(mcp.configs).length > 0) {
+      log2(`[mcp] Passing ${Object.keys(mcp.configs).length} mcpServers to SDK session: ${Object.keys(mcp.configs).join(", ")}`);
+    }
     return {
       model: model || MODEL,
       pathToClaudeCodeExecutable: path3.join(__dirname, "cli.js"),
@@ -16579,9 +16582,24 @@ ${workspaceState}`;
       if (msg.type === "system" && msg.subtype === "init") {
         currentSessionId = msg.session_id;
         log2(`Session initialized: ${currentSessionId} (conversation: ${conversationId})`);
-        if (msg.mcp_servers?.length) {
-          const mcpStatus = msg.mcp_servers.map((s3) => `${s3.name}:${s3.status}`).join(", ");
-          log2(`[mcp] Server status: ${mcpStatus}`);
+        const initKeys = Object.keys(msg).filter((k6) => k6 !== "type" && k6 !== "subtype");
+        log2(`[init] keys: ${initKeys.join(", ")}`);
+        const mcpServers = msg.mcp_servers;
+        if (mcpServers && Array.isArray(mcpServers)) {
+          if (mcpServers.length > 0) {
+            const mcpStatus = mcpServers.map((s3) => `${s3.name}:${s3.status}`).join(", ");
+            log2(`[mcp] Server status: ${mcpStatus}`);
+          } else {
+            log2(`[mcp] WARNING: mcp_servers array is empty \u2014 no MCP servers connected`);
+          }
+        } else {
+          log2(`[mcp] WARNING: no mcp_servers field in init message (mcpServers=${typeof mcpServers})`);
+        }
+        const tools = msg.tools;
+        if (tools && Array.isArray(tools)) {
+          const mcpTools = tools.filter((t) => typeof t === "string" && t.startsWith("mcp__"));
+          const builtinTools = tools.filter((t) => typeof t === "string" && !t.startsWith("mcp__"));
+          log2(`[init] tools: ${builtinTools.length} built-in, ${mcpTools.length} MCP ${mcpTools.length > 0 ? `(${mcpTools.slice(0, 5).join(", ")}${mcpTools.length > 5 ? "..." : ""})` : ""}`);
         }
         activityPoster.post("status", `Session initialized: ${currentSessionId}`);
         sessionManager.persistSessionId(conversationId, currentSessionId);
@@ -16930,8 +16948,8 @@ function sendJson(res, status, data) {
   });
   res.end(body);
 }
-var version = true ? "cc579769" : "dev";
-var buildTime = true ? "2026-04-05T18:13:45.545Z" : "";
+var version = true ? "1771c52f" : "dev";
+var buildTime = true ? "2026-04-05T18:34:13.994Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;

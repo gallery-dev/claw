@@ -183,6 +183,9 @@ const sessionManager = new SessionManager({
   buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const mcp = loadMcpConfig();
+    if (Object.keys(mcp.configs).length > 0) {
+      log(`[mcp] Passing ${Object.keys(mcp.configs).length} mcpServers to SDK session: ${Object.keys(mcp.configs).join(', ')}`);
+    }
     return {
       model: model || MODEL,
       pathToClaudeCodeExecutable: path.join(__dirname, 'cli.js'),
@@ -527,9 +530,26 @@ async function processMessageInner(
       if (msg.type === 'system' && msg.subtype === 'init') {
         currentSessionId = msg.session_id;
         log(`Session initialized: ${currentSessionId} (conversation: ${conversationId})`);
-        if ((msg as any).mcp_servers?.length) {
-          const mcpStatus = (msg as any).mcp_servers.map((s: any) => `${s.name}:${s.status}`).join(', ');
-          log(`[mcp] Server status: ${mcpStatus}`);
+        // Log full init message keys + MCP status for debugging
+        const initKeys = Object.keys(msg).filter(k => k !== 'type' && k !== 'subtype');
+        log(`[init] keys: ${initKeys.join(', ')}`);
+        const mcpServers = (msg as any).mcp_servers;
+        if (mcpServers && Array.isArray(mcpServers)) {
+          if (mcpServers.length > 0) {
+            const mcpStatus = mcpServers.map((s: any) => `${s.name}:${s.status}`).join(', ');
+            log(`[mcp] Server status: ${mcpStatus}`);
+          } else {
+            log(`[mcp] WARNING: mcp_servers array is empty — no MCP servers connected`);
+          }
+        } else {
+          log(`[mcp] WARNING: no mcp_servers field in init message (mcpServers=${typeof mcpServers})`);
+        }
+        // Log available tools from init message
+        const tools = (msg as any).tools;
+        if (tools && Array.isArray(tools)) {
+          const mcpTools = tools.filter((t: any) => typeof t === 'string' && t.startsWith('mcp__'));
+          const builtinTools = tools.filter((t: any) => typeof t === 'string' && !t.startsWith('mcp__'));
+          log(`[init] tools: ${builtinTools.length} built-in, ${mcpTools.length} MCP ${mcpTools.length > 0 ? `(${mcpTools.slice(0, 5).join(', ')}${mcpTools.length > 5 ? '...' : ''})` : ''}`);
         }
         activityPoster!.post('status', `Session initialized: ${currentSessionId}`);
         sessionManager.persistSessionId(conversationId, currentSessionId);
