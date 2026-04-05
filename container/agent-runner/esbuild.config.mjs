@@ -70,6 +70,16 @@ async function run() {
     outdir: undefined,
   });
 
+  // Bundle 4: Composio SSE-to-stdio proxy — bridges CLI's stdio transport to
+  // Composio's SSE MCP endpoint. Needed because the CLI's SSE client fails
+  // silently in container environments.
+  await build({
+    ...shared,
+    entryPoints: ['src/composio-proxy.ts'],
+    outfile: 'dist/composio-proxy.bundle.js',
+    outdir: undefined,
+  });
+
   // Copy cli.js from SDK — the Claude Agent SDK spawns this as a subprocess.
   // query() resolves cli.js relative to import.meta.url at runtime, so it must
   // sit next to server.bundle.js in dist/.
@@ -82,7 +92,7 @@ async function run() {
   // mcpServers={}, preventing the CLI from loading project MCP config.
   copyFileSync('src/cli-wrapper.js', 'dist/cli-wrapper.js');
 
-  console.log('✓ Bundled server.bundle.js + gallery-cli.bundle.js + mcp-tools.bundle.js + cli.js + cli-wrapper.js');
+  console.log('✓ Bundled server.bundle.js + gallery-cli.bundle.js + mcp-tools.bundle.js + composio-proxy.bundle.js + cli.js + cli-wrapper.js');
 }
 
 run().catch((err) => {

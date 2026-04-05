@@ -16952,7 +16952,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-04-05T19:06:10.929Z" : "";
+var buildTime = true ? "2026-04-05T19:22:29.109Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
