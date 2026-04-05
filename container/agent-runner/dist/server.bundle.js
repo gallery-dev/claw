@@ -16900,8 +16900,8 @@ function sendJson(res, status, data) {
   });
   res.end(body);
 }
-var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-04-01T06:25:27.856Z" : "";
+var version = true ? "8b07d8ae" : "dev";
+var buildTime = true ? "2026-04-01T07:08:13.377Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
