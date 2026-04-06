@@ -45304,6 +45304,26 @@ async function postConvexActivity(convexUrl2, token, agentId2, type, content, me
 var WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || "/home/sprite/workspace";
 var MEMORY_DIR = path2.join(WORKSPACE_DIR, "memory");
 var MEMORY_FILE = path2.join(WORKSPACE_DIR, "MEMORY.md");
+function assertWithinWorkspace(targetPath) {
+  try {
+    if (fs2.existsSync(targetPath)) {
+      const real = fs2.realpathSync(targetPath);
+      if (!real.startsWith(fs2.realpathSync(WORKSPACE_DIR))) return null;
+      return real;
+    }
+    const parentDir = path2.dirname(targetPath);
+    if (fs2.existsSync(parentDir)) {
+      const realParent = fs2.realpathSync(parentDir);
+      if (!realParent.startsWith(fs2.realpathSync(WORKSPACE_DIR))) return null;
+    } else {
+      const resolved = path2.resolve(targetPath);
+      if (!resolved.startsWith(path2.resolve(WORKSPACE_DIR))) return null;
+    }
+    return path2.resolve(targetPath);
+  } catch {
+    return null;
+  }
+}
 var galleryApiUrl = process.env.GALLERY_API_URL || "";
 var galleryWorkerUrl = process.env.GALLERY_WORKER_URL || "";
 var galleryToken = process.env.GALLERY_TOKEN || "";
@@ -45357,9 +45377,26 @@ server.tool(
 var convexUrl = process.env.GALLERY_CONVEX_URL || "";
 var gatewayToken = process.env.GALLERY_GATEWAY_TOKEN || "";
 var currentTaskId;
-var planModeActive = false;
+var PLAN_MODE_FILE = path2.join(WORKSPACE_DIR, ".plan-mode");
+function isPlanModeActive() {
+  try {
+    return fs2.existsSync(PLAN_MODE_FILE);
+  } catch {
+    return false;
+  }
+}
+function setPlanMode(active) {
+  try {
+    if (active) {
+      fs2.writeFileSync(PLAN_MODE_FILE, (/* @__PURE__ */ new Date()).toISOString());
+    } else if (fs2.existsSync(PLAN_MODE_FILE)) {
+      fs2.unlinkSync(PLAN_MODE_FILE);
+    }
+  } catch {
+  }
+}
 function checkPlanMode(toolName) {
-  if (!planModeActive) return null;
+  if (!isPlanModeActive()) return null;
   const readOnlyTools = /* @__PURE__ */ new Set([
     "memory_view",
     "memory_search",
@@ -45372,7 +45409,8 @@ function checkPlanMode(toolName) {
     "skill_list",
     "gallery_exit_plan_mode",
     "update_progress",
-    "send_message"
+    "send_message",
+    "gallery_list_files"
   ]);
   if (readOnlyTools.has(toolName)) return null;
   return {
@@ -45808,8 +45846,7 @@ ${entries.join("\n")}` }] };
     } else {
       targetPath = path2.join(MEMORY_DIR, requestedPath);
     }
-    const resolved = path2.resolve(targetPath);
-    if (!resolved.startsWith(WORKSPACE_DIR)) {
+    if (!assertWithinWorkspace(targetPath)) {
       return { content: [{ type: "text", text: `Error: path must be within your workspace.` }], isError: true };
     }
     if (!fs2.existsSync(targetPath)) {
@@ -45862,8 +45899,7 @@ Best practices:
     } else {
       targetPath = path2.join(MEMORY_DIR, args.path);
     }
-    const resolved = path2.resolve(targetPath);
-    if (!resolved.startsWith(WORKSPACE_DIR)) {
+    if (!assertWithinWorkspace(targetPath)) {
       return { content: [{ type: "text", text: `Error: path must be within your workspace.` }], isError: true };
     }
     fs2.mkdirSync(path2.dirname(targetPath), { recursive: true });
@@ -46004,8 +46040,7 @@ server.tool(
     } else {
       targetPath = path2.join(MEMORY_DIR, args.path);
     }
-    const resolved = path2.resolve(targetPath);
-    if (!resolved.startsWith(WORKSPACE_DIR)) {
+    if (!assertWithinWorkspace(targetPath)) {
       return { content: [{ type: "text", text: `Error: path must be within your workspace.` }], isError: true };
     }
     if (!fs2.existsSync(targetPath)) {
@@ -46014,6 +46049,41 @@ server.tool(
     fs2.unlinkSync(targetPath);
     removeMemoryEntry(args.path);
     return { content: [{ type: "text", text: `Deleted ${args.path}` }] };
+  }
+);
+var FILES_DIR = path2.join(WORKSPACE_DIR, "files");
+server.tool(
+  "gallery_list_files",
+  `List knowledge files uploaded to the workspace via the Gallery dashboard. These files are in the files/ directory and can be read with the Read tool.
+
+Use this to discover what reference materials, specs, or documents the workspace owner has uploaded.`,
+  {},
+  async () => {
+    if (!fs2.existsSync(FILES_DIR)) {
+      return { content: [{ type: "text", text: "No knowledge files uploaded. The workspace owner can upload files via the Gallery dashboard." }] };
+    }
+    try {
+      const entries = fs2.readdirSync(FILES_DIR).filter((f) => !f.startsWith(".")).sort();
+      if (entries.length === 0) {
+        return { content: [{ type: "text", text: "No knowledge files uploaded. The workspace owner can upload files via the Gallery dashboard." }] };
+      }
+      const lines = entries.map((f) => {
+        try {
+          const filePath = path2.join(FILES_DIR, f);
+          const stat = fs2.statSync(filePath);
+          const ext = path2.extname(f).toLowerCase();
+          return `- ${f} (${formatSize(stat.size)}, ${ext || "no extension"})  \u2192  Read with: files/${f}`;
+        } catch {
+          return `- ${f} (unreadable)`;
+        }
+      });
+      return { content: [{ type: "text", text: `Knowledge files (${entries.length}):
+${lines.join("\n")}
+
+Use the Read tool with path "files/<filename>" to view file contents.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error listing files: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
   }
 );
 var SKILLS_DIR = path2.join(WORKSPACE_DIR, "skills");
@@ -46325,6 +46395,56 @@ Please use a more specific title.` }], isError: true };
   }
 );
 server.tool(
+  "gallery_attach_to_task",
+  `Attach a file from the workspace to a task. Use this to deliver work products (reports, code, documents) as task attachments visible in the Gallery dashboard.
+
+The file must exist in the workspace filesystem. It will be read and uploaded to storage.`,
+  {
+    taskId: external_exports3.string().describe("Task ID to attach the file to"),
+    filePath: external_exports3.string().describe("Path to the file in the workspace (relative or absolute)"),
+    name: external_exports3.string().optional().describe("Display name for the attachment (defaults to filename)")
+  },
+  async (args) => {
+    const blocked = checkPlanMode("gallery_attach_to_task");
+    if (blocked) return blocked;
+    const absPath = path2.isAbsolute(args.filePath) ? args.filePath : path2.join(WORKSPACE_DIR, args.filePath);
+    if (!assertWithinWorkspace(absPath)) {
+      return { content: [{ type: "text", text: "Error: file must be within your workspace." }], isError: true };
+    }
+    if (!fs2.existsSync(absPath) || !fs2.statSync(absPath).isFile()) {
+      return { content: [{ type: "text", text: `Error: file not found at "${args.filePath}".` }], isError: true };
+    }
+    const stat = fs2.statSync(absPath);
+    const MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024;
+    if (stat.size > MAX_ATTACHMENT_SIZE) {
+      return { content: [{ type: "text", text: `Error: file too large (${formatSize(stat.size)}, max 50MB).` }], isError: true };
+    }
+    const fileName = args.name || path2.basename(absPath);
+    const ext = path2.extname(absPath).toLowerCase().replace(".", "");
+    const mimeType = ext === "md" ? "text/markdown" : ext === "json" ? "application/json" : ext === "pdf" ? "application/pdf" : ext === "csv" ? "text/csv" : ext === "txt" ? "text/plain" : ext === "html" ? "text/html" : `application/octet-stream`;
+    let url2;
+    if (stat.size <= 10 * 1024 * 1024) {
+      const content = fs2.readFileSync(absPath);
+      url2 = `data:${mimeType};base64,${content.toString("base64")}`;
+    } else {
+      url2 = `workspace://${path2.relative(WORKSPACE_DIR, absPath)}`;
+    }
+    try {
+      await convexMutation("mcpInternal:addTaskAttachment", {
+        taskId: args.taskId,
+        name: fileName,
+        url: url2,
+        type: mimeType,
+        size: stat.size
+      });
+      postActivity("tool_use", `Attached "${fileName}" (${formatSize(stat.size)}) to task`);
+      return { content: [{ type: "text", text: `Attached "${fileName}" (${formatSize(stat.size)}) to task.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Error attaching file: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  }
+);
+server.tool(
   "gallery_list_agents",
   "List all agents in the workspace. Returns agent names, roles, models, and status.",
   {
@@ -46626,7 +46746,7 @@ ${args.plan_content}
       }
     } catch {
     }
-    planModeActive = true;
+    setPlanMode(true);
     postActivity("status", `Entered plan mode: ${args.plan_title}`);
     return {
       content: [{
@@ -46647,7 +46767,7 @@ server.tool(
     plan_title: external_exports3.string().describe("Title of the plan that was approved")
   },
   async (args) => {
-    planModeActive = false;
+    setPlanMode(false);
     postActivity("status", `Exited plan mode: ${args.plan_title}`);
     return {
       content: [{

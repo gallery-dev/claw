@@ -16046,7 +16046,8 @@ var SessionManager = class {
     const loopTracker = new ToolCallTracker();
     const contextTracker = new ContextWindowTracker();
     contextTracker.contextWindow = this.defaultContextWindow;
-    const options = this.buildOptions(loopTracker, contextTracker, assistantName, effectiveMode, effectiveModel);
+    const cancelRef = { current: null };
+    const options = this.buildOptions(loopTracker, contextTracker, assistantName, effectiveMode, effectiveModel, cancelRef);
     const modeModelChanged = existing !== void 0;
     let session;
     if (persisted && !modeModelChanged) {
@@ -16071,7 +16072,8 @@ var SessionManager = class {
       mode: effectiveMode,
       model: effectiveModel,
       lockPromise: Promise.resolve(),
-      lockRelease: null
+      lockRelease: null,
+      cancelRef
     };
     this.conversations.set(id, ctx);
     return ctx;
@@ -16316,13 +16318,12 @@ function loadMcpConfig() {
   }
 }
 var activityPoster = null;
-var activeCancelRef = { current: null };
 var sessionManager = new SessionManager({
   workspaceDir: WORKSPACE_DIR,
   maxSessions: 5,
   defaultContextWindow: getDefaultContextWindow(MODEL),
   defaultModel: MODEL,
-  buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
+  buildOptions: (loopTracker, contextTracker, assistantName, mode, model, cancelRef) => {
     const __dirname = path3.dirname(fileURLToPath(import.meta.url));
     const mcp = loadMcpConfig();
     return {
@@ -16358,8 +16359,9 @@ var sessionManager = new SessionManager({
         PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log2)] }],
         PreToolUse: [
           // Cancel check — abort before starting tool execution if user cancelled
+          // Uses per-conversation cancelRef (not a global) to avoid cross-conversation cancellation.
           { hooks: [async () => {
-            if (activeCancelRef.current?.cancelled) {
+            if (cancelRef?.current?.cancelled) {
               return { decision: "block", reason: "Cancelled by user" };
             }
             return {};
@@ -16391,7 +16393,7 @@ async function processMessage(params, writer, cancelSignal) {
   try {
     return await processMessageInner(params, writer, cancelSignal, ctx);
   } finally {
-    activeCancelRef.current = null;
+    ctx.cancelRef.current = null;
     releaseLock();
   }
 }
@@ -16401,7 +16403,7 @@ async function processMessageInner(params, writer, cancelSignal, ctx) {
   const agentId = process.env.AGENT_ID || assistantName || "unknown";
   ensureActivityPoster(agentId);
   activityPoster.post("status", "Processing message");
-  activeCancelRef.current = cancelSignal ?? null;
+  if (ctx) ctx.cancelRef.current = cancelSignal ?? null;
   const tz2 = process.env.AGENT_TIMEZONE || "UTC";
   const localTime = (/* @__PURE__ */ new Date()).toLocaleString("en-US", {
     timeZone: tz2,
@@ -16739,7 +16741,7 @@ ${workspaceState}`;
   const statusMsg = limitHit ? `Query stopped (limit hit after ${turnCount} turns, $${accumulatedCostUsd.toFixed(4)})` : `Query done. Messages: ${messageCount}, results: ${resultTexts.length}`;
   log2(`${statusMsg}, sessionId: ${currentSessionId}`);
   activityPoster.post("status", limitHit ? statusMsg : "Message processed");
-  if (resultText && process.env.CLAW_AUTO_MEMORY !== "false") {
+  if (resultText && process.env.CLAW_AUTO_MEMORY === "true") {
     extractMemory(message, resultText).catch((err) => {
       log2(`Memory extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     });
@@ -16929,42 +16931,18 @@ async function enqueueMessage(params) {
 async function processQueue() {
   if (processing || requestQueue.length === 0) return;
   processing = true;
-  const first = requestQueue.shift();
-  const items = [first];
-  const isTask = first.params.isScheduledTask;
-  const sessionId = first.params.sessionId;
-  while (requestQueue.length > 0 && requestQueue[0].params.isScheduledTask === isTask && requestQueue[0].params.sessionId === sessionId) {
-    items.push(requestQueue.shift());
-  }
-  let params;
-  if (items.length === 1) {
-    params = items[0].params;
-  } else {
-    const combined = items.map(
-      (item, i3) => `[Message ${i3 + 1}]: ${item.params.message}`
-    ).join("\n\n");
-    params = {
-      message: combined,
-      sessionId: first.params.sessionId,
-      isScheduledTask: isTask,
-      assistantName: first.params.assistantName
-    };
-    log3(`Batched ${items.length} queued ${isTask ? "tasks" : "messages"} into single prompt`);
-  }
+  const item = requestQueue.shift();
+  const params = item.params;
   let timer;
   try {
     const timeoutPromise = new Promise((_3, rej) => {
       timer = setTimeout(() => rej(new Error("REQUEST_TIMEOUT")), REQUEST_TIMEOUT_MS);
     });
     const result = await Promise.race([processMessage(params), timeoutPromise]);
-    for (const item of items) {
-      item.resolve(result);
-    }
+    item.resolve(result);
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
-    for (const item of items) {
-      item.reject(error);
-    }
+    item.reject(error);
   } finally {
     if (timer) clearTimeout(timer);
     processing = false;
@@ -16999,8 +16977,8 @@ function sendJson(res, status, data) {
   });
   res.end(body);
 }
-var version = true ? "1.0.0" : "dev";
-var buildTime = true ? "2026-04-06T02:56:42.082Z" : "";
+var version = true ? "39339e83" : "dev";
+var buildTime = true ? "2026-04-06T03:52:31.583Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;
@@ -17032,8 +17010,8 @@ async function handleMessage(req, res) {
     sessionId: parsed.sessionId,
     isScheduledTask: false,
     assistantName: parsed.assistantName,
-    maxTurns: typeof parsed.maxTurns === "number" ? parsed.maxTurns : void 0,
-    maxBudgetUsd: typeof parsed.maxBudgetUsd === "number" ? parsed.maxBudgetUsd : void 0,
+    maxTurns: typeof parsed.maxTurns === "number" ? Math.min(Math.max(1, parsed.maxTurns), 500) : void 0,
+    maxBudgetUsd: typeof parsed.maxBudgetUsd === "number" ? Math.min(Math.max(0.01, parsed.maxBudgetUsd), 100) : void 0,
     mode: parsed.mode === "plan" ? "plan" : void 0,
     model: typeof parsed.model === "string" ? parsed.model : void 0
   };
