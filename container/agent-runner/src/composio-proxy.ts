@@ -1,8 +1,8 @@
 /**
- * Composio MCP Proxy — bridges stdio ↔ SSE for the Claude Code CLI.
+ * Composio MCP Proxy — bridges stdio ↔ Streamable HTTP for the Claude Code CLI.
  *
  * The CLI connects to this process via stdio (stdin/stdout). This proxy
- * connects to Composio's SSE MCP endpoint and forwards all JSON-RPC
+ * connects to Composio's HTTP MCP endpoint and forwards all JSON-RPC
  * messages bidirectionally.
  *
  * Usage:
@@ -11,12 +11,12 @@
  * The URL and API key come from the .mcp.json config, passed as args
  * by the CLI when spawning this stdio server.
  *
- * Why: The CLI's --mcp-config flag handles stdio servers but SSE
- * connections fail silently in the container environment. This proxy
- * converts the SSE transport to stdio, which is reliable.
+ * Why: The CLI's built-in HTTP/SSE MCP client fails silently in
+ * Cloudflare Sandbox containers. This proxy converts the remote
+ * transport to stdio, which is reliable.
  */
 
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 const url = process.argv[2];
@@ -35,35 +35,24 @@ if (apiKey) {
 // Stdio transport — receives from CLI, sends back to CLI
 const stdio = new StdioServerTransport();
 
-// SSE transport — connects to Composio
-const sseUrl = new URL(url);
-const sse = new SSEClientTransport(sseUrl, {
+// Streamable HTTP transport — connects to Composio's POST endpoint
+const remote = new StreamableHTTPClientTransport(new URL(url), {
   requestInit: {
     headers,
   },
-  eventSourceInit: {
-    fetch: (input: string | URL | Request, init?: RequestInit) =>
-      fetch(input, {
-        ...init,
-        headers: {
-          ...(init?.headers as Record<string, string> || {}),
-          ...headers,
-        },
-      }),
-  },
 });
 
-// Bridge: stdio → SSE (CLI sends request, proxy forwards to Composio)
+// Bridge: stdio → remote (CLI sends request, proxy forwards to Composio)
 stdio.onmessage = async (message) => {
   try {
-    await sse.send(message);
+    await remote.send(message);
   } catch (err) {
-    process.stderr.write(`[composio-proxy] Error forwarding to SSE: ${err}\n`);
+    process.stderr.write(`[composio-proxy] Error forwarding to remote: ${err}\n`);
   }
 };
 
-// Bridge: SSE → stdio (Composio responds, proxy forwards to CLI)
-sse.onmessage = async (message) => {
+// Bridge: remote → stdio (Composio responds, proxy forwards to CLI)
+remote.onmessage = async (message) => {
   try {
     await stdio.send(message);
   } catch (err) {
@@ -72,8 +61,8 @@ sse.onmessage = async (message) => {
 };
 
 // Error handling
-sse.onerror = (err) => {
-  process.stderr.write(`[composio-proxy] SSE error: ${err.message}\n`);
+remote.onerror = (err) => {
+  process.stderr.write(`[composio-proxy] Remote error: ${err.message}\n`);
 };
 
 stdio.onerror = (err) => {
@@ -81,20 +70,20 @@ stdio.onerror = (err) => {
 };
 
 // Cleanup
-sse.onclose = () => {
-  process.stderr.write('[composio-proxy] SSE connection closed\n');
+remote.onclose = () => {
+  process.stderr.write('[composio-proxy] Remote connection closed\n');
   process.exit(0);
 };
 
 stdio.onclose = () => {
-  sse.close().catch(() => {});
+  remote.close().catch(() => {});
   process.exit(0);
 };
 
 // Start both transports
 try {
-  await sse.start();
-  process.stderr.write(`[composio-proxy] Connected to ${sseUrl.origin}${sseUrl.pathname}\n`);
+  await remote.start();
+  process.stderr.write(`[composio-proxy] Connected to ${url}\n`);
   await stdio.start();
 } catch (err) {
   process.stderr.write(`[composio-proxy] Failed to start: ${err instanceof Error ? err.message : err}\n`);
