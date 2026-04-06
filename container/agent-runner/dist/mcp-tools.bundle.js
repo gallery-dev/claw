@@ -45239,6 +45239,26 @@ import path2 from "path";
 // src/shared.ts
 import fs from "fs";
 import path from "path";
+var TRANSIENT_ERROR_PATTERNS = [
+  /\bnot available\b/i,
+  /\bnot configured\b/i,
+  /\bconnection (?:failed|refused|reset)\b/i,
+  /\btimed?\s*out\b/i,
+  /\b(?:429|502|503|504)\b/,
+  /\brate limit/i,
+  /\btemporarily\b/i,
+  /\bunavailable\b/i,
+  /\bdisconnect(?:ed)?\b/i,
+  /\bunreachable\b/i,
+  /\bMCP\b.*(?:not responding|failed to connect|disconnected)/i,
+  /\bcould not connect\b/i,
+  /\bservice\b.*\bdown\b/i,
+  /\bnetwork error\b/i,
+  /\bretry later\b/i
+];
+function isTransientError(text) {
+  return TRANSIENT_ERROR_PATTERNS.some((p) => p.test(text));
+}
 var SECRET_ENV_VARS = [
   "ANTHROPIC_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
@@ -45822,11 +45842,11 @@ server.tool(
   "memory_write",
   `Write or update a memory file. Use this to persist important information across sessions.
 
-Write proactively after every substantive discovery: a user preference, a decision made, something that didn't work, an important project fact. Don't wait until you're asked \u2014 write now, during the conversation. This is how you become someone who genuinely knows the owner instead of starting fresh each session.
+Write proactively after every substantive discovery: a user preference, a decision made, a persistent limitation or wrong approach, an important project fact. Don't wait until you're asked \u2014 write now, during the conversation. This is how you become someone who genuinely knows the owner instead of starting fresh each session.
 
 Best practices:
-\u2022 MEMORY.md \u2014 curated long-term facts, decisions, preferences.
-\u2022 memory/YYYY-MM-DD.md \u2014 daily notes, running context, progress logs.
+\u2022 MEMORY.md \u2014 curated long-term facts, decisions, preferences. Never write transient errors here (timeouts, disconnects, "service unavailable").
+\u2022 memory/YYYY-MM-DD.md \u2014 daily notes, running context, progress logs, transient warnings.
 \u2022 memory/topic.md \u2014 structured data about specific topics.`,
   {
     path: external_exports3.string().describe('File path relative to memory. Examples: "MEMORY.md", "2026-02-28.md", "project-status.md"'),
@@ -45860,7 +45880,12 @@ Best practices:
     const fullContent = fs2.readFileSync(targetPath, "utf-8");
     indexMemoryEntry(args.path, fullContent);
     const stat = fs2.statSync(targetPath);
-    return { content: [{ type: "text", text: `Memory written: ${args.path} (${formatSize(stat.size)})` }] };
+    const isMemoryMd = args.path === "MEMORY.md" || args.path === "/MEMORY.md";
+    const hasTransient = isMemoryMd && isTransientError(args.content);
+    const warning = hasTransient ? `
+
+Warning: This content appears to describe a transient error. Consider writing transient errors to daily notes (memory/YYYY-MM-DD.md) instead of MEMORY.md to avoid poisoning long-term memory.` : "";
+    return { content: [{ type: "text", text: `Memory written: ${args.path} (${formatSize(stat.size)})${warning}` }] };
   }
 );
 function localKeywordSearch(queryTerms, scope) {
@@ -46165,7 +46190,7 @@ server.tool(
   },
   async (args) => {
     const tasks = await convexQuery("mcpInternal:listTasks", { status: args.status });
-    const list = tasks.map((t) => `- [${t.status}] ${t.title}${t.assignedAgent ? ` (${t.assignedAgent})` : ""}${t.priority ? ` [${t.priority}]` : ""}`);
+    const list = tasks.map((t) => `- [${t.status}] ${t.title}${t.assignedAgent ? ` (${t.assignedAgent})` : ""}${t.priority && t.priority !== "none" ? ` [${t.priority}]` : ""}${t.parentTaskId ? " (subtask)" : ""} \u2014 id: ${t._id}`);
     return { content: [{ type: "text", text: list.length > 0 ? list.join("\n") : "No tasks found." }] };
   }
 );
@@ -46179,7 +46204,8 @@ server.tool(
     assignedAgent: external_exports3.string().optional().describe("Name of the agent to assign this task to"),
     status: external_exports3.enum(["scheduled", "todo", "in_progress", "in_review", "blocked", "failed", "done", "cancelled"]).optional(),
     labels: external_exports3.array(external_exports3.string()).optional().describe("Tags/labels for the task"),
-    dueDate: external_exports3.number().optional().describe("Due date as Unix timestamp in milliseconds")
+    dueDate: external_exports3.number().optional().describe("Due date as Unix timestamp in milliseconds"),
+    parentTaskId: external_exports3.string().optional().describe("ID of parent task \u2014 use for subtasks. Get IDs from gallery_create_task or gallery_list_tasks.")
   },
   async (args) => {
     const blocked = checkPlanMode("gallery_create_task");
@@ -46191,10 +46217,11 @@ server.tool(
       priority: args.priority,
       labels: args.labels,
       assignedAgent: args.assignedAgent,
-      dueDate: args.dueDate
+      dueDate: args.dueDate,
+      parentTaskId: args.parentTaskId
     });
     postActivity("status", `Created task: ${args.title}`, { taskId: id });
-    return { content: [{ type: "text", text: `Task created: "${args.title}" [${args.status ?? "todo"}]` }] };
+    return { content: [{ type: "text", text: `Task created: "${args.title}" [${args.status ?? "todo"}] (id: ${id})` }] };
   }
 );
 server.tool(

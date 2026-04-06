@@ -19,7 +19,7 @@ if (existsSync(mcpJsonPath)) {
     // Validate it's parseable JSON with mcpServers
     const parsed = JSON.parse(mcpJson);
     if (parsed.mcpServers && Object.keys(parsed.mcpServers).length > 0) {
-      process.argv.push('--mcp-config', mcpJson);
+      process.argv.push('--mcp-config', mcpJsonPath);
     }
   } catch {
     // Silently continue — CLI will work without MCP servers

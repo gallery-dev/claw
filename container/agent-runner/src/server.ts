@@ -80,39 +80,9 @@ async function processQueue(): Promise<void> {
 
   processing = true;
 
-  // Take the first item, then batch any queued items with the same type AND sessionId
-  // (don't mix tasks with messages, or messages from different conversations)
-  const first = requestQueue.shift()!;
-  const items = [first];
-  const isTask = first.params.isScheduledTask;
-  const sessionId = first.params.sessionId;
-
-  // Collect same-type, same-session items from the front of the queue
-  while (
-    requestQueue.length > 0 &&
-    requestQueue[0].params.isScheduledTask === isTask &&
-    requestQueue[0].params.sessionId === sessionId
-  ) {
-    items.push(requestQueue.shift()!);
-  }
-
-  let params: MessageParams;
-
-  if (items.length === 1) {
-    params = items[0].params;
-  } else {
-    // Merge messages into one prompt, preserve metadata from first item
-    const combined = items.map((item, i) =>
-      `[Message ${i + 1}]: ${item.params.message}`
-    ).join('\n\n');
-    params = {
-      message: combined,
-      sessionId: first.params.sessionId,
-      isScheduledTask: isTask,
-      assistantName: first.params.assistantName,
-    };
-    log(`Batched ${items.length} queued ${isTask ? 'tasks' : 'messages'} into single prompt`);
-  }
+  // Process one request at a time — no merging, so each request keeps its own parameters
+  const item = requestQueue.shift()!;
+  const params = item.params;
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -120,19 +90,14 @@ async function processQueue(): Promise<void> {
       timer = setTimeout(() => rej(new Error('REQUEST_TIMEOUT')), REQUEST_TIMEOUT_MS);
     });
     const result = await Promise.race([processMessage(params), timeoutPromise]);
-    // Resolve all batched requests with the same result
-    for (const item of items) {
-      item.resolve(result);
-    }
+    item.resolve(result);
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
-    for (const item of items) {
-      item.reject(error);
-    }
+    item.reject(error);
   } finally {
     if (timer) clearTimeout(timer);
     processing = false;
-    // Process next batch if more arrived while processing
+    // Process next request if more arrived while processing
     if (requestQueue.length > 0) {
       processQueue();
     }
@@ -212,8 +177,8 @@ async function handleMessage(req: http.IncomingMessage, res: http.ServerResponse
     sessionId: parsed.sessionId,
     isScheduledTask: false,
     assistantName: parsed.assistantName,
-    maxTurns: typeof parsed.maxTurns === 'number' ? parsed.maxTurns : undefined,
-    maxBudgetUsd: typeof parsed.maxBudgetUsd === 'number' ? parsed.maxBudgetUsd : undefined,
+    maxTurns: typeof parsed.maxTurns === 'number' ? Math.min(Math.max(1, parsed.maxTurns), 500) : undefined,
+    maxBudgetUsd: typeof parsed.maxBudgetUsd === 'number' ? Math.min(Math.max(0.01, parsed.maxBudgetUsd), 100) : undefined,
     mode: parsed.mode === 'plan' ? 'plan' : undefined,
     model: typeof parsed.model === 'string' ? parsed.model : undefined,
   };

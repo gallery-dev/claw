@@ -18,7 +18,7 @@ Gallery UI → POST /api/chat → Cloudflare Worker → container POST /message 
 |------|---------|
 | `container/agent-runner/src/server.ts` | HTTP server (port 8080), request queuing, SSE streaming |
 | `container/agent-runner/src/agent.ts` | Claude Agent SDK integration, session persistence, activity posting |
-| `container/agent-runner/src/mcp-tools.ts` | 19 MCP tools: messaging, tasks, memory, delegation, workspace |
+| `container/agent-runner/src/mcp-tools.ts` | 31 MCP tools: messaging, tasks, memory, skills, delegation, reviews, files, workspace |
 | `container/agent-runner/src/shared.ts` | Hooks: bash sanitization, loop detection, context tracking, activity posting |
 | `container/agent-runner/esbuild.config.mjs` | Bundle config: server.bundle.js, mcp-tools.bundle.js, cli.js |
 | `cloudflare/claw/src/index.ts` | Cloudflare Worker: container lifecycle, routing, auth |

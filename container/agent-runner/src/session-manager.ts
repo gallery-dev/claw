@@ -35,6 +35,8 @@ export interface ConversationContext {
   /** Per-conversation message lock — serialize send/stream cycles. */
   lockPromise: Promise<void>;
   lockRelease: (() => void) | null;
+  /** Per-conversation cancel signal — avoids cross-conversation cancellation. */
+  cancelRef: { current: { cancelled: boolean } | null };
 }
 
 interface PersistedSession {
@@ -54,7 +56,7 @@ export class SessionManager {
   private maxSessions: number;
   private defaultContextWindow: number;
   private defaultModel: string;
-  private buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string, mode?: 'agent' | 'plan', model?: string) => SDKSessionOptions;
+  private buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string, mode?: 'agent' | 'plan', model?: string, cancelRef?: { current: { cancelled: boolean } | null }) => SDKSessionOptions;
 
   private idleTimeoutMs: number;
   private idleTimer: ReturnType<typeof setInterval> | null = null;
@@ -65,7 +67,7 @@ export class SessionManager {
     defaultContextWindow: number;
     defaultModel: string;
     idleTimeoutMs?: number;
-    buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string, mode?: 'agent' | 'plan', model?: string) => SDKSessionOptions;
+    buildOptions: (loopTracker: ToolCallTracker, contextTracker: ContextWindowTracker, assistantName?: string, mode?: 'agent' | 'plan', model?: string, cancelRef?: { current: { cancelled: boolean } | null }) => SDKSessionOptions;
   }) {
     this.workspaceDir = opts.workspaceDir;
     this.sessionsDir = path.join(opts.workspaceDir, '.sessions');
@@ -115,7 +117,8 @@ export class SessionManager {
     const loopTracker = new ToolCallTracker();
     const contextTracker = new ContextWindowTracker();
     contextTracker.contextWindow = this.defaultContextWindow;
-    const options = this.buildOptions(loopTracker, contextTracker, assistantName, effectiveMode, effectiveModel);
+    const cancelRef: { current: { cancelled: boolean } | null } = { current: null };
+    const options = this.buildOptions(loopTracker, contextTracker, assistantName, effectiveMode, effectiveModel, cancelRef);
 
     const modeModelChanged = existing !== undefined; // if existing was set, we deleted it above due to change
     let session: SDKSession;
@@ -147,6 +150,7 @@ export class SessionManager {
       model: effectiveModel,
       lockPromise: Promise.resolve(),
       lockRelease: null,
+      cancelRef,
     };
 
     this.conversations.set(id, ctx);

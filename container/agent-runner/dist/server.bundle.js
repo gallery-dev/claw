@@ -33,6 +33,49 @@ function scanForInjection(text) {
   }
   return detected;
 }
+var TRANSIENT_ERROR_PATTERNS = [
+  /\bnot available\b/i,
+  /\bnot configured\b/i,
+  /\bconnection (?:failed|refused|reset)\b/i,
+  /\btimed?\s*out\b/i,
+  /\b(?:429|502|503|504)\b/,
+  /\brate limit/i,
+  /\btemporarily\b/i,
+  /\bunavailable\b/i,
+  /\bdisconnect(?:ed)?\b/i,
+  /\bunreachable\b/i,
+  /\bMCP\b.*(?:not responding|failed to connect|disconnected)/i,
+  /\bcould not connect\b/i,
+  /\bservice\b.*\bdown\b/i,
+  /\bnetwork error\b/i,
+  /\bretry later\b/i
+];
+function isTransientError(text) {
+  return TRANSIENT_ERROR_PATTERNS.some((p) => p.test(text));
+}
+function filterTransientErrors(extractedText) {
+  const lines = extractedText.split("\n");
+  const filtered = lines.filter((line) => {
+    if (line.trimStart().startsWith("**") && line.trimEnd().endsWith("**")) return true;
+    if (line.trimStart().startsWith("-") && isTransientError(line)) return false;
+    return true;
+  });
+  const result = [];
+  for (let i3 = 0; i3 < filtered.length; i3++) {
+    const trimmed = filtered[i3].trimStart();
+    if (trimmed.startsWith("**") && trimmed.trimEnd().endsWith("**")) {
+      const hasBullets = filtered.slice(i3 + 1).some((l3) => {
+        const t = l3.trimStart();
+        if (t.startsWith("**") && t.trimEnd().endsWith("**")) return false;
+        if (t.startsWith("-")) return true;
+        return false;
+      });
+      if (!hasBullets) continue;
+    }
+    result.push(filtered[i3]);
+  }
+  return result.join("\n").trim();
+}
 function parseTranscript(content) {
   const messages = [];
   for (const line of content.split("\n")) {
@@ -500,7 +543,7 @@ function createContextSafetyHook(tracker, activityPoster2, log4, workspaceDir) {
       return {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
-          message: `WARNING: Your context window is ${pctStr}% full (${tracker.lastInputTokens.toLocaleString()} / ${tracker.contextWindow.toLocaleString()} tokens). Save your progress now: write important findings to MEMORY.md or files before context compaction occurs. Summarize your current state and next steps.`
+          message: `WARNING: Your context window is ${pctStr}% full (${tracker.lastInputTokens.toLocaleString()} / ${tracker.contextWindow.toLocaleString()} tokens). Save your progress now: write important findings to MEMORY.md or files before context compaction occurs. Summarize your current state and next steps. Do NOT save transient error states (tool timeouts, connection failures, service outages) to MEMORY.md \u2014 those go to daily notes (memory/YYYY-MM-DD.md) only.`
         }
       };
     }
@@ -16771,7 +16814,7 @@ Extract into these categories (skip empty categories, skip if nothing new):
 **User preferences/habits:** Communication style, working hours, tool preferences, aesthetic preferences, things they dislike
 **Decisions made:** What was decided, why, any tradeoffs noted
 **Key facts:** Important project details, agent configurations, codebase facts, user context
-**Things that didn't work:** Approaches tried that failed (so they're not repeated)
+**Things that didn't work:** Only persistent architectural limitations or wrong approaches \u2014 NOT transient errors like timeouts, connection failures, rate limits, or MCP disconnects. Those are temporary and must not be recorded.
 
 Respond ONLY with bullet points under category headers, or "NONE" if nothing worth remembering.
 No timestamps. No headers beyond the category names. Just bullet points.`
@@ -16785,20 +16828,25 @@ No timestamps. No headers beyond the category names. Just bullet points.`
     const data = await response.json();
     const text = data.content?.[0]?.type === "text" ? data.content[0].text?.trim() : "";
     if (!text || text === "NONE" || text.length < 5) return;
+    const filtered = filterTransientErrors(text);
+    if (!filtered || filtered.length < 5) {
+      log2("[memory] All extracted facts were transient errors \u2014 skipping MEMORY.md write");
+      return;
+    }
     const date = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
     const header = `## Auto-extracted (${date})`;
     if (existing.includes(header)) {
       fs3.appendFileSync(memoryFile, `
-${text}
+${filtered}
 `);
     } else {
       fs3.appendFileSync(memoryFile, `
 
 ${header}
-${text}
+${filtered}
 `);
     }
-    log2(`[memory] Extracted ${text.split("\n").length} facts to MEMORY.md`);
+    log2(`[memory] Extracted ${filtered.split("\n").length} facts to MEMORY.md`);
   } catch (err) {
     log2(`[memory] Extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
   } finally {
@@ -16951,8 +16999,8 @@ function sendJson(res, status, data) {
   });
   res.end(body);
 }
-var version = true ? "0c8356f3" : "dev";
-var buildTime = true ? "2026-04-05T19:27:24.252Z" : "";
+var version = true ? "1.0.0" : "dev";
+var buildTime = true ? "2026-04-06T02:56:42.082Z" : "";
 var ready = false;
 setTimeout(() => {
   ready = true;

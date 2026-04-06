@@ -9,7 +9,7 @@ Source code for the AI agent runtime that runs inside each Cloudflare Sandbox co
 | `src/server.ts` | HTTP server: `/message`, `/task`, `/health`, `/status` endpoints, request queuing, SSE streaming |
 | `src/agent.ts` | Claude Agent SDK V2 sessions, memory extraction (structured 4-category), cost tracking |
 | `src/session-manager.ts` | Multi-conversation lifecycle, LRU eviction, per-conversation locking |
-| `src/mcp-tools.ts` | MCP stdio server with 25 tools (messaging, tasks, memory, skills, delegation, reviews) |
+| `src/mcp-tools.ts` | MCP stdio server with 31 tools (messaging, tasks, memory, skills, delegation, reviews, files, workspace) |
 | `src/shared.ts` | Hooks (bash sanitization, loop detection, context safety, PreCompact), secrets redaction, activity posting |
 | `src/ui-stream.ts` | AI SDK UI Message Stream writer for SSE protocol |
 | `src/gallery-cli.ts` | CLI wrapper for Gallery tools (`gallery` command in containers) |

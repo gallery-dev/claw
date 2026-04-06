@@ -16,11 +16,40 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
-import { type ActivityType, postConvexActivity, SECRET_ENV_VARS } from './shared.js';
+import { type ActivityType, postConvexActivity, SECRET_ENV_VARS, isTransientError } from './shared.js';
 
 const WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace';
 const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
 const MEMORY_FILE = path.join(WORKSPACE_DIR, 'MEMORY.md');
+
+/**
+ * Resolve a target path and verify it stays within WORKSPACE_DIR.
+ * Uses fs.realpathSync() for existing paths to follow symlinks — prevents
+ * symlink-based escape (e.g., `ln -s /etc/passwd memory/leak`).
+ * For new files, resolves the parent directory (which must exist) instead.
+ */
+function assertWithinWorkspace(targetPath: string): string | null {
+  try {
+    if (fs.existsSync(targetPath)) {
+      const real = fs.realpathSync(targetPath);
+      if (!real.startsWith(fs.realpathSync(WORKSPACE_DIR))) return null;
+      return real;
+    }
+    // New file: resolve parent dir (must exist and be within workspace)
+    const parentDir = path.dirname(targetPath);
+    if (fs.existsSync(parentDir)) {
+      const realParent = fs.realpathSync(parentDir);
+      if (!realParent.startsWith(fs.realpathSync(WORKSPACE_DIR))) return null;
+    } else {
+      // Parent doesn't exist yet — fall back to path.resolve check
+      const resolved = path.resolve(targetPath);
+      if (!resolved.startsWith(path.resolve(WORKSPACE_DIR))) return null;
+    }
+    return path.resolve(targetPath);
+  } catch {
+    return null;
+  }
+}
 
 // Gallery API context (set by agent.ts when spawning this process)
 const galleryApiUrl = process.env.GALLERY_API_URL || '';
@@ -87,16 +116,33 @@ const convexUrl = process.env.GALLERY_CONVEX_URL || '';
 const gatewayToken = process.env.GALLERY_GATEWAY_TOKEN || '';
 
 let currentTaskId: string | undefined;
-let planModeActive = false;
+
+const PLAN_MODE_FILE = path.join(WORKSPACE_DIR, '.plan-mode');
+
+/** Read plan mode state from disk (survives process restarts). */
+function isPlanModeActive(): boolean {
+  try { return fs.existsSync(PLAN_MODE_FILE); } catch { return false; }
+}
+
+/** Set plan mode state (persisted to disk). */
+function setPlanMode(active: boolean): void {
+  try {
+    if (active) {
+      fs.writeFileSync(PLAN_MODE_FILE, new Date().toISOString());
+    } else if (fs.existsSync(PLAN_MODE_FILE)) {
+      fs.unlinkSync(PLAN_MODE_FILE);
+    }
+  } catch { /* non-fatal */ }
+}
 
 /** Check if the current operation is blocked by plan mode. Returns error content or null. */
 function checkPlanMode(toolName: string): { content: Array<{ type: 'text'; text: string }>; isError: true } | null {
-  if (!planModeActive) return null;
+  if (!isPlanModeActive()) return null;
   const readOnlyTools = new Set([
     'memory_view', 'memory_search', 'gallery_list_tasks', 'gallery_list_agents',
     'gallery_list_reviews', 'gallery_workspace_info', 'gallery_context_usage',
     'gallery_read_peer_memory', 'skill_list', 'gallery_exit_plan_mode',
-    'update_progress', 'send_message',
+    'update_progress', 'send_message', 'gallery_list_files',
   ]);
   if (readOnlyTools.has(toolName)) return null;
   return {
@@ -593,9 +639,8 @@ Returns directory listing (with sizes) or file contents with line numbers.`,
       targetPath = path.join(MEMORY_DIR, requestedPath);
     }
 
-    // Security: ensure path stays within workspace
-    const resolved = path.resolve(targetPath);
-    if (!resolved.startsWith(WORKSPACE_DIR)) {
+    // Security: ensure path stays within workspace (resolves symlinks)
+    if (!assertWithinWorkspace(targetPath)) {
       return { content: [{ type: 'text' as const, text: `Error: path must be within your workspace.` }], isError: true };
     }
 
@@ -632,11 +677,11 @@ server.tool(
   'memory_write',
   `Write or update a memory file. Use this to persist important information across sessions.
 
-Write proactively after every substantive discovery: a user preference, a decision made, something that didn't work, an important project fact. Don't wait until you're asked — write now, during the conversation. This is how you become someone who genuinely knows the owner instead of starting fresh each session.
+Write proactively after every substantive discovery: a user preference, a decision made, a persistent limitation or wrong approach, an important project fact. Don't wait until you're asked — write now, during the conversation. This is how you become someone who genuinely knows the owner instead of starting fresh each session.
 
 Best practices:
-• MEMORY.md — curated long-term facts, decisions, preferences.
-• memory/YYYY-MM-DD.md — daily notes, running context, progress logs.
+• MEMORY.md — curated long-term facts, decisions, preferences. Never write transient errors here (timeouts, disconnects, "service unavailable").
+• memory/YYYY-MM-DD.md — daily notes, running context, progress logs, transient warnings.
 • memory/topic.md — structured data about specific topics.`,
   {
     path: z.string().describe('File path relative to memory. Examples: "MEMORY.md", "2026-02-28.md", "project-status.md"'),
@@ -653,8 +698,7 @@ Best practices:
       targetPath = path.join(MEMORY_DIR, args.path);
     }
 
-    const resolved = path.resolve(targetPath);
-    if (!resolved.startsWith(WORKSPACE_DIR)) {
+    if (!assertWithinWorkspace(targetPath)) {
       return { content: [{ type: 'text' as const, text: `Error: path must be within your workspace.` }], isError: true };
     }
 
@@ -677,7 +721,12 @@ Best practices:
     indexMemoryEntry(args.path, fullContent);
 
     const stat = fs.statSync(targetPath);
-    return { content: [{ type: 'text' as const, text: `Memory written: ${args.path} (${formatSize(stat.size)})` }] };
+    const isMemoryMd = args.path === 'MEMORY.md' || args.path === '/MEMORY.md';
+    const hasTransient = isMemoryMd && isTransientError(args.content);
+    const warning = hasTransient
+      ? `\n\nWarning: This content appears to describe a transient error. Consider writing transient errors to daily notes (memory/YYYY-MM-DD.md) instead of MEMORY.md to avoid poisoning long-term memory.`
+      : '';
+    return { content: [{ type: 'text' as const, text: `Memory written: ${args.path} (${formatSize(stat.size)})${warning}` }] };
   },
 );
 
@@ -811,8 +860,7 @@ server.tool(
       targetPath = path.join(MEMORY_DIR, args.path);
     }
 
-    const resolved = path.resolve(targetPath);
-    if (!resolved.startsWith(WORKSPACE_DIR)) {
+    if (!assertWithinWorkspace(targetPath)) {
       return { content: [{ type: 'text' as const, text: `Error: path must be within your workspace.` }], isError: true };
     }
 
@@ -826,6 +874,45 @@ server.tool(
     removeMemoryEntry(args.path);
 
     return { content: [{ type: 'text' as const, text: `Deleted ${args.path}` }] };
+  },
+);
+
+// ─── Knowledge Files ────────────────────────────────────────
+
+const FILES_DIR = path.join(WORKSPACE_DIR, 'files');
+
+server.tool(
+  'gallery_list_files',
+  `List knowledge files uploaded to the workspace via the Gallery dashboard. These files are in the files/ directory and can be read with the Read tool.
+
+Use this to discover what reference materials, specs, or documents the workspace owner has uploaded.`,
+  {},
+  async () => {
+    if (!fs.existsSync(FILES_DIR)) {
+      return { content: [{ type: 'text' as const, text: 'No knowledge files uploaded. The workspace owner can upload files via the Gallery dashboard.' }] };
+    }
+
+    try {
+      const entries = fs.readdirSync(FILES_DIR).filter(f => !f.startsWith('.')).sort();
+      if (entries.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No knowledge files uploaded. The workspace owner can upload files via the Gallery dashboard.' }] };
+      }
+
+      const lines = entries.map(f => {
+        try {
+          const filePath = path.join(FILES_DIR, f);
+          const stat = fs.statSync(filePath);
+          const ext = path.extname(f).toLowerCase();
+          return `- ${f} (${formatSize(stat.size)}, ${ext || 'no extension'})  →  Read with: files/${f}`;
+        } catch {
+          return `- ${f} (unreadable)`;
+        }
+      });
+
+      return { content: [{ type: 'text' as const, text: `Knowledge files (${entries.length}):\n${lines.join('\n')}\n\nUse the Read tool with path "files/<filename>" to view file contents.` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error listing files: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
   },
 );
 
@@ -1026,7 +1113,7 @@ server.tool(
   },
   async (args) => {
     const tasks = await convexQuery('mcpInternal:listTasks', { status: args.status });
-    const list = (tasks as any[]).map((t: any) => `- [${t.status}] ${t.title}${t.assignedAgent ? ` (${t.assignedAgent})` : ''}${t.priority ? ` [${t.priority}]` : ''}`);
+    const list = (tasks as any[]).map((t: any) => `- [${t.status}] ${t.title}${t.assignedAgent ? ` (${t.assignedAgent})` : ''}${t.priority && t.priority !== 'none' ? ` [${t.priority}]` : ''}${t.parentTaskId ? ' (subtask)' : ''} — id: ${t._id}`);
     return { content: [{ type: 'text' as const, text: list.length > 0 ? list.join('\n') : 'No tasks found.' }] };
   },
 );
@@ -1042,6 +1129,7 @@ server.tool(
     status: z.enum(['scheduled', 'todo', 'in_progress', 'in_review', 'blocked', 'failed', 'done', 'cancelled']).optional(),
     labels: z.array(z.string()).optional().describe('Tags/labels for the task'),
     dueDate: z.number().optional().describe('Due date as Unix timestamp in milliseconds'),
+    parentTaskId: z.string().optional().describe('ID of parent task — use for subtasks. Get IDs from gallery_create_task or gallery_list_tasks.'),
   },
   async (args) => {
     const blocked = checkPlanMode('gallery_create_task');
@@ -1054,9 +1142,10 @@ server.tool(
       labels: args.labels,
       assignedAgent: args.assignedAgent,
       dueDate: args.dueDate,
+      parentTaskId: args.parentTaskId,
     });
     postActivity('status', `Created task: ${args.title}`, { taskId: id });
-    return { content: [{ type: 'text' as const, text: `Task created: "${args.title}" [${args.status ?? 'todo'}]` }] };
+    return { content: [{ type: 'text' as const, text: `Task created: "${args.title}" [${args.status ?? 'todo'}] (id: ${id})` }] };
   },
 );
 
@@ -1161,6 +1250,79 @@ server.tool(
 
     await convexMutation('mcpInternal:addTaskComment', { taskId: task._id, content: args.content });
     return { content: [{ type: 'text' as const, text: `Comment added to "${args.title}".` }] };
+  },
+);
+
+// ── Task Attachments ──
+
+server.tool(
+  'gallery_attach_to_task',
+  `Attach a file from the workspace to a task. Use this to deliver work products (reports, code, documents) as task attachments visible in the Gallery dashboard.
+
+The file must exist in the workspace filesystem. It will be read and uploaded to storage.`,
+  {
+    taskId: z.string().describe('Task ID to attach the file to'),
+    filePath: z.string().describe('Path to the file in the workspace (relative or absolute)'),
+    name: z.string().optional().describe('Display name for the attachment (defaults to filename)'),
+  },
+  async (args) => {
+    const blocked = checkPlanMode('gallery_attach_to_task');
+    if (blocked) return blocked;
+
+    // Resolve file path
+    const absPath = path.isAbsolute(args.filePath)
+      ? args.filePath
+      : path.join(WORKSPACE_DIR, args.filePath);
+
+    // Security: ensure file is within workspace
+    if (!assertWithinWorkspace(absPath)) {
+      return { content: [{ type: 'text' as const, text: 'Error: file must be within your workspace.' }], isError: true };
+    }
+
+    if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
+      return { content: [{ type: 'text' as const, text: `Error: file not found at "${args.filePath}".` }], isError: true };
+    }
+
+    const stat = fs.statSync(absPath);
+    const MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024; // 50MB
+    if (stat.size > MAX_ATTACHMENT_SIZE) {
+      return { content: [{ type: 'text' as const, text: `Error: file too large (${formatSize(stat.size)}, max 50MB).` }], isError: true };
+    }
+
+    const fileName = args.name || path.basename(absPath);
+    const ext = path.extname(absPath).toLowerCase().replace('.', '');
+    const mimeType = ext === 'md' ? 'text/markdown'
+      : ext === 'json' ? 'application/json'
+      : ext === 'pdf' ? 'application/pdf'
+      : ext === 'csv' ? 'text/csv'
+      : ext === 'txt' ? 'text/plain'
+      : ext === 'html' ? 'text/html'
+      : `application/octet-stream`;
+
+    // Upload file content as base64 data URL (for files under 10MB)
+    // For larger files, store path reference
+    let url: string;
+    if (stat.size <= 10 * 1024 * 1024) {
+      const content = fs.readFileSync(absPath);
+      url = `data:${mimeType};base64,${content.toString('base64')}`;
+    } else {
+      // For large files, store a workspace reference
+      url = `workspace://${path.relative(WORKSPACE_DIR, absPath)}`;
+    }
+
+    try {
+      await convexMutation('mcpInternal:addTaskAttachment', {
+        taskId: args.taskId as any,
+        name: fileName,
+        url,
+        type: mimeType,
+        size: stat.size,
+      });
+      postActivity('tool_use', `Attached "${fileName}" (${formatSize(stat.size)}) to task`);
+      return { content: [{ type: 'text' as const, text: `Attached "${fileName}" (${formatSize(stat.size)}) to task.` }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error attaching file: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
   },
 );
 
@@ -1489,7 +1651,7 @@ This is a behavioral toggle — you commit to only reading and planning, not exe
       }
     } catch { /* non-fatal — plan is saved even if review creation fails */ }
 
-    planModeActive = true;
+    setPlanMode(true);
     postActivity('status', `Entered plan mode: ${args.plan_title}`);
     return {
       content: [{
@@ -1510,7 +1672,7 @@ server.tool(
     plan_title: z.string().describe('Title of the plan that was approved'),
   },
   async (args) => {
-    planModeActive = false;
+    setPlanMode(false);
     postActivity('status', `Exited plan mode: ${args.plan_title}`);
     return {
       content: [{

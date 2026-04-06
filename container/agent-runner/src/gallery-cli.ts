@@ -20,6 +20,28 @@ const WORKSPACE_DIR = process.env.CLAW_WORKSPACE_DIR || '/home/sprite/workspace'
 const MEMORY_DIR = path.join(WORKSPACE_DIR, 'memory');
 const MEMORY_FILE = path.join(WORKSPACE_DIR, 'MEMORY.md');
 
+/**
+ * Resolve a target path and verify it stays within WORKSPACE_DIR.
+ * Uses fs.realpathSync() for existing paths to follow symlinks — prevents
+ * symlink-based escape (e.g., `ln -s /etc/passwd memory/leak`).
+ */
+function assertWithinWorkspace(targetPath: string): boolean {
+  try {
+    if (fs.existsSync(targetPath)) {
+      const real = fs.realpathSync(targetPath);
+      return real.startsWith(fs.realpathSync(WORKSPACE_DIR));
+    }
+    const parentDir = path.dirname(targetPath);
+    if (fs.existsSync(parentDir)) {
+      const realParent = fs.realpathSync(parentDir);
+      return realParent.startsWith(fs.realpathSync(WORKSPACE_DIR));
+    }
+    return path.resolve(targetPath).startsWith(path.resolve(WORKSPACE_DIR));
+  } catch {
+    return false;
+  }
+}
+
 const convexUrl = process.env.GALLERY_CONVEX_URL || '';
 const gatewayToken = process.env.GALLERY_GATEWAY_TOKEN || '';
 const galleryApiUrl = process.env.GALLERY_API_URL || '';
@@ -284,7 +306,11 @@ async function handleTask(sub: string, flags: Record<string, string>) {
     case 'create': {
       const title = flags['title'];
       if (!title) fail('Missing --title');
-      const labels = flags['labels'] ? JSON.parse(flags['labels']) : undefined;
+      let labels: string[] | undefined;
+      if (flags['labels']) {
+        try { labels = JSON.parse(flags['labels']); }
+        catch { fail('Invalid --labels: must be valid JSON array (e.g. \'["bug","urgent"]\')'); }
+      }
       const id = await convexMutation('mcpInternal:createTask', {
         title,
         description: flags['description'],
@@ -544,8 +570,7 @@ async function handleMemory(sub: string, flags: Record<string, string>, position
         targetPath = path.join(MEMORY_DIR, normalized);
       }
 
-      const resolved = path.resolve(targetPath);
-      if (!resolved.startsWith(WORKSPACE_DIR)) fail('Path must be within workspace.');
+      if (!assertWithinWorkspace(targetPath)) fail('Path must be within workspace.');
       if (!fs.existsSync(targetPath)) { ok(`No memory file at "${requestedPath}". Use \`gallery memory write\` to create one.`); break; }
 
       const stat = fs.statSync(targetPath);
@@ -589,8 +614,7 @@ async function handleMemory(sub: string, flags: Record<string, string>, position
         targetPath = path.join(MEMORY_DIR, memPath);
       }
 
-      const resolved = path.resolve(targetPath);
-      if (!resolved.startsWith(WORKSPACE_DIR)) fail('Path must be within workspace.');
+      if (!assertWithinWorkspace(targetPath)) fail('Path must be within workspace.');
 
       fs.mkdirSync(path.dirname(targetPath), { recursive: true });
 
@@ -680,8 +704,7 @@ async function handleMemory(sub: string, flags: Record<string, string>, position
         targetPath = path.join(MEMORY_DIR, memPath);
       }
 
-      const resolved = path.resolve(targetPath);
-      if (!resolved.startsWith(WORKSPACE_DIR)) fail('Path must be within workspace.');
+      if (!assertWithinWorkspace(targetPath)) fail('Path must be within workspace.');
       if (!fs.existsSync(targetPath)) fail(`File "${memPath}" not found.`);
 
       fs.unlinkSync(targetPath);

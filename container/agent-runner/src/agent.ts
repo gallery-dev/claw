@@ -33,6 +33,7 @@ import {
   redactSecretsFromOutput,
   writeContextUsage,
   scanForInjection,
+  filterTransientErrors,
 } from './shared.js';
 import { UIStreamWriter, generateMessageId } from './ui-stream.js';
 import type { MessageMetadata } from './ui-stream.js';
@@ -168,17 +169,13 @@ export interface MessageResult {
 
 let activityPoster: ActivityPoster | null = null;
 
-// Mutable cancel ref — updated per-message, checked by PreToolUse hook
-// to abort before starting long tool executions (e.g., Bash commands).
-const activeCancelRef: { current: { cancelled: boolean } | null } = { current: null };
-
 // Session manager — handles multiple conversations per container
 const sessionManager = new SessionManager({
   workspaceDir: WORKSPACE_DIR,
   maxSessions: 5,
   defaultContextWindow: getDefaultContextWindow(MODEL),
   defaultModel: MODEL,
-  buildOptions: (loopTracker, contextTracker, assistantName, mode, model) => {
+  buildOptions: (loopTracker, contextTracker, assistantName, mode, model, cancelRef) => {
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
     const mcp = loadMcpConfig();
     // Note: V2 sessions (unstable_v2_createSession) ignore mcpServers option —
@@ -209,8 +206,9 @@ const sessionManager = new SessionManager({
         PreCompact: [{ hooks: [createPreCompactHook(WORKSPACE_DIR, assistantName, log)] }],
         PreToolUse: [
           // Cancel check — abort before starting tool execution if user cancelled
+          // Uses per-conversation cancelRef (not a global) to avoid cross-conversation cancellation.
           { hooks: [async () => {
-            if (activeCancelRef.current?.cancelled) {
+            if (cancelRef?.current?.cancelled) {
               return { decision: 'block' as const, reason: 'Cancelled by user' };
             }
             return {};
@@ -260,7 +258,7 @@ export async function processMessage(
   try {
     return await processMessageInner(params, writer, cancelSignal, ctx);
   } finally {
-    activeCancelRef.current = null;
+    ctx.cancelRef.current = null;
     releaseLock();
   }
 }
@@ -279,7 +277,8 @@ async function processMessageInner(
   activityPoster!.post('status', 'Processing message');
 
   // Set cancel ref so PreToolUse hook can abort before starting tool execution
-  activeCancelRef.current = cancelSignal ?? null;
+  // Uses per-conversation cancelRef to avoid cross-conversation cancellation.
+  if (ctx) ctx.cancelRef.current = cancelSignal ?? null;
 
   // Build prompt with timezone context
   const tz = process.env.AGENT_TIMEZONE || 'UTC';
@@ -680,8 +679,11 @@ async function processMessageInner(
   log(`${statusMsg}, sessionId: ${currentSessionId}`);
   activityPoster!.post('status', limitHit ? statusMsg : 'Message processed');
 
-  // Fire-and-forget memory extraction — don't block the response
-  if (resultText && process.env.CLAW_AUTO_MEMORY !== 'false') {
+  // Fire-and-forget memory extraction — disabled by default to prevent memory poisoning.
+  // Auto-extraction via Haiku often saves transient errors as permanent facts (e.g., "Gmail MCP
+  // tools unavailable"), causing agents to give up without trying. Agents manage memory explicitly
+  // via memory_write/memory_view MCP tools instead. Enable with CLAW_AUTO_MEMORY=true if needed.
+  if (resultText && process.env.CLAW_AUTO_MEMORY === 'true') {
     extractMemory(message, resultText).catch((err) => {
       log(`Memory extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     });
@@ -769,7 +771,7 @@ Extract into these categories (skip empty categories, skip if nothing new):
 **User preferences/habits:** Communication style, working hours, tool preferences, aesthetic preferences, things they dislike
 **Decisions made:** What was decided, why, any tradeoffs noted
 **Key facts:** Important project details, agent configurations, codebase facts, user context
-**Things that didn't work:** Approaches tried that failed (so they're not repeated)
+**Things that didn't work:** Only persistent architectural limitations or wrong approaches — NOT transient errors like timeouts, connection failures, rate limits, or MCP disconnects. Those are temporary and must not be recorded.
 
 Respond ONLY with bullet points under category headers, or "NONE" if nothing worth remembering.
 No timestamps. No headers beyond the category names. Just bullet points.`,
@@ -786,15 +788,22 @@ No timestamps. No headers beyond the category names. Just bullet points.`,
     const text = data.content?.[0]?.type === 'text' ? data.content[0].text?.trim() : '';
     if (!text || text === 'NONE' || text.length < 5) return;
 
+    // Filter out transient error lines (timeouts, disconnects, rate limits, etc.)
+    const filtered = filterTransientErrors(text);
+    if (!filtered || filtered.length < 5) {
+      log('[memory] All extracted facts were transient errors — skipping MEMORY.md write');
+      return;
+    }
+
     // Append under today's date section (reuse existing header if present)
     const date = new Date().toISOString().split('T')[0];
     const header = `## Auto-extracted (${date})`;
     if (existing.includes(header)) {
-      fs.appendFileSync(memoryFile, `\n${text}\n`);
+      fs.appendFileSync(memoryFile, `\n${filtered}\n`);
     } else {
-      fs.appendFileSync(memoryFile, `\n\n${header}\n${text}\n`);
+      fs.appendFileSync(memoryFile, `\n\n${header}\n${filtered}\n`);
     }
-    log(`[memory] Extracted ${text.split('\n').length} facts to MEMORY.md`);
+    log(`[memory] Extracted ${filtered.split('\n').length} facts to MEMORY.md`);
   } catch (err) {
     log(`[memory] Extraction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
   } finally {

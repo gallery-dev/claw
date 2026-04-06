@@ -43,6 +43,66 @@ export function scanForInjection(text: string): string[] {
   return detected;
 }
 
+// ─── Transient Error Filtering ───────────────────────────
+
+/** Patterns that indicate transient/temporary errors — these should never be saved to MEMORY.md */
+export const TRANSIENT_ERROR_PATTERNS: RegExp[] = [
+  /\bnot available\b/i,
+  /\bnot configured\b/i,
+  /\bconnection (?:failed|refused|reset)\b/i,
+  /\btimed?\s*out\b/i,
+  /\b(?:429|502|503|504)\b/,
+  /\brate limit/i,
+  /\btemporarily\b/i,
+  /\bunavailable\b/i,
+  /\bdisconnect(?:ed)?\b/i,
+  /\bunreachable\b/i,
+  /\bMCP\b.*(?:not responding|failed to connect|disconnected)/i,
+  /\bcould not connect\b/i,
+  /\bservice\b.*\bdown\b/i,
+  /\bnetwork error\b/i,
+  /\bretry later\b/i,
+];
+
+/** Returns true if the text matches any transient error pattern */
+export function isTransientError(text: string): boolean {
+  return TRANSIENT_ERROR_PATTERNS.some((p) => p.test(text));
+}
+
+/**
+ * Filter transient error lines from auto-extracted memory text.
+ * Strips matching bullet lines and removes orphaned category headers.
+ */
+export function filterTransientErrors(extractedText: string): string {
+  const lines = extractedText.split('\n');
+  const filtered = lines.filter((line) => {
+    // Always keep category headers (they start with **)
+    if (line.trimStart().startsWith('**') && line.trimEnd().endsWith('**')) return true;
+    // Filter bullet lines that match transient patterns
+    if (line.trimStart().startsWith('-') && isTransientError(line)) return false;
+    return true;
+  });
+
+  // Remove orphaned category headers (no bullet points following them)
+  const result: string[] = [];
+  for (let i = 0; i < filtered.length; i++) {
+    const trimmed = filtered[i].trimStart();
+    if (trimmed.startsWith('**') && trimmed.trimEnd().endsWith('**')) {
+      // Look ahead for a bullet point before the next header or end
+      const hasBullets = filtered.slice(i + 1).some((l) => {
+        const t = l.trimStart();
+        if (t.startsWith('**') && t.trimEnd().endsWith('**')) return false; // next header
+        if (t.startsWith('-')) return true; // found a bullet
+        return false;
+      });
+      if (!hasBullets) continue; // skip orphaned header
+    }
+    result.push(filtered[i]);
+  }
+
+  return result.join('\n').trim();
+}
+
 // ─── Transcript Parsing ──────────────────────────────────
 
 export interface ParsedMessage {
@@ -679,7 +739,7 @@ export function createContextSafetyHook(
       return {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
-          message: `WARNING: Your context window is ${pctStr}% full (${tracker.lastInputTokens.toLocaleString()} / ${tracker.contextWindow.toLocaleString()} tokens). Save your progress now: write important findings to MEMORY.md or files before context compaction occurs. Summarize your current state and next steps.`,
+          message: `WARNING: Your context window is ${pctStr}% full (${tracker.lastInputTokens.toLocaleString()} / ${tracker.contextWindow.toLocaleString()} tokens). Save your progress now: write important findings to MEMORY.md or files before context compaction occurs. Summarize your current state and next steps. Do NOT save transient error states (tool timeouts, connection failures, service outages) to MEMORY.md — those go to daily notes (memory/YYYY-MM-DD.md) only.`,
         },
       };
     }
